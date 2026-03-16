@@ -3,9 +3,6 @@ Quick sanity check for Koopman Prior CVAE
 Tests: forward pass, loss shapes, sampling, rollout
 """
 
-import sys
-sys.path.insert(0, '/home/claude/koopman_cvae')
-
 import torch
 import math
 from models.koopman_cvae import KoopmanCVAE, KoopmanCVAEConfig, symlog, symexp

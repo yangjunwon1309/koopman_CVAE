@@ -1,0 +1,10 @@
+torch>=2.0.0
+numpy>=1.24.0
+gymnasium>=0.29.0
+
+# D4RL (Adroit, MuJoCo tasks) -- install separately
+# pip install d4rl
+# requires: mujoco, mujoco-py
+
+# Isaac Gym -- install from NVIDIA separately
+# https://developer.nvidia.com/isaac-gym

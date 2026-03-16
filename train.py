@@ -12,55 +12,57 @@ import os
 from pathlib import Path
 
 from models.koopman_cvae import KoopmanCVAE, KoopmanCVAEConfig
+from envs.env_configs import ENV_CONFIGS, build_config
+from data.dataset_utils import load_d4rl_trajectories, make_synthetic_dataset
 
 
 # ─────────────────────────────────────────────
 #  Environment Configs
 # ─────────────────────────────────────────────
 
-ENV_CONFIGS = {
-    # DMControl
-    'dm_reacher':    dict(action_dim=2,  state_dim=11, dt_control=0.02,  patch_size=5),
-    'dm_walker':     dict(action_dim=6,  state_dim=24, dt_control=0.02,  patch_size=5),
-    'dm_cheetah':    dict(action_dim=6,  state_dim=17, dt_control=0.02,  patch_size=5),
-    'dm_cartpole':   dict(action_dim=1,  state_dim=5,  dt_control=0.02,  patch_size=5),
-    'dm_humanoid':   dict(action_dim=21, state_dim=67, dt_control=0.02,  patch_size=5),
+# ENV_CONFIGS = {
+#     # DMControl
+#     'dm_reacher':    dict(action_dim=2,  state_dim=11, dt_control=0.02,  patch_size=5),
+#     'dm_walker':     dict(action_dim=6,  state_dim=24, dt_control=0.02,  patch_size=5),
+#     'dm_cheetah':    dict(action_dim=6,  state_dim=17, dt_control=0.02,  patch_size=5),
+#     'dm_cartpole':   dict(action_dim=1,  state_dim=5,  dt_control=0.02,  patch_size=5),
+#     'dm_humanoid':   dict(action_dim=21, state_dim=67, dt_control=0.02,  patch_size=5),
 
-    # D4RL Adroit (offline)
-    'adroit_pen':      dict(action_dim=24, state_dim=45, dt_control=0.04, patch_size=3),
-    'adroit_hammer':   dict(action_dim=26, state_dim=46, dt_control=0.04, patch_size=3),
-    'adroit_door':     dict(action_dim=28, state_dim=39, dt_control=0.04, patch_size=3),
-    'adroit_relocate': dict(action_dim=30, state_dim=39, dt_control=0.04, patch_size=3),
+#     # D4RL Adroit (offline)
+#     'adroit_pen':      dict(action_dim=24, state_dim=45, dt_control=0.04, patch_size=3),
+#     'adroit_hammer':   dict(action_dim=26, state_dim=46, dt_control=0.04, patch_size=3),
+#     'adroit_door':     dict(action_dim=28, state_dim=39, dt_control=0.04, patch_size=3),
+#     'adroit_relocate': dict(action_dim=30, state_dim=39, dt_control=0.04, patch_size=3),
 
-    # HumanoidBench
-    'humanoid_stand':  dict(action_dim=19, state_dim=76,  dt_control=0.01, patch_size=10),
-    'humanoid_walk':   dict(action_dim=19, state_dim=76,  dt_control=0.01, patch_size=10),
-    'humanoid_reach':  dict(action_dim=19, state_dim=132, dt_control=0.01, patch_size=10),
+#     # HumanoidBench
+#     'humanoid_stand':  dict(action_dim=19, state_dim=76,  dt_control=0.01, patch_size=10),
+#     'humanoid_walk':   dict(action_dim=19, state_dim=76,  dt_control=0.01, patch_size=10),
+#     'humanoid_reach':  dict(action_dim=19, state_dim=132, dt_control=0.01, patch_size=10),
 
-    # Isaac Gym
-    'isaac_franka':    dict(action_dim=7,  state_dim=23,  dt_control=0.0167, patch_size=6),
-    'isaac_allegro':   dict(action_dim=16, state_dim=92,  dt_control=0.0167, patch_size=6),
-    'isaac_humanoid':  dict(action_dim=21, state_dim=108, dt_control=0.0167, patch_size=6),
-}
+#     # Isaac Gym
+#     'isaac_franka':    dict(action_dim=7,  state_dim=23,  dt_control=0.0167, patch_size=6),
+#     'isaac_allegro':   dict(action_dim=16, state_dim=92,  dt_control=0.0167, patch_size=6),
+#     'isaac_humanoid':  dict(action_dim=21, state_dim=108, dt_control=0.0167, patch_size=6),
+# }
 
 
-def build_config(args) -> KoopmanCVAEConfig:
-    env_cfg = ENV_CONFIGS.get(args.env, {})
-    return KoopmanCVAEConfig(
-        action_dim      = env_cfg.get('action_dim', args.action_dim),
-        state_dim       = env_cfg.get('state_dim', args.state_dim),
-        patch_size      = env_cfg.get('patch_size', args.patch_size),
-        dt_control      = env_cfg.get('dt_control', args.dt_control),
-        embed_dim       = args.embed_dim,
-        state_embed_dim = args.state_embed_dim,
-        gru_hidden_dim  = args.gru_hidden_dim,
-        mlp_hidden_dim  = args.mlp_hidden_dim,
-        koopman_dim     = args.koopman_dim,
-        beta_kl         = args.beta_kl,
-        alpha_pred      = args.alpha_pred,
-        gamma_eig       = args.gamma_eig,
-        dropout         = args.dropout,
-    )
+# def build_config(args) -> KoopmanCVAEConfig:
+#     env_cfg = ENV_CONFIGS.get(args.env, {})
+#     return KoopmanCVAEConfig(
+#         action_dim      = env_cfg.get('action_dim', args.action_dim),
+#         state_dim       = env_cfg.get('state_dim', args.state_dim),
+#         patch_size      = env_cfg.get('patch_size', args.patch_size),
+#         dt_control      = env_cfg.get('dt_control', args.dt_control),
+#         embed_dim       = args.embed_dim,
+#         state_embed_dim = args.state_embed_dim,
+#         gru_hidden_dim  = args.gru_hidden_dim,
+#         mlp_hidden_dim  = args.mlp_hidden_dim,
+#         koopman_dim     = args.koopman_dim,
+#         beta_kl         = args.beta_kl,
+#         alpha_pred      = args.alpha_pred,
+#         gamma_eig       = args.gamma_eig,
+#         dropout         = args.dropout,
+#     )
 
 
 # ─────────────────────────────────────────────
@@ -249,6 +251,8 @@ def parse_args():
     p.add_argument('--save_freq',      type=int,   default=50)
     p.add_argument('--save_dir',       type=str,   default='checkpoints')
     p.add_argument('--device',         type=str,   default='cuda' if torch.cuda.is_available() else 'cpu')
+    p.add_argument('--d4rl_quality', type=str, default='expert',
+               choices=['expert', 'medium', 'random', 'human'])
     return p.parse_args()
 
 
