@@ -2,6 +2,8 @@
 Training script for Diagonal Koopman Prior CVAE
 Supports: DMControl, D4RL (Adroit), HumanoidBench, Isaac Gym (offline data)
 """
+import argparse
+from typing import Dict, Optional
 
 import torch
 import torch.nn as nn

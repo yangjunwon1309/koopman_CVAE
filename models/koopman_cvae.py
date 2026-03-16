@@ -58,6 +58,9 @@ class KoopmanCVAEConfig:
     dropout: float = 0.1
     layer_norm: bool = True
 
+    temp_contrastive: float = 0.1    # temperature
+    delta_min: int = 3   
+
 
 # ─────────────────────────────────────────────
 #  Utility Functions
@@ -593,6 +596,61 @@ class KoopmanCVAE(nn.Module):
             'loss_eig': loss_eig,
             'loss_cst' : loss_cst
         }
+    
+    def compute_contrastive_loss(
+        self,
+        patch_emb: torch.Tensor,   # (B, Np, embed_dim)
+        state_emb: torch.Tensor,   # (B, Np, state_embed_dim)
+        enc: dict,
+    ) -> torch.Tensor:
+        """
+        InfoNCE contrastive loss on latent z.
+        Positive: temporal jitter augmentation of same patch
+        Negative: patches with |j-k| > delta_min
+        """
+        B, Np, _ = patch_emb.shape
+        tau = self.cfg.temp_contrastive
+        delta = self.cfg.delta_min
+        m = self.cfg.koopman_dim
+
+        mu_re = enc['mu_re']   # (B, Np, m)
+        mu_im = enc['mu_im']   # (B, Np, m)
+
+        # Flatten z_k as query: concat Re+Im, L2 normalize
+        z_flat = torch.cat([mu_re, mu_im], dim=-1)          # (B, Np, 2m)
+        z_norm = F.normalize(z_flat, dim=-1)                 # (B, Np, 2m)
+
+        # Positive: same patch with Gaussian noise augmentation (temporal jitter)
+        noise = torch.randn_like(patch_emb) * 0.05
+        p_aug = patch_emb + noise
+        mu_re_aug, mu_im_aug, _ = self.encoder(p_aug, state_emb)
+        z_aug = torch.cat([mu_re_aug, mu_im_aug], dim=-1)
+        z_aug_norm = F.normalize(z_aug, dim=-1)              # (B, Np, 2m)
+
+        loss_cst = torch.tensor(0.0, device=patch_emb.device)
+        count = 0
+
+        for k in range(Np):
+            q = z_norm[:, k, :]          # (B, 2m) query
+            pos = z_aug_norm[:, k, :]    # (B, 2m) positive
+
+            # Negatives: patches far enough in time
+            neg_idx = [j for j in range(Np) if abs(j - k) > delta]
+            if len(neg_idx) < 2:
+                continue
+
+            negs = z_norm[:, neg_idx, :]   # (B, N_neg, 2m)
+
+            # Similarity: (B, 1+N_neg)
+            sim_pos = (q * pos).sum(dim=-1, keepdim=True) / tau      # (B, 1)
+            sim_neg = torch.bmm(negs, q.unsqueeze(-1)).squeeze(-1) / tau  # (B, N_neg)
+
+            logits = torch.cat([sim_pos, sim_neg], dim=-1)   # (B, 1+N_neg)
+            labels = torch.zeros(B, dtype=torch.long, device=q.device)
+            loss_cst += F.cross_entropy(logits, labels)
+            count += 1
+
+        return loss_cst / max(count, 1)
 
     @torch.no_grad()
     def sample(
