@@ -52,6 +52,7 @@ class KoopmanCVAEConfig:
     beta_kl: float = 1.0
     alpha_pred: float = 1.0
     gamma_eig: float = 0.1
+    delta_cst: float = 1.0
 
     # Regularization
     dropout: float = 0.1
@@ -482,7 +483,7 @@ class KoopmanCVAE(nn.Module):
         # p_hat: (B, Np, n, da)  -- symlog space
 
         # Losses
-        losses = self.compute_losses(patches, p_hat, enc)
+        losses = self.compute_losses(patches, p_hat, enc, patch_emb, state_emb)
 
         return {**losses, 'p_hat': p_hat, **enc}
 
@@ -491,6 +492,8 @@ class KoopmanCVAE(nn.Module):
         patches: torch.Tensor,   # (B, Np, n, da)  symlog space
         p_hat: torch.Tensor,     # (B, Np, n, da)  symlog space
         enc: Dict[str, torch.Tensor],
+        patch_emb: torch.Tensor,
+        state_emb: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
 
         B, Np, n, da = patches.shape
@@ -569,13 +572,17 @@ class KoopmanCVAE(nn.Module):
         omega_drift = (self.koopman.omega - omega_init) / (omega_init + 1e-6)
         loss_eig = omega_drift.pow(2).mean()
 
+        # ── 5. Constrastive Regularization ────────────────────────────────
+        loss_cst = self.compute_contrastive_loss(patch_emb, state_emb, enc)
         # ── Total Loss ───────────────────────────────────────────────────
+
         cfg = self.cfg
         loss_total = (
             loss_recon
             + cfg.beta_kl * loss_kl
             + cfg.alpha_pred * loss_pred
             + cfg.gamma_eig * loss_eig
+            + cfg.delta_cst * loss_cst
         )
 
         return {
@@ -584,6 +591,7 @@ class KoopmanCVAE(nn.Module):
             'loss_kl': loss_kl,
             'loss_pred': loss_pred,
             'loss_eig': loss_eig,
+            'loss_cst' : loss_cst
         }
 
     @torch.no_grad()
