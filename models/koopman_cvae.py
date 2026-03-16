@@ -621,8 +621,10 @@ class KoopmanCVAE(nn.Module):
         z_norm = F.normalize(z_flat, dim=-1)                 # (B, Np, 2m)
 
         # Positive: same patch with Gaussian noise augmentation (temporal jitter)
-        noise = torch.randn_like(patch_emb) * 0.05
-        p_aug = patch_emb + noise
+        scale = 0.8 + 0.4 * torch.rand(B, 1, 1, device=patch_emb.device)
+        noise = torch.randn_like(patch_emb) * 0.2   # 0.05 → 0.2
+        p_aug = patch_emb * scale + noise
+        
         mu_re_aug, mu_im_aug, _ = self.encoder(p_aug, state_emb)
         z_aug = torch.cat([mu_re_aug, mu_im_aug], dim=-1)
         z_aug_norm = F.normalize(z_aug, dim=-1)              # (B, Np, 2m)
