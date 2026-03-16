@@ -1,0 +1,22 @@
+﻿# Analysis outputs
+analysis/
+checkpoints/
+*.png
+*.jpg
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# IDE
+.vscode/
+.idea/
+
+# Data
+*.hdf5
+*.pkl
