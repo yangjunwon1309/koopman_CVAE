@@ -56,5 +56,6 @@ def build_config(args) -> KoopmanCVAEConfig:
         beta_kl          = args.beta_kl,
         alpha_pred       = args.alpha_pred,
         gamma_eig        = args.gamma_eig,
+        delta_cst        = args.delta_cst,
         dropout          = args.dropout,
     )

@@ -1,24 +1,47 @@
 """
-Diagonal Koopman Prior CVAE
-============================
-Action sequence modeling conditioned on robot states.
-Compatible with: DMControl, Isaac Gym, D4RL (Adroit), HumanoidBench
+Diagonal Koopman Prior CVAE — v2
+=====================================
+Changes from v1:
+  1. Polar latent: z_k^i = A_k^i * exp(j * theta_k^i)
+     - Encoder outputs amplitude A and phase theta separately
+     - More natural for Koopman rotation: exp(lambda*dt) = |lambda|*exp(j*angle)
 
-Architecture:
-  - Symlog normalization for actions and states
-  - Action patch tokenization
-  - Symmetric GRU encoder/decoder (state as GRU input, not just init)
-  - Diagonal Koopman prior: CN(diag(lambda) z_{k-1}, Sigma)
-  - Complex-valued latent z_k in C^m
-  - Learnable imaginary eigenvalues, fixed real eigenvalues
+  2. Temporal contrastive loss (time-series aware):
+     - Positive: patches within |j-k| <= delta_pos (temporally adjacent)
+     - Negative: patches with |j-k| >= delta_neg
+     - No augmentation needed
+
+  3. Multi-step prediction loss (KoVAE-style):
+     - For each anchor patch k: predict z_{k+1}, z_{k+2}, ..., z_{k+H}
+       using z_k * lambda_bar^1, lambda_bar^2, ..., lambda_bar^H
+     - MSE between predicted and true latents
+
+  4. KL prior options:
+     - 'koopman': prior = CN(lambda_bar * z_{k-1}, Sigma)  [dynamic prior]
+     - 'standard': prior = CN(0, Sigma)                    [simple regularization]
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from dataclasses import dataclass
-from typing import Optional, Dict, Tuple
+from dataclasses import dataclass, field
+from typing import Optional, Tuple, Dict
+
+
+# ─────────────────────────────────────────────
+#  Utility
+# ─────────────────────────────────────────────
+
+def symlog(x: torch.Tensor) -> torch.Tensor:
+    return torch.sign(x) * torch.log(torch.abs(x) + 1.0)
+
+def symexp(x: torch.Tensor) -> torch.Tensor:
+    return torch.sign(x) * (torch.exp(torch.abs(x)) - 1.0)
+
+def complex_mul(a_re, a_im, b_re, b_im):
+    """Element-wise complex multiply: (a_re+j*a_im)(b_re+j*b_im)"""
+    return a_re * b_re - a_im * b_im, a_re * b_im + a_im * b_re
 
 
 # ─────────────────────────────────────────────
@@ -27,154 +50,125 @@ from typing import Optional, Dict, Tuple
 
 @dataclass
 class KoopmanCVAEConfig:
-    # Environment dimensions
-    action_dim: int = 6              # d_a
-    state_dim: int = 24              # d_s
-
-    # Patch settings
-    patch_size: int = 5              # n (timesteps per patch)
-    dt_control: float = 0.02         # control period in seconds (1/Hz)
+    # Environment
+    action_dim: int = 6
+    state_dim: int = 24
+    patch_size: int = 5
+    dt_control: float = 0.02
 
     # Architecture
-    embed_dim: int = 128             # d: patch embedding dim
-    state_embed_dim: int = 64        # state embedding dim
-    gru_hidden_dim: int = 256        # GRU hidden size
-    mlp_hidden_dim: int = 256        # MLP hidden size
-    koopman_dim: int = 64            # m: complex latent dim
+    embed_dim: int = 128
+    state_embed_dim: int = 64
+    gru_hidden_dim: int = 256
+    mlp_hidden_dim: int = 256
+    koopman_dim: int = 64
 
-    # Koopman eigenvalue settings
-    mu_fixed: float = -0.2           # fixed real part of continuous eigenvalue
-    omega_max: float = math.pi       # max frequency for init
-    mu_min: float = -0.5             # stability constraint lower bound
-    mu_max: float = -0.01            # stability constraint upper bound
+    # Koopman eigenvalue
+    mu_fixed: float = -0.2
+    omega_max: float = math.pi
+    mu_min: float = -0.5
+    mu_max: float = -0.01
 
     # Loss weights
-    beta_kl: float = 1.0
+    beta_kl: float = 0.1
     alpha_pred: float = 1.0
     gamma_eig: float = 0.1
     delta_cst: float = 1.0
+
+    # Multi-step prediction
+    pred_steps: int = 5          # H: predict up to H steps ahead
+
+    # KL prior mode: 'koopman' or 'standard'
+    kl_prior: str = 'koopman'
+
+    # Contrastive
+    temp_contrastive: float = 0.1
+    delta_pos: int = 2           # |j-k| <= delta_pos → positive
+    delta_neg: int = 4           # |j-k| >= delta_neg → negative
 
     # Regularization
     dropout: float = 0.1
     layer_norm: bool = True
 
-    temp_contrastive: float = 0.1    # temperature
-    delta_min: int = 3   
-
 
 # ─────────────────────────────────────────────
-#  Utility Functions
-# ─────────────────────────────────────────────
-
-def symlog(x: torch.Tensor) -> torch.Tensor:
-    """Symmetric log: sign(x) * ln(|x| + 1)"""
-    return torch.sign(x) * torch.log(torch.abs(x) + 1.0)
-
-
-def symexp(x: torch.Tensor) -> torch.Tensor:
-    """Inverse of symlog: sign(x) * (exp(|x|) - 1)"""
-    return torch.sign(x) * (torch.exp(torch.abs(x)) - 1.0)
-
-
-def complex_mul(a_re, a_im, b_re, b_im):
-    """Element-wise complex multiplication: (a_re + j*a_im)(b_re + j*b_im)"""
-    re = a_re * b_re - a_im * b_im
-    im = a_re * b_im + a_im * b_re
-    return re, im
-
-
-# ─────────────────────────────────────────────
-#  Koopman Eigenvalue Module
+#  Koopman Eigenvalues
 # ─────────────────────────────────────────────
 
 class KoopmanEigenvalues(nn.Module):
     """
-    Diagonal Koopman eigenvalues: lambda_i = mu_i + j * omega_i
-    - mu_i: fixed constant in [-0.5, -0.01]
-    - omega_i: learnable, initialized with ascending frequencies
-    - Discretized via ZOH: lambda_bar_i = exp(lambda_i * dt)
+    Diagonal Koopman: lambda_i = mu_i + j*omega_i
+    mu_i: fixed,  omega_i: learnable
+    Discrete via ZOH: lambda_bar_i = exp(lambda_i * dt)
     """
     def __init__(self, cfg: KoopmanCVAEConfig):
         super().__init__()
-        self.m = cfg.koopman_dim
-        self.mu = cfg.mu_fixed
-        self.dt = cfg.patch_size * cfg.dt_control   # Delta t per patch
+        self.m  = cfg.koopman_dim
+        self.dt = cfg.patch_size * cfg.dt_control
 
-        # Fixed real part (no gradient)
-        mu_tensor = torch.full((self.m,), cfg.mu_fixed)
-        self.register_buffer('mu_fixed', mu_tensor)
+        self.register_buffer('mu_fixed',
+            torch.full((self.m,), cfg.mu_fixed))
 
-        # Learnable imaginary part: omega_i = pi * omega_max / (m+1-i)
+        # Ascending frequency initialization: omega_i = pi*omega_max / (m+1-i)
         omega_init = torch.tensor([
             math.pi * cfg.omega_max / (self.m + 1 - i)
             for i in range(1, self.m + 1)
         ])
         self.omega = nn.Parameter(omega_init)
 
-        # Learnable process noise: Sigma = diag(sigma_1^2, ..., sigma_m^2)
+        # Learnable process noise
         self.log_sigma = nn.Parameter(torch.zeros(self.m))
 
     @property
     def sigma_sq(self) -> torch.Tensor:
-        """Process noise variance (always positive)"""
         return F.softplus(self.log_sigma) + 1e-6
 
-    def get_discrete_eigenvalues(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Returns (lambda_bar_re, lambda_bar_im) via ZOH discretization.
-        lambda_bar_i = exp(mu_i * dt) * (cos(omega_i * dt) + j*sin(omega_i * dt))
-        """
-        dt = self.dt
-        decay = torch.exp(self.mu_fixed * dt)          # e^{mu * dt}, shape (m,)
-        lambda_bar_re = decay * torch.cos(self.omega * dt)
-        lambda_bar_im = decay * torch.sin(self.omega * dt)
-        return lambda_bar_re, lambda_bar_im
+    def get_discrete(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Returns (lambda_bar_re, lambda_bar_im), shape (m,)"""
+        decay = torch.exp(self.mu_fixed * self.dt)
+        return decay * torch.cos(self.omega * self.dt), \
+               decay * torch.sin(self.omega * self.dt)
 
-    def propagate(
+    def get_modulus_angle(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Returns (|lambda_bar|, angle), shape (m,)"""
+        lb_re, lb_im = self.get_discrete()
+        return torch.sqrt(lb_re**2 + lb_im**2), torch.atan2(lb_im, lb_re)
+
+    def propagate_polar(
         self,
-        z_re: torch.Tensor,  # (B, m)
-        z_im: torch.Tensor,  # (B, m)
+        A: torch.Tensor,      # (..., m) amplitude
+        theta: torch.Tensor,  # (..., m) phase
+        steps: int = 1,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Compute prior mean: mu_0 = diag(lambda_bar) z_{k-1}
-        Returns (mu0_re, mu0_im), each (B, m)
+        Koopman propagation in polar:
+          A_{k+h} = |lambda_bar|^h * A_k
+          theta_{k+h} = theta_k + h * angle(lambda_bar)
+        Returns (A_new, theta_new) same shape as input.
         """
-        lb_re, lb_im = self.get_discrete_eigenvalues()  # (m,)
-        mu0_re, mu0_im = complex_mul(lb_re, lb_im, z_re, z_im)
-        return mu0_re, mu0_im
+        mod, ang = self.get_modulus_angle()  # (m,)
+        A_new     = A     * (mod ** steps)
+        theta_new = theta + steps * ang
+        return A_new, theta_new
 
-    def rollout(
+    def rollout_polar(
         self,
-        z_re: torch.Tensor,   # (B, m)
-        z_im: torch.Tensor,   # (B, m)
+        A: torch.Tensor,      # (B, m)
+        theta: torch.Tensor,  # (B, m)
         steps: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Multi-step deterministic rollout: z_{k+tau} = diag(lambda_bar)^tau * z_k
-        Returns (z_re_seq, z_im_seq), each (B, steps, m)
-        O(m * steps), fully parallel via Vandermonde
+        Returns (A_seq, theta_seq), each (B, steps, m)
+        z_{k+h} = |lambda_bar|^h * A_k * exp(j*(theta_k + h*ang))
         """
-        lb_re, lb_im = self.get_discrete_eigenvalues()  # (m,)
-        # tau = 1, ..., steps
-        taus = torch.arange(1, steps + 1, device=z_re.device).float()  # (steps,)
+        mod, ang = self.get_modulus_angle()       # (m,)
+        hs = torch.arange(1, steps+1,
+                          device=A.device).float() # (steps,)
 
-        # |lambda_bar|^tau and angle * tau
-        decay = torch.exp(self.mu_fixed * self.dt)           # (m,)
-        decay_tau = decay.unsqueeze(0) ** taus.unsqueeze(1)  # (steps, m)
-        angle = torch.atan2(lb_im, lb_re)                    # (m,)
-        angle_tau = angle.unsqueeze(0) * taus.unsqueeze(1)   # (steps, m)
-
-        lb_re_tau = decay_tau * torch.cos(angle_tau)  # (steps, m)
-        lb_im_tau = decay_tau * torch.sin(angle_tau)  # (steps, m)
-
-        # z_re: (B, m) -> broadcast with (steps, m)
-        z_re_seq, z_im_seq = complex_mul(
-            lb_re_tau.unsqueeze(0),   # (1, steps, m)
-            lb_im_tau.unsqueeze(0),
-            z_re.unsqueeze(1),        # (B, 1, m)
-            z_im.unsqueeze(1),
-        )
-        return z_re_seq, z_im_seq  # (B, steps, m)
+        # (B, steps, m)
+        A_seq     = A.unsqueeze(1) * (mod.unsqueeze(0) ** hs.unsqueeze(-1))
+        theta_seq = theta.unsqueeze(1) + hs.unsqueeze(-1) * ang.unsqueeze(0)
+        return A_seq, theta_seq
 
 
 # ─────────────────────────────────────────────
@@ -182,31 +176,16 @@ class KoopmanEigenvalues(nn.Module):
 # ─────────────────────────────────────────────
 
 class PatchEmbedding(nn.Module):
-    """Flatten action patch and project to embedding dim"""
     def __init__(self, cfg: KoopmanCVAEConfig):
         super().__init__()
-        self.patch_size = cfg.patch_size
-        self.action_dim = cfg.action_dim
-        patch_flat_dim = cfg.patch_size * cfg.action_dim
-        self.proj = nn.Linear(patch_flat_dim, cfg.embed_dim)
+        self.proj = nn.Linear(cfg.patch_size * cfg.action_dim, cfg.embed_dim)
 
     def forward(self, p: torch.Tensor) -> torch.Tensor:
-        """
-        p: (B, Np, patch_size * action_dim) or (B, Np, patch_size, action_dim)
-        Returns: (B, Np, embed_dim)
-        """
-        if p.dim() == 4:
-            B, Np, n, da = p.shape
-            p = p.reshape(B, Np, n * da)
+        """p: (B, Np, n*da) → (B, Np, embed_dim)"""
         return self.proj(p)
 
 
-# ─────────────────────────────────────────────
-#  State Embedding
-# ─────────────────────────────────────────────
-
 class StateEmbedding(nn.Module):
-    """Embed symlog-normalized state into fixed-size vector"""
     def __init__(self, cfg: KoopmanCVAEConfig):
         super().__init__()
         self.net = nn.Sequential(
@@ -216,64 +195,77 @@ class StateEmbedding(nn.Module):
         )
 
     def forward(self, s: torch.Tensor) -> torch.Tensor:
-        """s: (B, Np, state_dim) -> (B, Np, state_embed_dim)"""
         return self.net(s)
 
 
 # ─────────────────────────────────────────────
-#  Encoder
+#  Encoder — Polar Latent
 # ─────────────────────────────────────────────
 
 class KoopmanEncoder(nn.Module):
     """
-    Symmetric encoder:
-      GRU input = [patch_embed ; state_embed]  (action + state together)
-    Outputs posterior parameters: mu_re, mu_im, log_sigma per patch
+    Symmetric encoder: GRU input = [patch_emb ; state_emb]
+    Outputs polar posterior: (log_A, theta, log_sigma) per patch
+
+    Reparameterization:
+      A     = softplus(log_A_net) + eps    (amplitude > 0)
+      theta = theta_net                    (phase, unbounded)
+      z_re  = A * cos(theta)
+      z_im  = A * sin(theta)
     """
     def __init__(self, cfg: KoopmanCVAEConfig):
         super().__init__()
         self.m = cfg.koopman_dim
-        gru_input_dim = cfg.embed_dim + cfg.state_embed_dim
+        gru_in = cfg.embed_dim + cfg.state_embed_dim
 
         self.gru = nn.GRU(
-            input_size=gru_input_dim,
+            input_size=gru_in,
             hidden_size=cfg.gru_hidden_dim,
             num_layers=2,
             batch_first=True,
             dropout=cfg.dropout if cfg.dropout > 0 else 0,
         )
+        self.ln = nn.LayerNorm(cfg.gru_hidden_dim) if cfg.layer_norm else nn.Identity()
 
-        if cfg.layer_norm:
-            self.ln = nn.LayerNorm(cfg.gru_hidden_dim)
-        else:
-            self.ln = nn.Identity()
-
+        # Output: log_A (m), theta (m), log_sigma (m)
         self.mlp = nn.Sequential(
             nn.Linear(cfg.gru_hidden_dim, cfg.mlp_hidden_dim),
             nn.SiLU(),
-            nn.Linear(cfg.mlp_hidden_dim, 3 * cfg.koopman_dim),  # mu_re, mu_im, log_sigma
+            nn.Linear(cfg.mlp_hidden_dim, 3 * cfg.koopman_dim),
         )
 
     def forward(
         self,
         p_emb: torch.Tensor,   # (B, Np, embed_dim)
         s_emb: torch.Tensor,   # (B, Np, state_embed_dim)
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Returns:
-          mu_re:    (B, Np, m)
-          mu_im:    (B, Np, m)
-          sigma:    (B, Np, m)  -- shared for re and im
-        """
-        x = torch.cat([p_emb, s_emb], dim=-1)   # (B, Np, embed+state_embed)
-        h, _ = self.gru(x)                        # (B, Np, gru_hidden)
+    ) -> Dict[str, torch.Tensor]:
+        x = torch.cat([p_emb, s_emb], dim=-1)
+        h, _ = self.gru(x)
         h = self.ln(h)
-        out = self.mlp(h)                          # (B, Np, 3m)
+        out = self.mlp(h)                              # (B, Np, 3m)
+        log_A, theta, log_sigma = out.chunk(3, dim=-1)
 
-        mu_re, mu_im, log_sigma = out.chunk(3, dim=-1)   # each (B, Np, m)
-        sigma = F.softplus(log_sigma) + 1e-4
+        # Amplitude: always positive
+        A     = F.softplus(log_A) + 1e-4              # (B, Np, m)
+        sigma = F.softplus(log_sigma) + 1e-4          # (B, Np, m)
 
-        return mu_re, mu_im, sigma
+        # Reparameterize: z = A*exp(j*theta) + sigma*eps
+        eps_re = torch.randn_like(A)
+        eps_im = torch.randn_like(A)
+
+        z_re = A * torch.cos(theta) + (sigma / math.sqrt(2)) * eps_re
+        z_im = A * torch.sin(theta) + (sigma / math.sqrt(2)) * eps_im
+
+        return {
+            'A': A,           # amplitude (B, Np, m)
+            'theta': theta,   # phase     (B, Np, m)
+            'sigma': sigma,   # std       (B, Np, m)
+            'z_re': z_re,     # (B, Np, m)
+            'z_im': z_im,     # (B, Np, m)
+            # posterior mean in re/im for losses
+            'mu_re': A * torch.cos(theta),
+            'mu_im': A * torch.sin(theta),
+        }
 
 
 # ─────────────────────────────────────────────
@@ -282,72 +274,49 @@ class KoopmanEncoder(nn.Module):
 
 class KoopmanDecoder(nn.Module):
     """
-    Symmetric decoder:
-      GRU input = [zero_action ; state_embed]  (zero + state together)
-      GRU initial hidden state = projected latent z_k
-    Outputs reconstructed action patch
+    Symmetric decoder: GRU input = [zeros ; state_emb]
+    Initial hidden = projected (Re(z), Im(z), state_emb)
     """
     def __init__(self, cfg: KoopmanCVAEConfig):
         super().__init__()
-        self.patch_size = cfg.patch_size
-        self.action_dim = cfg.action_dim
-        self.m = cfg.koopman_dim
+        self.n  = cfg.patch_size
+        self.da = cfg.action_dim
 
-        latent_real_dim = 2 * cfg.koopman_dim  # Re(z) + Im(z)
-        gru_input_dim = cfg.state_embed_dim     # zero action + state_embed
-        # (zero action part is just zeros, same dim as state_embed for symmetry)
-
-        # Project latent + state to GRU init hidden state
         self.proj = nn.Sequential(
-            nn.Linear(latent_real_dim + cfg.state_embed_dim, cfg.mlp_hidden_dim),
+            nn.Linear(2 * cfg.koopman_dim + cfg.state_embed_dim,
+                      cfg.mlp_hidden_dim),
             nn.SiLU(),
-            nn.Linear(cfg.mlp_hidden_dim, cfg.gru_hidden_dim * 2),  # for 2-layer GRU
+            nn.Linear(cfg.mlp_hidden_dim, cfg.gru_hidden_dim * 2),
         )
-
-        # GRU: unroll patch_size steps
-        # Input at each step: state_embed (zeros for action part, symmetric with encoder)
         self.gru = nn.GRU(
-            input_size=gru_input_dim,
+            input_size=cfg.state_embed_dim,
             hidden_size=cfg.gru_hidden_dim,
             num_layers=2,
             batch_first=True,
             dropout=cfg.dropout if cfg.dropout > 0 else 0,
         )
-
-        # Output: action per step
         self.out = nn.Linear(cfg.gru_hidden_dim, cfg.action_dim)
 
     def forward(
         self,
-        z_re: torch.Tensor,   # (B, Np, m)
-        z_im: torch.Tensor,   # (B, Np, m)
-        s_emb: torch.Tensor,  # (B, Np, state_embed_dim)
+        z_re: torch.Tensor,     # (B, Np, m)
+        z_im: torch.Tensor,     # (B, Np, m)
+        s_emb: torch.Tensor,    # (B, Np, state_embed_dim)
     ) -> torch.Tensor:
-        """
-        Returns reconstructed action patches: (B, Np, patch_size, action_dim)
-        in symlog space
-        """
+        """Returns (B, Np, n, da) in symlog space"""
         B, Np, _ = s_emb.shape
 
-        # Flatten patches into batch for parallel processing
-        z_re_flat = z_re.reshape(B * Np, self.m)
-        z_im_flat = z_im.reshape(B * Np, self.m)
-        s_flat = s_emb.reshape(B * Np, -1)
+        z_re_f = z_re.reshape(B * Np, -1)
+        z_im_f = z_im.reshape(B * Np, -1)
+        s_f    = s_emb.reshape(B * Np, -1)
 
-        # Project latent to GRU initial hidden state
-        latent = torch.cat([z_re_flat, z_im_flat, s_flat], dim=-1)  # (B*Np, 2m+state_embed)
-        h_init = self.proj(latent)  # (B*Np, gru_hidden*2)
-        # Split into 2 layers: (2, B*Np, gru_hidden)
+        h_init = self.proj(torch.cat([z_re_f, z_im_f, s_f], dim=-1))
         h_init = h_init.reshape(B * Np, 2, -1).permute(1, 0, 2).contiguous()
 
-        # GRU input: repeat state embedding for each step, zero action (symmetric)
-        # Encoder uses [action_patch ; state_embed], decoder uses [zeros ; state_embed]
-        s_seq = s_flat.unsqueeze(1).expand(-1, self.patch_size, -1)  # (B*Np, n, state_embed)
-
-        out, _ = self.gru(s_seq, h_init)  # (B*Np, n, gru_hidden)
-        actions = self.out(out)            # (B*Np, n, action_dim)
-
-        return actions.reshape(B, Np, self.patch_size, self.action_dim)
+        s_seq = s_f.unsqueeze(1).expand(-1, self.n, -1)
+        out, _ = self.gru(s_seq, h_init)
+        acts = self.out(out)                   # (B*Np, n, da)
+        return acts.reshape(B, Np, self.n, self.da)
 
 
 # ─────────────────────────────────────────────
@@ -356,28 +325,21 @@ class KoopmanDecoder(nn.Module):
 
 class KoopmanCVAE(nn.Module):
     """
-    Diagonal Koopman Prior CVAE for robot action sequence modeling.
-
-    P(a_{1:T} | s_{1:T}) modeled via structured latent dynamics:
-      - z_k in C^m follows diagonal Koopman prior
-      - State s_k conditions encoder and decoder symmetrically
-
-    Compatible environments:
-      - DMControl: action_dim=1~21, state_dim=6~67, dt=0.02s
-      - Isaac Gym: action_dim=6~23, state_dim=32~200, dt=0.0167s
-      - D4RL Adroit: action_dim=24~30, state_dim=39~46, dt=0.04s
-      - HumanoidBench: action_dim=19~56, state_dim=76~350, dt=0.01s
+    Diagonal Koopman Prior CVAE v2
+    - Polar latent: z_k = A_k * exp(j*theta_k)
+    - Temporal contrastive (time-proximity as positive)
+    - Multi-step Koopman prediction loss
+    - KL with koopman or standard prior
     """
-
     def __init__(self, cfg: KoopmanCVAEConfig):
         super().__init__()
         self.cfg = cfg
 
         self.patch_embed = PatchEmbedding(cfg)
         self.state_embed = StateEmbedding(cfg)
-        self.encoder = KoopmanEncoder(cfg)
-        self.decoder = KoopmanDecoder(cfg)
-        self.koopman = KoopmanEigenvalues(cfg)
+        self.encoder     = KoopmanEncoder(cfg)
+        self.decoder     = KoopmanDecoder(cfg)
+        self.koopman     = KoopmanEigenvalues(cfg)
 
         self._init_weights()
 
@@ -388,332 +350,321 @@ class KoopmanCVAE(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
             elif isinstance(m, nn.GRU):
-                for name, param in m.named_parameters():
+                for name, p in m.named_parameters():
                     if 'weight' in name:
-                        nn.init.orthogonal_(param)
+                        nn.init.orthogonal_(p)
                     elif 'bias' in name:
-                        nn.init.zeros_(param)
+                        nn.init.zeros_(p)
+
+    # ── Preprocessing ────────────────────────────────────────
 
     def preprocess(
         self,
-        actions: torch.Tensor,   # (B, T, action_dim)
-        states: torch.Tensor,    # (B, T, state_dim)
+        actions: torch.Tensor,   # (B, T, da)
+        states: torch.Tensor,    # (B, T, ds)
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        1. Symlog normalization
-        2. Patch tokenization for actions
-        3. State selection per patch (start of each patch)
-        Returns:
-          patches: (B, Np, patch_size, action_dim) -- symlog space
-          patch_emb: (B, Np, embed_dim)
-          state_emb: (B, Np, state_embed_dim)
-        """
         n = self.cfg.patch_size
         B, T, da = actions.shape
 
-        # Symlog normalize
-        a_norm = symlog(actions)
+        T_crop = (T // n) * n
+        Np     = T_crop // n
+
+        a_norm = symlog(actions[:, :T_crop, :])
         s_norm = symlog(states)
 
-        # Truncate to multiple of patch_size
-        T_crop = (T // n) * n
-        a_norm = a_norm[:, :T_crop, :]     # (B, T_crop, da)
-        Np = T_crop // n
+        patches = a_norm.reshape(B, Np, n, da)       # (B, Np, n, da)
+        s_patch = s_norm[:, ::n, :][:, :Np, :]       # (B, Np, ds)
 
-        # Reshape to patches: (B, Np, n, da)
-        patches = a_norm.reshape(B, Np, n, da)
+        p_flat   = patches.reshape(B, Np, n * da)
+        p_emb    = self.patch_embed(p_flat)           # (B, Np, embed_dim)
+        s_emb    = self.state_embed(s_patch)          # (B, Np, state_embed_dim)
 
-        # Select state at start of each patch
-        s_patch = s_norm[:, ::n, :][:, :Np, :]   # (B, Np, ds)
+        return patches, p_emb, s_emb
 
-        # Embeddings
-        p_flat = patches.reshape(B, Np, n * da)
-        patch_emb = self.patch_embed.proj(p_flat)   # (B, Np, embed_dim)
-        state_emb = self.state_embed(s_patch)        # (B, Np, state_embed_dim)
+    # ── Encode / Decode ──────────────────────────────────────
 
-        return patches, patch_emb, state_emb
+    def encode(self, p_emb, s_emb):
+        return self.encoder(p_emb, s_emb)
 
-    def encode(
-        self,
-        patch_emb: torch.Tensor,  # (B, Np, embed_dim)
-        state_emb: torch.Tensor,  # (B, Np, state_embed_dim)
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Returns posterior parameters and sampled latents.
-        """
-        mu_re, mu_im, sigma = self.encoder(patch_emb, state_emb)
-        # (B, Np, m) each
+    def decode(self, z_re, z_im, s_emb):
+        return self.decoder(z_re, z_im, s_emb)
 
-        # Reparameterize: z = mu + (1/sqrt(2)) * eps * sigma
-        eps_re = torch.randn_like(mu_re)
-        eps_im = torch.randn_like(mu_im)
-        z_re = mu_re + (1.0 / math.sqrt(2)) * eps_re * sigma
-        z_im = mu_im + (1.0 / math.sqrt(2)) * eps_im * sigma
-
-        return {
-            'mu_re': mu_re,     # (B, Np, m)
-            'mu_im': mu_im,     # (B, Np, m)
-            'sigma': sigma,     # (B, Np, m)
-            'z_re': z_re,       # (B, Np, m)
-            'z_im': z_im,       # (B, Np, m)
-        }
-
-    def decode(
-        self,
-        z_re: torch.Tensor,    # (B, Np, m)
-        z_im: torch.Tensor,    # (B, Np, m)
-        state_emb: torch.Tensor,  # (B, Np, state_embed_dim)
-    ) -> torch.Tensor:
-        """
-        Returns reconstructed action patches in symlog space.
-        Shape: (B, Np, patch_size, action_dim)
-        """
-        return self.decoder(z_re, z_im, state_emb)
+    # ── Forward ──────────────────────────────────────────────
 
     def forward(
         self,
-        actions: torch.Tensor,   # (B, T, action_dim)
-        states: torch.Tensor,    # (B, T, state_dim)
+        actions: torch.Tensor,
+        states: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-        """
-        Full forward pass. Returns dict with losses and intermediates.
-        """
-        patches, patch_emb, state_emb = self.preprocess(actions, states)
-        enc = self.encode(patch_emb, state_emb)
-
-        # Decode
-        p_hat = self.decode(enc['z_re'], enc['z_im'], state_emb)
-        # p_hat: (B, Np, n, da)  -- symlog space
-
-        # Losses
-        losses = self.compute_losses(patches, p_hat, enc, patch_emb, state_emb)
-
+        patches, p_emb, s_emb = self.preprocess(actions, states)
+        enc    = self.encode(p_emb, s_emb)
+        p_hat  = self.decode(enc['z_re'], enc['z_im'], s_emb)
+        losses = self.compute_losses(patches, p_hat, enc, p_emb, s_emb)
         return {**losses, 'p_hat': p_hat, **enc}
 
-    def compute_losses(
-        self,
-        patches: torch.Tensor,   # (B, Np, n, da)  symlog space
-        p_hat: torch.Tensor,     # (B, Np, n, da)  symlog space
-        enc: Dict[str, torch.Tensor],
-        patch_emb: torch.Tensor,
-        state_emb: torch.Tensor,
-    ) -> Dict[str, torch.Tensor]:
+    # ── Loss: Reconstruction ─────────────────────────────────
 
-        B, Np, n, da = patches.shape
-        mu_re  = enc['mu_re']    # (B, Np, m)
-        mu_im  = enc['mu_im']
-        sigma  = enc['sigma']
-        z_re   = enc['z_re']
-        z_im   = enc['z_im']
-
-        # ── 1. Reconstruction Loss ──────────────────────────────────────
-        p_flat = patches.reshape(B, Np, -1)
-        p_hat_flat = p_hat.reshape(B, Np, -1)
-        loss_recon = F.mse_loss(p_hat_flat, p_flat, reduction='mean')
-
-        # ── 2. KL Divergence ────────────────────────────────────────────
-        # Prior mean: mu_0_{k,i} = lambda_bar_i * z_{k-1,i}
-        # Use sampled z for prior mean (as in original ELBO derivation)
-        lb_re, lb_im = self.koopman.get_discrete_eigenvalues()  # (m,)
-        sigma_sq = self.koopman.sigma_sq                         # (m,)
-
-        # Shift: z_{k-1} for k=2,...,Np
-        z_prev_re = z_re[:, :-1, :]   # (B, Np-1, m)
-        z_prev_im = z_im[:, :-1, :]
-
-        mu0_re, mu0_im = complex_mul(
-            lb_re, lb_im,
-            z_prev_re, z_prev_im,
-        )  # (B, Np-1, m)
-
-        # Posterior params for k=2,...,Np
-        mu_re_k = mu_re[:, 1:, :]    # (B, Np-1, m)
-        mu_im_k = mu_im[:, 1:, :]
-        sigma_k = sigma[:, 1:, :]    # (B, Np-1, m)
-
-        # KL = ||mu_re - mu0_re||^2 / sigma0^2
-        #    + ||mu_im - mu0_im||^2 / sigma0^2
-        #    + sigma_k^2 / sigma0^2
-        #    - ln(sigma_k^2 / sigma0^2) - 1
-        diff_re_sq = (mu_re_k - mu0_re).pow(2)   # (B, Np-1, m)
-        diff_im_sq = (mu_im_k - mu0_im).pow(2)
-
-        # sigma0^2 broadcast: (m,) -> (1, 1, m)
-        s0_sq = sigma_sq.unsqueeze(0).unsqueeze(0)
-        sk_sq = sigma_k.pow(2)
-
-        kl_per = (
-            (diff_re_sq + diff_im_sq) / s0_sq
-            + sk_sq / s0_sq
-            - torch.log(sk_sq / s0_sq + 1e-8)
-            - 1.0
-        )  # (B, Np-1, m)
-        loss_kl = kl_per.mean()
-
-        # ── 3. Linearity Promotion Loss ─────────────────────────────────
-        # L_pred = sum_{k=2} sum_i |mu_{k,i} - lambda_bar_i * mu_{k-1,i}|^2
-        mu_prev_re = mu_re[:, :-1, :]
-        mu_prev_im = mu_im[:, :-1, :]
-
-        mu0_re_det, mu0_im_det = complex_mul(
-            lb_re, lb_im,
-            mu_prev_re, mu_prev_im,
-        )  # (B, Np-1, m)
-
-        loss_pred = (
-            (mu_re_k - mu0_re_det).pow(2) +
-            (mu_im_k - mu0_im_det).pow(2)
-        ).mean()
-
-        # ── 4. Eigenvalue Regularization ────────────────────────────────
-        # Regularize omega away from drifting too far from initialization
-        # (mu is fixed so only omega matters)
-        omega_init = torch.tensor([
-            math.pi * self.cfg.omega_max / (self.cfg.koopman_dim + 1 - i)
-            for i in range(1, self.cfg.koopman_dim + 1)
-        ], device=mu_re.device)
-        omega_drift = (self.koopman.omega - omega_init) / (omega_init + 1e-6)
-        loss_eig = omega_drift.pow(2).mean()
-
-        # ── 5. Constrastive Regularization ────────────────────────────────
-        loss_cst = self.compute_contrastive_loss(patch_emb, state_emb, enc)
-        # ── Total Loss ───────────────────────────────────────────────────
-
-        cfg = self.cfg
-        loss_total = (
-            loss_recon
-            + cfg.beta_kl * loss_kl
-            + cfg.alpha_pred * loss_pred
-            + cfg.gamma_eig * loss_eig
-            + cfg.delta_cst * loss_cst
+    def loss_reconstruction(self, patches, p_hat):
+        """MSE in symlog space"""
+        return F.mse_loss(
+            p_hat.reshape(*patches.shape),
+            patches
         )
 
-        return {
-            'loss': loss_total,
-            'loss_recon': loss_recon,
-            'loss_kl': loss_kl,
-            'loss_pred': loss_pred,
-            'loss_eig': loss_eig,
-            'loss_cst' : loss_cst
-        }
-    
-    def compute_contrastive_loss(
+    # ── Loss: KL Divergence ──────────────────────────────────
+
+    def loss_kl(self, enc: Dict) -> torch.Tensor:
+        """
+        Two modes (cfg.kl_prior):
+          'koopman' : prior = CN(lambda_bar * z_{k-1}, Sigma)
+          'standard': prior = CN(0+0j, Sigma)
+
+        KL(CN(mu_hat, sigma_hat^2) || CN(mu0, sigma0^2))
+          = (||mu_hat_re - mu0_re||^2 + ||mu_hat_im - mu0_im||^2) / sigma0^2
+          + sigma_hat^2 / sigma0^2 - log(sigma_hat^2/sigma0^2) - 1
+        """
+        mu_re = enc['mu_re']   # (B, Np, m)
+        mu_im = enc['mu_im']
+        sigma = enc['sigma']   # (B, Np, m)
+        z_re  = enc['z_re']
+        z_im  = enc['z_im']
+
+        s0_sq = self.koopman.sigma_sq.unsqueeze(0).unsqueeze(0)  # (1,1,m)
+        sk_sq = sigma ** 2
+
+        if self.cfg.kl_prior == 'koopman':
+            # Prior mean: lambda_bar * z_{k-1}  for k=2,...,Np
+            lb_re, lb_im = self.koopman.get_discrete()
+            mu0_re, mu0_im = complex_mul(
+                lb_re, lb_im,
+                z_re[:, :-1, :], z_im[:, :-1, :]
+            )
+            mu_re_k = mu_re[:, 1:, :]
+            mu_im_k = mu_im[:, 1:, :]
+            sk_sq_k = sk_sq[:, 1:, :]
+
+            kl = (
+                ((mu_re_k - mu0_re)**2 + (mu_im_k - mu0_im)**2) / (s0_sq + 1e-8)
+                + sk_sq_k / (s0_sq + 1e-8)
+                - torch.log(sk_sq_k / (s0_sq + 1e-8) + 1e-8)
+                - 1.0
+            )
+
+        else:  # 'standard': CN(0, Sigma)
+            mu0_re = torch.zeros_like(mu_re)
+            mu0_im = torch.zeros_like(mu_im)
+
+            kl = (
+                (mu_re**2 + mu_im**2) / (s0_sq + 1e-8)
+                + sk_sq / (s0_sq + 1e-8)
+                - torch.log(sk_sq / (s0_sq + 1e-8) + 1e-8)
+                - 1.0
+            )
+
+        return kl.mean()
+
+    # ── Loss: Multi-step Prediction ──────────────────────────
+
+    def loss_prediction(self, enc: Dict) -> torch.Tensor:
+        """
+        KoVAE-style multi-step prediction loss:
+        For each anchor k and step h=1,...,H:
+          predicted: z_k * lambda_bar^h   (in polar: A_k*|lambda|^h, theta_k + h*angle)
+          target:    z_{k+h}
+          loss:      MSE(pred_re - true_re)^2 + MSE(pred_im - true_im)^2
+
+        Total: mean over all valid (k, h) pairs
+        """
+        A      = enc['A']      # (B, Np, m)
+        theta  = enc['theta']  # (B, Np, m)
+        mu_re  = enc['mu_re']  # (B, Np, m)  = A*cos(theta)
+        mu_im  = enc['mu_im']  # (B, Np, m)  = A*sin(theta)
+
+        B, Np, m = A.shape
+        H = min(self.cfg.pred_steps, Np - 1)
+
+        mod, ang = self.koopman.get_modulus_angle()  # (m,)
+
+        total_loss = torch.tensor(0.0, device=A.device)
+        count = 0
+
+        for h in range(1, H + 1):
+            # Predicted: Koopman propagation h steps from each anchor k
+            # anchor range: k = 0, ..., Np-h-1
+            # target range: k+h = h, ..., Np-1
+
+            A_anchor     = A[:, :Np-h, :]        # (B, Np-h, m)
+            theta_anchor = theta[:, :Np-h, :]
+
+            # Polar propagation: |lambda|^h * amplitude, theta + h*angle
+            A_pred     = A_anchor     * (mod ** h)              # (B, Np-h, m)
+            theta_pred = theta_anchor + h * ang                  # (B, Np-h, m)
+
+            pred_re = A_pred * torch.cos(theta_pred)
+            pred_im = A_pred * torch.sin(theta_pred)
+
+            true_re = mu_re[:, h:, :]             # (B, Np-h, m)
+            true_im = mu_im[:, h:, :]
+
+            loss_h = (pred_re - true_re)**2 + (pred_im - true_im)**2
+            # Normalize by Frobenius norm (as in KoVAE)
+            norm_h = torch.sqrt((pred_re**2 + pred_im**2).sum() + 1e-8)
+            total_loss += loss_h.mean() / norm_h
+            count += 1
+
+        return total_loss / max(count, 1)
+
+    # ── Loss: Temporal Contrastive ───────────────────────────
+
+    def loss_contrastive(
         self,
-        patch_emb: torch.Tensor,   # (B, Np, embed_dim)
-        state_emb: torch.Tensor,   # (B, Np, state_embed_dim)
-        enc: dict,
+        enc: Dict,
     ) -> torch.Tensor:
         """
-        InfoNCE contrastive loss on latent z.
-        Positive: temporal jitter augmentation of same patch
-        Negative: patches with |j-k| > delta_min
+        Time-series aware InfoNCE:
+          Positive pairs: patches with |j-k| <= delta_pos
+          Negative pairs: patches with |j-k| >= delta_neg
+
+        Uses posterior means (mu_re, mu_im) as representations.
+        No augmentation — temporal proximity is the positive signal.
         """
-        B, Np, _ = patch_emb.shape
-        tau = self.cfg.temp_contrastive
-        delta = self.cfg.delta_min
-        m = self.cfg.koopman_dim
-
         mu_re = enc['mu_re']   # (B, Np, m)
-        mu_im = enc['mu_im']   # (B, Np, m)
+        mu_im = enc['mu_im']
 
-        # Flatten z_k as query: concat Re+Im, L2 normalize
-        z_flat = torch.cat([mu_re, mu_im], dim=-1)          # (B, Np, 2m)
-        z_norm = F.normalize(z_flat, dim=-1)                 # (B, Np, 2m)
+        B, Np, m = mu_re.shape
+        tau      = self.cfg.temp_contrastive
+        dp       = self.cfg.delta_pos
+        dn       = self.cfg.delta_neg
 
-        # Positive: same patch with Gaussian noise augmentation (temporal jitter)
-        scale = 0.8 + 0.4 * torch.rand(B, 1, 1, device=patch_emb.device)
-        noise = torch.randn_like(patch_emb) * 0.2   # 0.05 → 0.2
-        p_aug = patch_emb * scale + noise
-        
-        mu_re_aug, mu_im_aug, _ = self.encoder(p_aug, state_emb)
-        z_aug = torch.cat([mu_re_aug, mu_im_aug], dim=-1)
-        z_aug_norm = F.normalize(z_aug, dim=-1)              # (B, Np, 2m)
+        # L2-normalize [Re; Im] as feature vector
+        z_flat = torch.cat([mu_re, mu_im], dim=-1)        # (B, Np, 2m)
+        z_norm = F.normalize(z_flat, dim=-1)              # (B, Np, 2m)
 
-        loss_cst = torch.tensor(0.0, device=patch_emb.device)
+        total_loss = torch.tensor(0.0, device=mu_re.device)
         count = 0
 
         for k in range(Np):
-            q = z_norm[:, k, :]          # (B, 2m) query
-            pos = z_aug_norm[:, k, :]    # (B, 2m) positive
+            pos_idx = [j for j in range(Np) if 0 < abs(j - k) <= dp]
+            neg_idx = [j for j in range(Np) if abs(j - k) >= dn]
 
-            # Negatives: patches far enough in time
-            neg_idx = [j for j in range(Np) if abs(j - k) > delta]
-            if len(neg_idx) < 2:
+            if len(pos_idx) == 0 or len(neg_idx) == 0:
                 continue
 
-            negs = z_norm[:, neg_idx, :]   # (B, N_neg, 2m)
+            q    = z_norm[:, k, :]                        # (B, 2m)
+            pos  = z_norm[:, pos_idx, :]                  # (B, n_pos, 2m)
+            negs = z_norm[:, neg_idx, :]                  # (B, n_neg, 2m)
 
-            # Similarity: (B, 1+N_neg)
-            sim_pos = (q * pos).sum(dim=-1, keepdim=True) / tau      # (B, 1)
-            sim_neg = torch.bmm(negs, q.unsqueeze(-1)).squeeze(-1) / tau  # (B, N_neg)
+            # Similarities
+            sim_pos = torch.bmm(pos,  q.unsqueeze(-1)).squeeze(-1) / tau  # (B, n_pos)
+            sim_neg = torch.bmm(negs, q.unsqueeze(-1)).squeeze(-1) / tau  # (B, n_neg)
 
-            logits = torch.cat([sim_pos, sim_neg], dim=-1)   # (B, 1+N_neg)
-            labels = torch.zeros(B, dtype=torch.long, device=q.device)
-            loss_cst += F.cross_entropy(logits, labels)
+            # InfoNCE: label = mean over positives
+            # Use logsumexp formulation
+            log_pos = torch.logsumexp(sim_pos, dim=-1)              # (B,)
+            log_all = torch.logsumexp(
+                torch.cat([sim_pos, sim_neg], dim=-1), dim=-1       # (B,)
+            )
+            total_loss += (log_all - log_pos).mean()
             count += 1
 
-        return loss_cst / max(count, 1)
+        return total_loss / max(count, 1)
+
+    # ── Loss: Eigenvalue Regularization ──────────────────────
+
+    def loss_eigenvalue(self) -> torch.Tensor:
+        """Regularize omega away from drifting too far"""
+        omega_init = torch.tensor([
+            math.pi * self.cfg.omega_max / (self.cfg.koopman_dim + 1 - i)
+            for i in range(1, self.cfg.koopman_dim + 1)
+        ], device=self.koopman.omega.device)
+        drift = (self.koopman.omega - omega_init) / (omega_init.abs() + 1e-6)
+        return drift.pow(2).mean()
+
+    # ── Aggregate Losses ─────────────────────────────────────
+
+    def compute_losses(
+        self,
+        patches:  torch.Tensor,
+        p_hat:    torch.Tensor,
+        enc:      Dict,
+        p_emb:    torch.Tensor,
+        s_emb:    torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        cfg = self.cfg
+
+        loss_recon = self.loss_reconstruction(patches, p_hat)
+        loss_kl    = self.loss_kl(enc)
+        loss_pred  = self.loss_prediction(enc)
+        loss_eig   = self.loss_eigenvalue()
+        loss_cst   = self.loss_contrastive(enc)
+
+        loss_total = (
+            loss_recon
+            + cfg.beta_kl    * loss_kl
+            + cfg.alpha_pred * loss_pred
+            + cfg.gamma_eig  * loss_eig
+            + cfg.delta_cst  * loss_cst
+        )
+
+        return {
+            'loss':       loss_total,
+            'loss_recon': loss_recon,
+            'loss_kl':    loss_kl,
+            'loss_pred':  loss_pred,
+            'loss_eig':   loss_eig,
+            'loss_cst':   loss_cst,
+        }
+
+    # ── Inference ────────────────────────────────────────────
 
     @torch.no_grad()
     def sample(
         self,
-        states: torch.Tensor,   # (B, T, state_dim) -- full horizon or just s_1
+        states: torch.Tensor,    # (B, T_in, ds)
         horizon: Optional[int] = None,
-        z1: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        z0_re: Optional[torch.Tensor] = None,
+        z0_im: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Generate action sequence given states.
-        If only s_1 is provided (T=1), uses Koopman rollout for z_k.
-        Returns actions in original (symexp) space: (B, T_out, action_dim)
+        Generate action sequence from initial state.
+        If z0 not provided, samples from prior (A~Exp(1), theta~Uniform).
+        Returns actions in original space: (B, T_out, da)
         """
         self.eval()
-        B = states.shape[0]
+        B, T_in, _ = states.shape
         device = states.device
+        n  = self.cfg.patch_size
+        Np = math.ceil((horizon or T_in) / n)
 
+        # State embedding
         s_norm = symlog(states)
-        T_in = s_norm.shape[1]
-        n = self.cfg.patch_size
-
-        # Determine number of patches
-        if horizon is None:
-            Np = T_in // n
-        else:
-            Np = math.ceil(horizon / n)
-
-        # State embedding per patch
         if T_in >= Np * n:
             s_patch = s_norm[:, ::n, :][:, :Np, :]
         else:
-            # Repeat last state
             s_last = s_norm[:, -1:, :].expand(-1, Np, -1)
-            s_patch_avail = s_norm[:, ::n, :]
-            pad = Np - s_patch_avail.shape[1]
-            s_patch = torch.cat([
-                s_patch_avail,
-                s_last[:, :pad, :]
-            ], dim=1)
+            s_avail = s_norm[:, ::n, :]
+            pad = Np - s_avail.shape[1]
+            s_patch = torch.cat([s_avail, s_last[:, :pad, :]], dim=1)
+        s_emb = self.state_embed(s_patch)  # (B, Np, state_embed_dim)
 
-        state_emb = self.state_embed(s_patch)  # (B, Np, state_embed_dim)
+        # Initial latent
+        if z0_re is None:
+            # Sample from prior: A ~ Rayleigh(1), theta ~ Uniform(0, 2pi)
+            A0    = torch.abs(torch.randn(B, self.cfg.koopman_dim, device=device))
+            theta0 = torch.rand(B, self.cfg.koopman_dim, device=device) * 2 * math.pi
+            z0_re = A0 * torch.cos(theta0)
+            z0_im = A0 * torch.sin(theta0)
 
-        # Sample or use provided z_1
-        if z1 is None:
-            # Sample z_1 from prior CN(0, I)
-            z_re = torch.randn(B, self.cfg.koopman_dim, device=device) / math.sqrt(2)
-            z_im = torch.randn(B, self.cfg.koopman_dim, device=device) / math.sqrt(2)
-        else:
-            z_re, z_im = z1
+        # Koopman rollout
+        A0 = torch.sqrt(z0_re**2 + z0_im**2 + 1e-8)
+        theta0 = torch.atan2(z0_im, z0_re)
+        A_seq, theta_seq = self.koopman.rollout_polar(A0, theta0, Np)
 
-        # Koopman rollout: z_1, ..., z_Np
-        z_re_seq, z_im_seq = self.koopman.rollout(z_re, z_im, Np)
-        # Prepend z_1: (B, Np, m)
-        z_re_all = torch.cat([z_re.unsqueeze(1), z_re_seq[:, :-1, :]], dim=1)
-        z_im_all = torch.cat([z_im.unsqueeze(1), z_im_seq[:, :-1, :]], dim=1)
+        z_re_all = A_seq * torch.cos(theta_seq)   # (B, Np, m)
+        z_im_all = A_seq * torch.sin(theta_seq)
 
         # Decode
-        p_hat = self.decode(z_re_all, z_im_all, state_emb)
-        # (B, Np, n, da)
-
-        # Reshape and symexp
+        p_hat = self.decode(z_re_all, z_im_all, s_emb)  # (B, Np, n, da)
         actions_symlog = p_hat.reshape(B, Np * n, self.cfg.action_dim)
         if horizon is not None:
             actions_symlog = actions_symlog[:, :horizon, :]
@@ -721,15 +672,7 @@ class KoopmanCVAE(nn.Module):
         return symexp(actions_symlog)
 
     @torch.no_grad()
-    def encode_trajectory(
-        self,
-        actions: torch.Tensor,   # (B, T, action_dim)
-        states: torch.Tensor,    # (B, T, state_dim)
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Encode trajectory to latent sequence.
-        Returns (z_re, z_im): (B, Np, m) each
-        """
-        patches, patch_emb, state_emb = self.preprocess(actions, states)
-        enc = self.encode(patch_emb, state_emb)
-        return enc['z_re'], enc['z_im']
+    def encode_trajectory(self, actions, states):
+        patches, p_emb, s_emb = self.preprocess(actions, states)
+        enc = self.encode(p_emb, s_emb)
+        return enc['z_re'], enc['z_im'], enc['A'], enc['theta']
