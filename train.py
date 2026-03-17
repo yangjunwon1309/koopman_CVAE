@@ -240,6 +240,7 @@ def parse_args():
     p.add_argument('--mlp_hidden_dim', type=int,   default=256)
     p.add_argument('--koopman_dim',    type=int,   default=64)
     # Loss
+    p.add_argument('--kl_prior',        type=str, default="koopman")
     p.add_argument('--beta_kl',        type=float, default=1.0)
     p.add_argument('--alpha_pred',     type=float, default=1.0)
     p.add_argument('--gamma_eig',      type=float, default=0.1)

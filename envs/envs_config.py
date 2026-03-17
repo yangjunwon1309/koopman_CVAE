@@ -53,6 +53,7 @@ def build_config(args) -> KoopmanCVAEConfig:
         gru_hidden_dim   = args.gru_hidden_dim,
         mlp_hidden_dim   = args.mlp_hidden_dim,
         koopman_dim      = args.koopman_dim,
+        kl_prior         = args.kl_prior,
         beta_kl          = args.beta_kl,
         alpha_pred       = args.alpha_pred,
         gamma_eig        = args.gamma_eig,
