@@ -10,7 +10,7 @@ from typing import List, Dict, Optional, Tuple
 
 
 # ─────────────────────────────────────────────
-#  Episode splitting
+# Episode splitting
 # ─────────────────────────────────────────────
 
 def split_into_trajectories(
@@ -19,37 +19,33 @@ def split_into_trajectories(
 ) -> List[Dict[str, np.ndarray]]:
     """
     Split flat D4RL dataset into individual episodes.
-    Episode boundary is marked by terminals=True or timeouts=True.
+    Episode boundary: terminals=True OR timeouts=True.
 
     Args:
-        dataset: dict from d4rl.qlearning_dataset()
-                 keys: observations, actions, rewards, terminals
-                 optional: timeouts, next_observations
+        dataset:  dict from d4rl.qlearning_dataset()
         min_len:  discard episodes shorter than this
 
     Returns:
-        List of dicts, each with keys: observations, actions, rewards
+        List of dicts with keys: observations, actions, rewards
     """
-    obs   = dataset['observations']      # (N, obs_dim)
-    acts  = dataset['actions']           # (N, act_dim)
-    rews  = dataset['rewards']           # (N,)
-    terms = dataset['terminals'].astype(bool)  # (N,)
-
-    # Some D4RL datasets also have 'timeouts' (truncation, not terminal)
+    obs      = dataset['observations']
+    acts     = dataset['actions']
+    rews     = dataset['rewards']
+    terms    = dataset['terminals'].astype(bool)
     timeouts = dataset.get('timeouts', np.zeros_like(terms, dtype=bool))
-    ends = terms | timeouts
+    ends     = terms | timeouts
 
     trajectories = []
     start = 0
     for i in range(len(ends)):
         if ends[i] or i == len(ends) - 1:
-            end = i + 1
+            end    = i + 1
             length = end - start
             if length >= min_len:
                 trajectories.append({
-                    'observations': obs[start:end],   # (T, obs_dim)
-                    'actions':      acts[start:end],  # (T, act_dim)
-                    'rewards':      rews[start:end],  # (T,)
+                    'observations': obs[start:end],
+                    'actions':      acts[start:end],
+                    'rewards':      rews[start:end],
                 })
             start = end
 
@@ -59,7 +55,7 @@ def split_into_trajectories(
 
 
 # ─────────────────────────────────────────────
-#  Sliding window segmentation
+# Sliding window segmentation
 # ─────────────────────────────────────────────
 
 def segment_trajectories(
@@ -69,11 +65,6 @@ def segment_trajectories(
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Cut trajectories into fixed-length segments with sliding window.
-
-    Args:
-        trajectories: from split_into_trajectories()
-        seq_len:      segment length in timesteps
-        stride:       sliding step (default: seq_len // 2 for 50% overlap)
 
     Returns:
         actions_arr: (B, seq_len, action_dim)
@@ -91,17 +82,19 @@ def segment_trajectories(
             actions_list.append(traj['actions'][start:end])
 
     if len(actions_list) == 0:
-        raise ValueError(f"No segments found. Try reducing seq_len (current={seq_len}).")
+        raise ValueError(
+            f"No segments found. Try reducing seq_len (current={seq_len})."
+        )
 
-    actions_arr = np.stack(actions_list)  # (B, T, da)
-    states_arr  = np.stack(states_list)   # (B, T, ds)
-    print(f"  Segments: {actions_arr.shape[0]} x {seq_len} steps  "
+    actions_arr = np.stack(actions_list)
+    states_arr  = np.stack(states_list)
+    print(f"  Segments: {actions_arr.shape[0]} x {seq_len} steps "
           f"(action_dim={actions_arr.shape[-1]}, state_dim={states_arr.shape[-1]})")
     return actions_arr, states_arr
 
 
 # ─────────────────────────────────────────────
-#  D4RL loader
+# D4RL loader
 # ─────────────────────────────────────────────
 
 def load_d4rl_trajectories(
@@ -109,24 +102,24 @@ def load_d4rl_trajectories(
     seq_len: int = 100,
     stride: Optional[int] = None,
     min_episode_len: int = 50,
-    quality: str = 'expert',       # 'expert', 'medium', 'random', 'human'
+    quality: str = 'expert',
 ) -> TensorDataset:
     """
     Load D4RL offline dataset and return TensorDataset.
 
     Args:
-        env_name:  D4RL gym env name, e.g. 'pen-expert-v1'
-                   OR our shorthand, e.g. 'adroit_pen'
-        seq_len:   sequence length per sample
-        stride:    sliding window stride (default: seq_len//2)
-        quality:   only used if env_name is our shorthand
+        env_name: our shorthand ('adroit_pen') OR full D4RL name ('pen-human-v1')
+        seq_len:  sequence length per sample
+        stride:   sliding window stride (default: seq_len // 2)
+        quality:  'expert' | 'human' | 'cloned'
+                  only used when env_name is our shorthand
 
     Returns:
         TensorDataset of (actions (B,T,da), states (B,T,ds))
 
-    Example:
-        dataset = load_d4rl_trajectories('pen-expert-v1', seq_len=100)
-        dataset = load_d4rl_trajectories('adroit_pen', quality='medium')
+    Examples:
+        load_d4rl_trajectories('adroit_pen', quality='human')
+        load_d4rl_trajectories('pen-human-v1')
     """
     try:
         import d4rl
@@ -135,33 +128,25 @@ def load_d4rl_trajectories(
         raise ImportError(
             "d4rl not installed. Install with:\n"
             "  pip install d4rl\n"
-            "  (requires MuJoCo license and mujoco-py)"
+            "  (requires MuJoCo and mujoco-py)"
         )
 
-    # Resolve shorthand env names
-    from envs.env_configs import D4RL_ENV_MAP
+    # ── Resolve shorthand → full D4RL gym name ──────────────
+    from envs.envs_config import D4RL_ENV_MAP, get_d4rl_env_name
+
     if env_name in D4RL_ENV_MAP:
-        quality_idx = {'expert': 0, 'medium': 1, 'random': 2}
-        env_name = D4RL_ENV_MAP[env_name][quality_idx.get(quality, 0)]
+        env_name = get_d4rl_env_name(env_name, quality)
 
     print(f"Loading D4RL dataset: {env_name}")
-    env = gym.make(env_name)
+
+    env     = gym.make(env_name)
     dataset = d4rl.qlearning_dataset(env)
 
-    # Dataset structure:
-    # {
-    #   'observations':      (N, obs_dim)   -- s_t
-    #   'actions':           (N, act_dim)   -- a_t
-    #   'rewards':           (N,)           -- r_t
-    #   'next_observations': (N, obs_dim)   -- s_{t+1}
-    #   'terminals':         (N,)           -- episode end (bool)
-    #   'timeouts':          (N,)           -- truncation (bool, optional)
-    # }
     print(f"  Raw dataset: {len(dataset['observations'])} steps, "
           f"obs_dim={dataset['observations'].shape[1]}, "
           f"act_dim={dataset['actions'].shape[1]}")
 
-    trajs = split_into_trajectories(dataset, min_len=min_episode_len)
+    trajs                  = split_into_trajectories(dataset, min_len=min_episode_len)
     actions_arr, states_arr = segment_trajectories(trajs, seq_len=seq_len, stride=stride)
 
     actions = torch.tensor(actions_arr, dtype=torch.float32)
@@ -170,33 +155,30 @@ def load_d4rl_trajectories(
 
 
 # ─────────────────────────────────────────────
-#  Custom numpy array loader
+# Custom numpy array loader
 # ─────────────────────────────────────────────
 
 def load_from_numpy(
-    actions: np.ndarray,   # (N_total, action_dim) or (B, T, action_dim)
-    states: np.ndarray,    # (N_total, state_dim)  or (B, T, state_dim)
+    actions: np.ndarray,
+    states: np.ndarray,
     seq_len: int = 100,
     stride: Optional[int] = None,
     terminals: Optional[np.ndarray] = None,
 ) -> TensorDataset:
     """
     Load from raw numpy arrays (e.g. Isaac Gym offline data).
-
-    If input is already (B, T, dim), returns directly.
-    If input is (N_total, dim) flat, segments into (B, seq_len, dim).
+    Input shape (B, T, dim) → returned directly.
+    Input shape (N_total, dim) → segmented into (B, seq_len, dim).
     """
     if actions.ndim == 3:
-        # Already segmented
-        a = torch.tensor(actions, dtype=torch.float32)
-        s = torch.tensor(states,  dtype=torch.float32)
-        return TensorDataset(a, s)
+        return TensorDataset(
+            torch.tensor(actions, dtype=torch.float32),
+            torch.tensor(states,  dtype=torch.float32),
+        )
 
-    # Flat array: need to segment
     if terminals is None:
-        # No episode boundaries: treat as one long trajectory
-        terminals = np.zeros(len(actions), dtype=bool)
-        terminals[-1] = True
+        terminals       = np.zeros(len(actions), dtype=bool)
+        terminals[-1]   = True
 
     dataset = {
         'observations': states,
@@ -204,16 +186,17 @@ def load_from_numpy(
         'rewards':      np.zeros(len(actions)),
         'terminals':    terminals,
     }
-    trajs = split_into_trajectories(dataset, min_len=seq_len)
+    trajs                  = split_into_trajectories(dataset, min_len=seq_len)
     actions_arr, states_arr = segment_trajectories(trajs, seq_len=seq_len, stride=stride)
 
-    a = torch.tensor(actions_arr, dtype=torch.float32)
-    s = torch.tensor(states_arr,  dtype=torch.float32)
-    return TensorDataset(a, s)
+    return TensorDataset(
+        torch.tensor(actions_arr, dtype=torch.float32),
+        torch.tensor(states_arr,  dtype=torch.float32),
+    )
 
 
 # ─────────────────────────────────────────────
-#  Synthetic data (for testing)
+# Synthetic data
 # ─────────────────────────────────────────────
 
 def make_synthetic_dataset(
@@ -222,30 +205,26 @@ def make_synthetic_dataset(
     n_samples: int = 1000,
     seq_len: int = 100,
 ) -> TensorDataset:
-    """
-    Generate synthetic sinusoidal trajectories for quick testing.
-    Each sample has random frequencies and phases per dimension.
-    """
+    """Sinusoidal synthetic dataset for quick testing."""
+    import math
     T = seq_len
-    t = torch.linspace(0, 2 * np.pi, T)
+    t = torch.linspace(0, 2 * math.pi, T)
 
     actions = torch.zeros(n_samples, T, action_dim)
     states  = torch.zeros(n_samples, T, state_dim)
 
     for i in range(n_samples):
-        # Action: superposition of random sinusoids
         freqs  = torch.rand(action_dim) * 3.0 + 0.5
-        phases = torch.rand(action_dim) * 2 * np.pi
+        phases = torch.rand(action_dim) * 2 * math.pi
         amps   = torch.rand(action_dim) * 0.5 + 0.5
         for d in range(action_dim):
             actions[i, :, d] = amps[d] * torch.sin(freqs[d] * t + phases[d])
 
-        # State: different frequencies
         freqs_s  = torch.rand(state_dim) * 2.0 + 0.3
-        phases_s = torch.rand(state_dim) * 2 * np.pi
+        phases_s = torch.rand(state_dim) * 2 * math.pi
         for d in range(state_dim):
             states[i, :, d] = torch.sin(freqs_s[d] * t + phases_s[d])
 
-    print(f"Synthetic dataset: {n_samples} samples x {seq_len} steps  "
+    print(f"Synthetic dataset: {n_samples} samples x {seq_len} steps "
           f"(action_dim={action_dim}, state_dim={state_dim})")
     return TensorDataset(actions, states)
