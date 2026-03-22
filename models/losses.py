@@ -293,16 +293,32 @@ def posterior_entropy_regularization(
 
 
 def mode_diversity_loss(
-    V: torch.Tensor,  # (S, m)  all skill mode vectors
+    V: torch.Tensor,        # (S, m)  all skill mode vectors
+    margin: float = 0.2,    # stop penalizing once cosine sim drops below margin
 ) -> torch.Tensor:
     """
-    Penalize skill modes collapsing to same direction.
-    R_div = -sum_{i != j} ||v_i - v_j||^2  [minimize -> modes repel]
+    Penalize skill modes that are too similar in DIRECTION (cosine similarity).
+
+    Replaces the previous ||v_i - v_j||^2 formulation which caused norm
+    divergence: minimizing -||v_i - v_j||^2 is satisfied by growing ||v_i||
+    indefinitely without actually separating directions.
+
+    New formulation:
+        R_div = mean_{i != j} ReLU(cos_sim(v_i, v_j) - margin)^2
+
+    Properties:
+      - Norm-invariant: only direction matters
+      - Margin: gradient is zero once cos_sim(v_i, v_j) < margin (diverse enough)
+      - Bounded: always in [0, (1 - margin)^2]
+      - No divergence: V norm is not rewarded
     """
-    diff_sq = torch.cdist(V.unsqueeze(0), V.unsqueeze(0)).squeeze(0) ** 2
-    mask = 1.0 - torch.eye(V.shape[0], device=V.device)
     S = V.shape[0]
-    return -(diff_sq * mask).sum() / max(S * (S - 1), 1)
+    V_norm = F.normalize(V, p=2, dim=-1)               # (S, m), unit vectors
+    cos_sim = torch.mm(V_norm, V_norm.T)               # (S, S)
+    mask    = 1.0 - torch.eye(S, device=V.device)
+    # Penalize pairs that are still too similar (above margin)
+    excess  = F.relu(cos_sim - margin) ** 2            # zero when already diverse
+    return (excess * mask).sum() / max(S * (S - 1), 1)
 
 
 def decorrelation_loss(

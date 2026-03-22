@@ -99,6 +99,17 @@ class KoopmanCVAEConfig:
     delta_ent:     float = 0.05
     delta_decorr:  float = 0.05
 
+    # Skill mode stability constraints
+    # div_margin: cosine similarity threshold below which diversity penalty = 0
+    #   (modes are "diverse enough" once cos_sim < margin)
+    div_margin:  float = 0.2
+    # v_max: max L2 norm of each skill mode vector v_i
+    #   prevents norm explosion while allowing direction learning
+    v_max:       float = 1.0
+    # beta_max: element-wise clamp on beta (input coupling)
+    #   |mu_fixed| = 0.2, so |beta| << 1/dt keeps exponent stable
+    beta_max:    float = 0.5
+
     # KL prior
     kl_prior: str = 'koopman'
 
@@ -371,7 +382,12 @@ class SkillParameters(nn.Module):
       beta in R^{S x m x da}: Input coupling (diagonal + low-rank LoRA)
           beta_i = diag(beta_bar_i) + U_i @ VT_i
 
-    LoRA: S x (m*da + 2*m*r) params vs S x m*m*da for full tensor
+    Stability constraints:
+      - V: max-norm constraint (||v_i||_2 <= v_max) applied at each forward call.
+        Prevents norm explosion while allowing direction learning.
+        Mode diversity loss (cosine-based) then only affects direction.
+      - beta: component-wise clamp to prevent input coupling from
+        overwhelming the eigenvalue decay term.
     """
 
     def __init__(self, cfg: KoopmanCVAEConfig):
@@ -384,21 +400,44 @@ class SkillParameters(nn.Module):
         self.beta_VT   = nn.Parameter(torch.randn(S, r, da) * 0.01)
         self.S, self.m, self.da, self.r = S, m, da, r
 
+        # Max-norm for V: ||v_i||_2 <= v_max
+        # Set relative to expected z_a norm (~1 after decorrelation constraint)
+        self.v_max    = cfg.v_max
+        # Max absolute value for beta components
+        # |beta_k^(l)| controls effective eigenvalue shift;
+        # clamped so |mu_k + beta_k*u| stays in a stable range
+        self.beta_max = cfg.beta_max
+
+    def _constrain_V(self) -> torch.Tensor:
+        """
+        Project V rows onto L2 ball of radius v_max.
+        Applied at interpolation time (not in-place on parameter).
+        """
+        norms = self.V.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        scale = (norms / self.v_max).clamp(min=1.0)   # only shrink, never grow
+        return self.V / scale                           # (S, m)
+
     def get_beta(self) -> torch.Tensor:
-        """beta in R^{S x m x da}: diag + low-rank"""
-        return self.beta_diag + torch.bmm(self.beta_U, self.beta_VT)
+        """
+        beta in R^{S x m x da}: diag + low-rank, clamped.
+        Clamp prevents beta from overwhelming mu in the exponent:
+            exp((mu_k + beta_k * u) * dt)
+        """
+        beta = self.beta_diag + torch.bmm(self.beta_U, self.beta_VT)
+        return beta.clamp(-self.beta_max, self.beta_max)
 
     def interpolate(
         self, P_hat: torch.Tensor  # (B, S)
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        v_eff  = sum_i P_i * v_i   in R^{B x m}
-        beta_eff = sum_i P_i * beta_i  in R^{B x m x da}
+        v_eff  = sum_i P_i * v_i   in R^{B x m}   (uses norm-constrained V)
+        beta_eff = sum_i P_i * beta_i  in R^{B x m x da}  (uses clamped beta)
         """
-        v_eff    = torch.mm(P_hat, self.V)
-        beta_eff = torch.mm(
+        V_constrained = self._constrain_V()                              # (S, m)
+        v_eff         = torch.mm(P_hat, V_constrained)                   # (B, m)
+        beta_eff      = torch.mm(
             P_hat, self.get_beta().reshape(self.S, -1)
-        ).reshape(-1, self.m, self.da)
+        ).reshape(-1, self.m, self.da)                                   # (B, m, da)
         return v_eff, beta_eff
 
 
@@ -656,8 +695,11 @@ class KoopmanCVAE(nn.Module):
             tau=cfg.temp_contrastive,
         )
 
-        # 8. Skill mode diversity
-        loss_div = mode_diversity_loss(self.skill_params.V)
+        # 8. Skill mode diversity (cosine-based, bounded, with margin)
+        loss_div = mode_diversity_loss(
+            self.skill_params.V,
+            margin=cfg.div_margin,
+        )
 
         # 9. Posterior entropy (anti-collapse)
         loss_ent = posterior_entropy_regularization(P_hat)

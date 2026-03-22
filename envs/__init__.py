@@ -1,1 +1,1 @@
-from envs.envs_config import ENV_CONFIGS, build_config
+from envs.env_configs import ENV_CONFIGS, build_config

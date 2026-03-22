@@ -14,7 +14,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from models.koopman_cvae import KoopmanCVAE, KoopmanCVAEConfig
-from envs.envs_config import ENV_CONFIGS, build_config
+from envs.env_configs import ENV_CONFIGS, build_config
 from data.dataset_utils import (
     load_d4rl_trajectories,
     make_synthetic_dataset,
@@ -253,6 +253,14 @@ def parse_args():
                    help='Eigenfunction decorrelation weight. default: 0.05')
     p.add_argument('--pred_steps',    type=int,   default=None,
                    help='Multi-step prediction horizon H. default: 5')
+    # ── Skill stability ──────────────────────────────────────────────────
+    p.add_argument('--div_margin',  type=float, default=None,
+                   help='Cosine sim margin for diversity loss; gradient=0 below this. '
+                        'default: 0.2')
+    p.add_argument('--v_max',       type=float, default=None,
+                   help='Max L2 norm of skill mode vectors v_i. default: 1.0')
+    p.add_argument('--beta_max',    type=float, default=None,
+                   help='Element-wise clamp on beta (input coupling). default: 0.5')
 
     # ── Training ─────────────────────────────────────────────────────────
     p.add_argument('--epochs',       type=int,   default=200,

@@ -106,6 +106,8 @@ def build_config(args) -> KoopmanCVAEConfig:
         'beta_kl', 'gamma_eig',
         'delta_cst', 'delta_div', 'delta_ent', 'delta_decorr',
         'temp_contrastive', 'freq_repulsion_sigma',
+        # skill stability
+        'div_margin', 'v_max', 'beta_max',
     ]:
         val = getattr(args, key, None)
         if val is not None:
