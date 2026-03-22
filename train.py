@@ -14,7 +14,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from models.koopman_cvae import KoopmanCVAE, KoopmanCVAEConfig
-from envs.env_configs import ENV_CONFIGS, build_config
+from envs.envs_config import ENV_CONFIGS, build_config
 from data.dataset_utils import (
     load_d4rl_trajectories,
     make_synthetic_dataset,
