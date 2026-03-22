@@ -1,7 +1,11 @@
 """
-Training script for Diagonal Koopman Prior CVAE v2
-Supports: DMControl (synthetic), D4RL Adroit, HumanoidBench, Isaac Gym
+train.py — Training script for KODAC
+(Koopman Diagonal Matrix Prior CVAE with Skill-Specific Modes)
+
+Supports: D4RL Adroit (adroit_pen/hammer/door/relocate), synthetic fallback.
+Keeps original Trainer / DataLoader structure; updates model, config, logging.
 """
+
 import argparse
 import os
 from pathlib import Path
@@ -25,6 +29,7 @@ from data.dataset_utils import (
 
 ADROIT_ENVS = ['adroit_pen', 'adroit_hammer', 'adroit_door', 'adroit_relocate']
 
+
 def load_dataset(args, cfg: KoopmanCVAEConfig):
     """
     Route to correct dataset loader based on --env and --d4rl_quality.
@@ -41,18 +46,18 @@ def load_dataset(args, cfg: KoopmanCVAEConfig):
               f"seq_len={args.seq_len}")
         try:
             dataset = load_d4rl_trajectories(
-                env_name       = args.env,
-                seq_len        = args.seq_len,
-                stride         = args.stride if hasattr(args, 'stride') else None,
-                min_episode_len= args.min_episode_len,
-                quality        = args.d4rl_quality,
+                env_name        = args.env,
+                seq_len         = args.seq_len,
+                stride          = args.stride if hasattr(args, 'stride') else None,
+                min_episode_len = args.min_episode_len,
+                quality         = args.d4rl_quality,
             )
             return dataset
         except Exception as e:
             print(f"D4RL load failed: {e}")
             print("Falling back to synthetic dataset.")
 
-    # Synthetic fallback (DMControl, HumanoidBench, Isaac, or fallback)
+    # Synthetic fallback
     print(f"Using synthetic dataset: action_dim={cfg.action_dim}, "
           f"state_dim={cfg.state_dim}, n_samples={args.n_synthetic}, "
           f"seq_len={args.seq_len}")
@@ -139,10 +144,15 @@ class Trainer:
             train_metrics = self.train_epoch(train_loader, epoch)
             self.scheduler.step()
 
-            # Build log string
+            # Build log string — show dominant losses prominently
             log_str = f"Epoch {epoch:4d}"
-            for k, v in train_metrics.items():
-                log_str += f"  {k}: {v:.4f}"
+            # Dominant: pred first
+            key_order = ['loss', 'loss_pred', 'loss_recon', 'loss_kl',
+                         'loss_eig', 'loss_cst', 'loss_div', 'loss_ent',
+                         'loss_decorr']
+            for k in key_order:
+                if k in train_metrics:
+                    log_str += f"  {k}: {train_metrics[k]:.4f}"
 
             # Validation
             if val_loader is not None and epoch % self.args.eval_freq == 0:
@@ -187,47 +197,62 @@ class Trainer:
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description='Train Diagonal Koopman Prior CVAE')
+        description='Train KODAC: Koopman Diagonal Matrix Prior CVAE')
 
     # ── Environment ──────────────────────────
     p.add_argument('--env',         type=str,   default='synthetic',
                    help='Environment key (e.g. adroit_pen, dm_walker, synthetic)')
-    p.add_argument('--action_dim',  type=int,   default=6)
-    p.add_argument('--state_dim',   type=int,   default=24)
-    p.add_argument('--patch_size',  type=int,   default=5)
-    p.add_argument('--dt_control',  type=float, default=0.02)
+    p.add_argument('--action_dim',  type=int,   default=None)
+    p.add_argument('--state_dim',   type=int,   default=None)
+    p.add_argument('--patch_size',  type=int,   default=None)
+    p.add_argument('--dt_control',  type=float, default=None)
 
     # ── Dataset ───────────────────────────────
-    p.add_argument('--d4rl_quality',   type=str,  default='human',
+    p.add_argument('--d4rl_quality',    type=str,  default='human',
                    choices=['expert', 'human', 'cloned'],
                    help='D4RL dataset quality (only for adroit envs)')
-    p.add_argument('--seq_len',        type=int,  default=100,
+    p.add_argument('--seq_len',         type=int,  default=100,
                    help='Sequence length (timesteps) per sample')
-    p.add_argument('--stride',         type=int,  default=None,
+    p.add_argument('--stride',          type=int,  default=None,
                    help='Sliding window stride (default: seq_len//2)')
-    p.add_argument('--min_episode_len',type=int,  default=30,
+    p.add_argument('--min_episode_len', type=int,  default=30,
                    help='Minimum episode length to keep')
-    p.add_argument('--n_synthetic',    type=int,  default=1000,
+    p.add_argument('--n_synthetic',     type=int,  default=1000,
                    help='Number of synthetic samples (if env=synthetic)')
 
     # ── Architecture ─────────────────────────
-    p.add_argument('--embed_dim',       type=int,   default=128)
-    p.add_argument('--state_embed_dim', type=int,   default=64)
-    p.add_argument('--gru_hidden_dim',  type=int,   default=256)
-    p.add_argument('--mlp_hidden_dim',  type=int,   default=256)
-    p.add_argument('--koopman_dim',     type=int,   default=64)
-    p.add_argument('--dropout',         type=float, default=0.1)
+    p.add_argument('--embed_dim',       type=int,   default=None)
+    p.add_argument('--state_embed_dim', type=int,   default=None)
+    p.add_argument('--gru_hidden_dim',  type=int,   default=None)
+    p.add_argument('--mlp_hidden_dim',  type=int,   default=None)
+    p.add_argument('--koopman_dim',     type=int,   default=None,
+                   help='m: number of Koopman eigenfunction pairs')
+    p.add_argument('--num_skills',      type=int,   default=None,
+                   help='S: number of discrete skills')
+    p.add_argument('--lora_rank',       type=int,   default=None,
+                   help='r: low-rank residual rank for β parameterization')
+    p.add_argument('--dropout',         type=float, default=None)
 
-    # ── Loss ─────────────────────────────────
-    p.add_argument('--kl_prior',    type=str,   default='koopman',
+    # ── Eigenvalue ────────────────────────────
+    p.add_argument('--mu_fixed',   type=float, default=None,
+                   help='Fixed real part of eigenvalue (stability decay)')
+    p.add_argument('--omega_max',  type=float, default=None,
+                   help='Max frequency for eigenvalue initialization grid')
+
+    # ── Loss weights ─────────────────────────
+    p.add_argument('--kl_prior',     type=str,   default=None,
                    choices=['koopman', 'standard'],
-                   help='KL prior: koopman=CN(lambda*z_{k-1},Sigma), '
-                        'standard=CN(0,Sigma)')
-    p.add_argument('--beta_kl',     type=float, default=0.1)
-    p.add_argument('--alpha_pred',  type=float, default=1.0)
-    p.add_argument('--gamma_eig',   type=float, default=0.1)
-    p.add_argument('--delta_cst',   type=float, default=1.0)
-    p.add_argument('--pred_steps',  type=int,   default=5,
+                   help='KL prior type')
+    p.add_argument('--alpha_pred',   type=float, default=None,
+                   help='Prediction loss weight (dominant, default 1.0)')
+    p.add_argument('--alpha_recon',  type=float, default=None)
+    p.add_argument('--beta_kl',      type=float, default=None)
+    p.add_argument('--gamma_eig',    type=float, default=None)
+    p.add_argument('--delta_cst',    type=float, default=None)
+    p.add_argument('--delta_div',    type=float, default=None)
+    p.add_argument('--delta_ent',    type=float, default=None)
+    p.add_argument('--delta_decorr', type=float, default=None)
+    p.add_argument('--pred_steps',   type=int,   default=None,
                    help='Multi-step prediction horizon H')
 
     # ── Training ─────────────────────────────
@@ -255,11 +280,26 @@ if __name__ == '__main__':
     cfg  = build_config(args)
 
     print(f"Config: {cfg}")
-    print(f"Delta_t patch: {cfg.patch_size * cfg.dt_control * 1000:.1f}ms")
+    print(f"Eigenfunction patch Δt: {cfg.patch_size * cfg.dt_control * 1000:.1f}ms")
+    print(f"Skills: S={cfg.num_skills}, Koopman dim: m={cfg.koopman_dim}")
+    print(f"β parameterization: diag + LR(rank={cfg.lora_rank}), "
+          f"params/skill: {cfg.koopman_dim + 2*cfg.koopman_dim*cfg.lora_rank}")
 
     model    = KoopmanCVAE(cfg)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Parameters: {n_params:,}")
+    print(f"Total trainable parameters: {n_params:,}")
+
+    # Parameter breakdown
+    phi_params    = sum(p.numel() for p in model.phi_encoder.parameters())
+    gru_params    = sum(p.numel() for p in model.skill_gru.parameters())
+    skill_params  = sum(p.numel() for p in model.skill_params.parameters())
+    eig_params    = sum(p.numel() for p in model.koopman.parameters())
+    dec_params    = sum(p.numel() for p in model.decoder.parameters())
+    print(f"  Eigenfunction encoder (shared): {phi_params:,}")
+    print(f"  Skill GRU posterior (shared):   {gru_params:,}")
+    print(f"  Skill parameters V,β (S={cfg.num_skills}):   {skill_params:,}")
+    print(f"  Eigenvalues ω (shared):         {eig_params:,}")
+    print(f"  Decoder:                        {dec_params:,}")
 
     # ── Load dataset ──────────────────────────
     dataset = load_dataset(args, cfg)
