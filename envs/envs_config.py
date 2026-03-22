@@ -90,16 +90,22 @@ def build_config(args) -> KoopmanCVAEConfig:
     # Start from env defaults
     cfg_kwargs = dict(env_defaults)
 
-    # Override with explicit CLI args (non-None values)
+    # Override with explicit CLI args (non-None values).
+    # Keys must exactly match KoopmanCVAEConfig field names.
     for key in [
+        # environment
         'action_dim', 'state_dim', 'patch_size', 'dt_control',
-        'embed_dim', 'state_embed_dim', 'gru_hidden_dim', 'mlp_hidden_dim',
-        'koopman_dim', 'num_skills', 'lora_rank',
+        # architecture
+        'mlp_hidden_dim', 'gru_hidden_dim', 'embed_dim',
+        'koopman_dim', 'num_skills', 'lora_rank', 'dropout',
+        # eigenvalue
         'mu_fixed', 'omega_max',
-        'alpha_pred', 'beta_kl', 'alpha_recon', 'gamma_eig',
+        # loss weights
+        'kl_prior', 'pred_steps',
+        'alpha_pred', 'alpha_recon_s', 'alpha_recon_a',
+        'beta_kl', 'gamma_eig',
         'delta_cst', 'delta_div', 'delta_ent', 'delta_decorr',
-        'kl_prior', 'pred_steps', 'temp_contrastive',
-        'freq_repulsion_sigma', 'dropout',
+        'temp_contrastive', 'freq_repulsion_sigma',
     ]:
         val = getattr(args, key, None)
         if val is not None:
