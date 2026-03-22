@@ -104,15 +104,22 @@ def analyze_reconstruction(model, dataset, cfg, n=N_SAMPLES):
         s_true = states.cpu().numpy()
         a_true = actions.cpu().numpy()
 
-        # Random latent baseline
-        zs_re_rand = torch.randn(B, T, cfg.koopman_dim, device=DEVICE)
-        zs_im_rand = torch.randn(B, T, cfg.koopman_dim, device=DEVICE)
-        za_re_rand = torch.randn(B, T, cfg.koopman_dim, device=DEVICE)
-        za_im_rand = torch.randn(B, T, cfg.koopman_dim, device=DEVICE)
+        # Random latent baseline — tanh-bounded to match encoder output range
+        zs_re_rand = torch.tanh(torch.randn(B, T, cfg.koopman_dim, device=DEVICE))
+        zs_im_rand = torch.tanh(torch.randn(B, T, cfg.koopman_dim, device=DEVICE))
+        za_re_rand = torch.tanh(torch.randn(B, T, cfg.koopman_dim, device=DEVICE))
+        za_im_rand = torch.tanh(torch.randn(B, T, cfg.koopman_dim, device=DEVICE))
         v_eff, beta_eff = model.skill_params.interpolate(out['P_hat'])
         s_rand = symexp(model.dec_s(zs_re_rand, zs_im_rand)).cpu().numpy()
         a_rand = symexp(model.dec_a(za_re_rand, za_im_rand,
                                     v_eff, beta_eff)).cpu().numpy()
+
+    # Clip extreme values before MSE to avoid overflow from outlier batches
+    clip_val = 1e4
+    s_hat  = np.clip(s_hat,  -clip_val, clip_val)
+    a_hat  = np.clip(a_hat,  -clip_val, clip_val)
+    s_rand = np.clip(s_rand, -clip_val, clip_val)
+    a_rand = np.clip(a_rand, -clip_val, clip_val)
 
     mse_s_enc  = np.mean((s_hat  - s_true)**2)
     mse_s_rand = np.mean((s_rand - s_true)**2)
@@ -355,6 +362,10 @@ def analyze_prediction(model, dataset, cfg, n=N_SAMPLES):
             v_eff, beta_eff,
         )).cpu().numpy()
         a_true_1 = actions[:, 1:].cpu().numpy()
+
+    clip_val = 1e3
+    s_pred_1 = np.clip(s_pred_1, -clip_val, clip_val)
+    a_pred_1 = np.clip(a_pred_1, -clip_val, clip_val)
 
     mse_s1 = np.mean((s_pred_1 - s_true_1)**2)
     mse_a1 = np.mean((a_pred_1 - a_true_1)**2)
@@ -760,9 +771,19 @@ def analyze_rollout(model, dataset, cfg, n=4, horizon=20):
     s_true = states[:, cond_len:cond_len + horizon_clamp].cpu().numpy()
     a_true = actions[:, cond_len:cond_len + horizon_clamp].cpu().numpy()
 
+    # Clip rollout outputs to prevent overflow in MSE and plotting
+    clip_val = 1e3
+    s_pred = np.clip(s_pred, -clip_val, clip_val)
+    a_pred = np.clip(a_pred, -clip_val, clip_val)
+
     mse_s = np.mean((s_pred[:, :horizon_clamp] - s_true)**2)
     mse_a = np.mean((a_pred[:, :horizon_clamp] - a_true)**2)
-    print(f"  Rollout MSE  state={mse_s:.4f}  action={mse_a:.4f}")
+    n_clipped_s = np.sum(np.abs(out['s_preds'].cpu().numpy()) > clip_val)
+    n_clipped_a = np.sum(np.abs(out['a_preds'].cpu().numpy()) > clip_val)
+    clip_str = ""
+    if n_clipped_s + n_clipped_a > 0:
+        clip_str = f"  [clipped {n_clipped_s}s/{n_clipped_a}a values > {clip_val:.0e}]"
+    print(f"  Rollout MSE  state={mse_s:.4f}  action={mse_a:.4f}{clip_str}")
 
     fig, axes = plt.subplots(2, 4, figsize=(20, 9))
     t_cond = np.arange(cond_len)
@@ -883,17 +904,24 @@ def diagnose(model, dataset, cfg):
     if decorr_s > 0.5 or decorr_a > 0.5:
         print("  [WARNING] High off-diagonal covariance — consider increasing delta_decorr")
 
-    # omega gradient (require one backward pass)
+    # omega/V gradient check — requires training mode for cudnn RNN backward
+    model.train()
+    model.zero_grad()
     actions2, states2 = batch(dataset, 4)
     out = model(actions2, states2)
     out['loss'].backward()
+    model.eval()  # restore eval mode
+
     omega_grad = model.koopman.omega.grad
     V_grad     = model.skill_params.V.grad
-    print(f"  omega grad norm: {omega_grad.norm().item():.4e}  "
-          f"(None = no gradient flow)" if omega_grad is not None
-          else "  omega grad: None — check prediction loss path")
-    print(f"  V     grad norm: {V_grad.norm().item():.4e}"
-          if V_grad is not None else "  V grad: None")
+    if omega_grad is not None:
+        print(f"  omega grad norm: {omega_grad.norm().item():.4e}")
+    else:
+        print("  omega grad: None — check prediction loss path")
+    if V_grad is not None:
+        print(f"  V     grad norm: {V_grad.norm().item():.4e}")
+    else:
+        print("  V grad: None")
 
 
 # ─────────────────────────────────────────────────────────────
