@@ -1,333 +1,245 @@
 """
-losses.py — standalone loss functions for KODAC
+losses.py — KODAC-S loss functions
+===================================
 
-Theoretical basis:
-    State stream:   z_s_{t+1} = A * z_s_t           (diagonal ZOH, no u)
-    Action stream:  z_a_{t+1} = (A + B(u)) * z_a_t  (diagonal+LoRA ZOH)
+Architecture change from diagonal to Full A + Low-rank B:
 
-    Observable readout (action stream):
-        g(a_{t+h}) = sum_k v_k * exp[(lam_k + sum_l beta_k^(l) u_l) dt] z_a_k(t)
+  REMOVED assumptions:
+    - A = diag(lambda_k)  [exact eigenfunction basis]
+    - B = diag(beta_k^(l)) [no cross-mode coupling]
+    - Real Schur 2x2 block structure
+    - schur_block_propagate / schur_block_rollout
+    - KL divergence, reparameterization
 
-    Reconstruction:
-        s_hat = D_s(z_s_re, z_s_im)             -- state decoder
-        a_hat = D_a(z_a_re, z_a_im, v_eff, beta) -- action decoder
+  NEW structure:
+    - A in R^{m x m}: full learnable transition matrix
+    - B^(l) = U^(l) @ V^(l).T in R^{m x m}: low-rank per action dim
+    - ZOH: z_{t+1} = (I + M(a_t)*dt) z_t,  M = A + sum_l B^(l) a_l
+                     (1st-order Taylor; exact when dt is small)
+    - eigenvalue_stability_loss: penalize eigenvalues of A outside unit disk
+    - decorrelation_loss: off-diagonal cosine similarity (scale-invariant)
+    - reconstruction_loss: MSE in symlog space
+    - multistep_prediction_loss: multi-head observable h-step prediction
 
 All functions are self-contained (no import from koopman_cvae.py).
 """
 
 import torch
 import torch.nn.functional as F
-import math
 from typing import Tuple
 
 
 # ─────────────────────────────────────────────────────────────
-# Real Schur 2x2 block propagation (exact ZOH)
+# ZOH propagation: Full A + Low-rank B
 # ─────────────────────────────────────────────────────────────
 
-def schur_block_propagate(
-    z_re: torch.Tensor,   # (..., m)
-    z_im: torch.Tensor,   # (..., m)
-    mu: torch.Tensor,     # (m,)   fixed decay
-    omega: torch.Tensor,  # (m,)   learnable frequency
+def get_transition_matrix(
+    A: torch.Tensor,         # (m, m)
+    B_U: torch.Tensor,       # (da, m, r)
+    B_V: torch.Tensor,       # (da, m, r)
+    a: torch.Tensor,         # (batch, da)
     dt: float,
-    steps: int = 1,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Exact ZOH for the autonomous state stream using Real Schur 2x2 blocks.
-    No Taylor approximation -- exact because A is diagonal.
-
-    Each pair (z_re_k, z_im_k) evolves as:
-        [z_re]_{t+dt} = e^{mu_k dt} [cos w dt  -sin w dt] [z_re]_t
-        [z_im]_{t+dt}               [sin w dt   cos w dt] [z_im]_t
-    """
-    decay = torch.exp(mu * dt * steps)     # (m,)
-    angle = omega * dt * steps             # (m,)
-    cos_a = torch.cos(angle)
-    sin_a = torch.sin(angle)
-    z_re_next = decay * (cos_a * z_re - sin_a * z_im)
-    z_im_next = decay * (sin_a * z_re + cos_a * z_im)
-    return z_re_next, z_im_next
-
-
-def schur_block_rollout(
-    z_re: torch.Tensor,   # (B, m)
-    z_im: torch.Tensor,   # (B, m)
-    mu: torch.Tensor,     # (m,)
-    omega: torch.Tensor,  # (m,)
-    dt: float,
-    steps: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Vectorized multi-step autonomous rollout.
-    Returns (z_re_seq, z_im_seq) each (B, steps, m).
-    """
-    hs    = torch.arange(1, steps + 1, device=z_re.device, dtype=z_re.dtype)
-    decay = torch.exp(mu.unsqueeze(0) * dt * hs.unsqueeze(1))  # (steps, m)
-    angle = omega.unsqueeze(0) * dt * hs.unsqueeze(1)
-    cos_a = torch.cos(angle)
-    sin_a = torch.sin(angle)
-
-    z_re_0 = z_re.unsqueeze(1)  # (B, 1, m)
-    z_im_0 = z_im.unsqueeze(1)
-
-    z_re_seq = decay * (cos_a * z_re_0 - sin_a * z_im_0)  # (B, steps, m)
-    z_im_seq = decay * (sin_a * z_re_0 + cos_a * z_im_0)
-    return z_re_seq, z_im_seq
-
-
-# ─────────────────────────────────────────────────────────────
-# KL divergences
-# ─────────────────────────────────────────────────────────────
-
-def kl_koopman_prior(
-    mu_re: torch.Tensor,      # (B, T, m)
-    mu_im: torch.Tensor,
-    log_sigma: torch.Tensor,  # (B, T, m)
-    z_re: torch.Tensor,       # (B, T, m)  sampled
-    z_im: torch.Tensor,
-    mu_k: torch.Tensor,       # (m,)  fixed decay
-    omega: torch.Tensor,      # (m,)
-    dt: float,
-    log_sigma0: torch.Tensor, # (m,)
 ) -> torch.Tensor:
     """
-    KL with Koopman dynamic prior p(z_t | z_{t-1}) = CN(A*z_{t-1}, Sigma_0).
-    Prior mean = schur_block_propagate(z_{t-1}).
-    Applied for t=1,...,T-1.
+    Compute F = I + M*dt  where  M = A + sum_l B^(l) a_l
+    B^(l) = B_U[l] @ B_V[l].T  (low-rank decomposition)
+
+    Returns F: (batch, m, m)
     """
-    prior_re, prior_im = schur_block_propagate(
-        z_re[:, :-1], z_im[:, :-1], mu_k, omega, dt, steps=1
-    )
-    mu_re_q  = mu_re[:, 1:]
-    mu_im_q  = mu_im[:, 1:]
-    sigma_q  = log_sigma[:, 1:].exp() + 1e-6
-    sigma_0  = log_sigma0.exp() + 1e-6
+    m = A.shape[0]
+    device = A.device
 
-    sigma_q_sq = sigma_q ** 2
-    sigma_0_sq = sigma_0.unsqueeze(0).unsqueeze(0) ** 2
+    # B^(l) = U^(l) @ V^(l).T -> (da, m, m)
+    B_full = torch.bmm(B_U, B_V.transpose(-1, -2))           # (da, m, m)
 
-    kl = (
-        ((mu_re_q - prior_re) ** 2 + (mu_im_q - prior_im) ** 2) / sigma_0_sq
-        + sigma_q_sq / sigma_0_sq
-        - torch.log(sigma_q_sq / (sigma_0_sq + 1e-8) + 1e-8)
-        - 1.0
-    )
-    return 0.5 * kl.mean()
+    # sum_l B^(l) * a_l -> (batch, m, m)
+    Ba = torch.einsum('bl,lij->bij', a, B_full)               # (batch, m, m)
+
+    # M = A + Ba
+    M = A.unsqueeze(0) + Ba                                    # (batch, m, m)
+
+    # F = I + M*dt  (1st-order ZOH)
+    I = torch.eye(m, device=device).unsqueeze(0)              # (1, m, m)
+    F = I + M * dt                                             # (batch, m, m)
+    return F
 
 
-def kl_standard_prior(
-    mu_re: torch.Tensor,
-    mu_im: torch.Tensor,
-    log_sigma: torch.Tensor,
-    log_sigma0: torch.Tensor,
+def propagate(
+    z: torch.Tensor,         # (batch, m)
+    A: torch.Tensor,         # (m, m)
+    B_U: torch.Tensor,       # (da, m, r)
+    B_V: torch.Tensor,       # (da, m, r)
+    a: torch.Tensor,         # (batch, da)
+    dt: float,
 ) -> torch.Tensor:
-    """KL(CN(mu_q, sigma_q^2) || CN(0, sigma_0^2))"""
-    sigma_q_sq = (log_sigma.exp() + 1e-6) ** 2
-    sigma_0_sq = (log_sigma0.exp() + 1e-6).unsqueeze(0).unsqueeze(0) ** 2
-    kl = (
-        (mu_re ** 2 + mu_im ** 2) / sigma_0_sq
-        + sigma_q_sq / sigma_0_sq
-        - torch.log(sigma_q_sq / (sigma_0_sq + 1e-8) + 1e-8)
-        - 1.0
-    )
-    return 0.5 * kl.mean()
+    """Single-step ZOH: z_{t+1} = F(a) z_t"""
+    F = get_transition_matrix(A, B_U, B_V, a, dt)             # (batch, m, m)
+    return torch.bmm(F, z.unsqueeze(-1)).squeeze(-1)           # (batch, m)
 
 
-# ─────────────────────────────────────────────────────────────
-# Reconstruction losses
-# ─────────────────────────────────────────────────────────────
-
-def reconstruction_loss(
-    pred: torch.Tensor,   # (..., dim)  decoder output (symlog space)
-    target: torch.Tensor, # (..., dim)  ground truth (symlog space)
+def propagate_h_steps(
+    z: torch.Tensor,         # (BT, m)  flattened batch x time
+    A: torch.Tensor,         # (m, m)
+    B_U: torch.Tensor,       # (da, m, r)
+    B_V: torch.Tensor,       # (da, m, r)
+    a: torch.Tensor,         # (BT, da)  action at anchor time
+    dt: float,
+    h: int,
 ) -> torch.Tensor:
     """
-    MSE in symlog space.
-    Used for both:
-      - state recon:  D_s(z_s) vs symlog(s)
-      - action recon: D_a(z_a, v_eff, beta_eff) vs symlog(a)
+    h-step ZOH assuming constant action over [t, t+h*dt) (ZOH assumption).
+    F^h = (I + M*dt)^h via matrix power.
+
+    Returns z_pred: (BT, m)
     """
-    return F.mse_loss(pred, target)
+    F = get_transition_matrix(A, B_U, B_V, a, dt)             # (BT, m, m)
+
+    # F^h via repeated matmul (h is small, typically 1-5)
+    Fh = F
+    for _ in range(h - 1):
+        Fh = torch.bmm(Fh, F)
+
+    return torch.bmm(Fh, z.unsqueeze(-1)).squeeze(-1)         # (BT, m)
 
 
 # ─────────────────────────────────────────────────────────────
-# Multi-step prediction loss (dominant, KODAC-specific)
+# Eigenvalue stability loss (on full A)
 # ─────────────────────────────────────────────────────────────
 
-def kodac_multistep_prediction_loss(
-    zs_re: torch.Tensor,        # (B, T, m)  state stream latent
-    zs_im: torch.Tensor,
-    za_re: torch.Tensor,        # (B, T, m)  action stream latent
-    za_im: torch.Tensor,
-    v_eff: torch.Tensor,        # (B, m)     interpolated Koopman mode
-    beta_eff: torch.Tensor,     # (B, m, da) interpolated input coupling
-    actions: torch.Tensor,      # (B, T, da) ground-truth actions
-    mu: torch.Tensor,           # (m,)
-    omega: torch.Tensor,        # (m,)
+def eigenvalue_stability_loss(
+    A: torch.Tensor,           # (m, m)
+    target_radius: float = 0.99,
+    margin: float = 0.01,
+) -> torch.Tensor:
+    """
+    Penalize eigenvalues of A whose modulus exceeds target_radius.
+
+    For full A (not necessarily symmetric), eigenvalues are complex.
+    We use torch.linalg.eigvals which returns complex eigenvalues.
+
+    Loss = mean over eigenvalues of ReLU(|lambda_k| - target_radius + margin)^2
+
+    This replaces the diagonal mu_k fixed constraint.
+    gradient flows through the real eigenvalue magnitudes.
+
+    Note: torch.linalg.eigvals is differentiable w.r.t. A.
+    """
+    # eigvals: complex (m,)
+    eigvals = torch.linalg.eigvals(A)
+    modulus = eigvals.abs()                                    # (m,) real
+
+    # Penalize moduli that exceed target_radius (soft margin)
+    excess = F.relu(modulus - (target_radius - margin))       # (m,)
+    return (excess ** 2).mean()
+
+
+def eigenvalue_diversity_loss(
+    A: torch.Tensor,           # (m, m)
+    sigma: float = 0.1,
+) -> torch.Tensor:
+    """
+    Penalize eigenvalues of A that are too close together (frequency collapse).
+    Replaces frequency repulsion loss on omega_k.
+
+    Loss = mean_{i != j} exp(-|lambda_i - lambda_j|^2 / sigma^2)
+
+    Uses complex eigenvalues directly.
+    """
+    eigvals = torch.linalg.eigvals(A)                         # (m,) complex
+    diff    = eigvals.unsqueeze(0) - eigvals.unsqueeze(1)     # (m, m) complex
+    dist_sq = diff.real**2 + diff.imag**2                     # (m, m) real
+    repul   = torch.exp(-dist_sq / (sigma**2 + 1e-8))
+    mask    = 1.0 - torch.eye(A.shape[0], device=A.device)
+    m       = A.shape[0]
+    return (repul * mask).sum() / max(m * (m - 1), 1)
+
+
+# ─────────────────────────────────────────────────────────────
+# Multi-head prediction loss
+# ─────────────────────────────────────────────────────────────
+
+def multistep_prediction_loss(
+    z: torch.Tensor,           # (B, T, m)  encoder output
+    v_heads: torch.Tensor,     # (B, T, Nh, m)  multi-head readout vectors
+    actions: torch.Tensor,     # (B, T, da)
+    A: torch.Tensor,           # (m, m)
+    B_U: torch.Tensor,         # (da, m, r)
+    B_V: torch.Tensor,         # (da, m, r)
     dt: float,
     H: int,
 ) -> torch.Tensor:
     """
-    ZOH multi-step prediction loss for BOTH streams.
+    Multi-head Koopman prediction loss.
 
-    For the ACTION stream, the predicted h-step ZOH observable is:
-        g_hat(t+h) = sum_k v_k * exp[(mu_k + beta_k*u_t) h*dt] * za_re_k(t)
-        g_tgt(t+h) = sum_k v_k * za_re_k(t+h)   [from encoder posterior]
+    For each anchor t, horizon h, head n:
+        g_pred^(n)(t+h) = v^(n)(t) · z_pred(t+h)
+                        = v^(n)(t) · F^h(a_t) z(t)
 
-    For the STATE stream, the predicted h-step ZOH state is:
-        zs_hat(t+h) = A^h * zs(t)  [pure autonomous rollout]
-        zs_tgt(t+h) = zs_re(t+h)   [from encoder posterior]
+        g_true^(n)(t+h) = v^(n)(t) · z(t+h)   [stop_gradient on z(t+h)]
 
-    Both losses are summed. This jointly supervises:
-        phi_s, phi_a, v_i, beta_i, omega_k, GRU posterior (via P_hat in v_eff)
+    Loss = mean over h, n of MSE(g_pred, g_true)
+
+    Jointly supervises: Phi (encoder), A, B_U, B_V, TCN heads W^(n).
     """
-    B, T, m = za_re.shape
-    H = min(H, T - 1)
+    B, T, m  = z.shape
+    Nh       = v_heads.shape[2]
+    H        = min(H, T - 1)
 
-    loss_action = torch.tensor(0.0, device=za_re.device)
-    loss_state  = torch.tensor(0.0, device=zs_re.device)
+    total = torch.tensor(0.0, device=z.device)
 
     for h in range(1, H + 1):
         T_anc = T - h
         BT    = B * T_anc
 
-        # ── Action stream prediction ─────────────────────────
-        za_re_anc = za_re[:, :T_anc].reshape(BT, m)
-        za_im_anc = za_im[:, :T_anc].reshape(BT, m)
-        u_anc     = actions[:, :T_anc].reshape(BT, -1)   # (BT, da)
+        # Flatten batch x time for vectorized matmul
+        z_anc   = z[:, :T_anc].reshape(BT, m)                 # (BT, m)
+        a_anc   = actions[:, :T_anc].reshape(BT, -1)          # (BT, da)
+        vh_anc  = v_heads[:, :T_anc].reshape(BT, Nh, m)       # (BT, Nh, m)
 
-        ve_f  = v_eff.unsqueeze(1).expand(-1, T_anc, -1).reshape(BT, m)
-        be_f  = beta_eff.unsqueeze(1).expand(-1, T_anc, -1, -1).reshape(BT, m, -1)
+        # h-step ZOH prediction
+        z_pred  = propagate_h_steps(z_anc, A, B_U, B_V,
+                                    a_anc, dt, h)              # (BT, m)
 
-        # Effective decay with input coupling: exp[(mu + beta*u) h*dt]
-        beta_u   = torch.bmm(be_f, u_anc.unsqueeze(-1)).squeeze(-1)   # (BT, m)
-        eff_mu   = mu.unsqueeze(0) + beta_u                             # (BT, m)
-        decay_h  = torch.exp(eff_mu * dt * h)                          # (BT, m)
-        angle_h  = omega.unsqueeze(0) * dt * h                         # (1, m)
-        cos_h    = torch.cos(angle_h)
-        sin_h    = torch.sin(angle_h)
+        # Observable: g^(n) = v^(n) · z
+        # g_pred: (BT, Nh)
+        g_pred  = torch.bmm(vh_anc,
+                            z_pred.unsqueeze(-1)).squeeze(-1)  # (BT, Nh)
 
-        za_re_pred = decay_h * (cos_h * za_re_anc - sin_h * za_im_anc)
-        # Observable: Re(v * z) = v * za_re  (v is real, z is complex)
-        g_pred = (ve_f * za_re_pred).sum(dim=-1).reshape(B, T_anc)     # (B, T_anc)
+        # Target: v^(n)(t) · z(t+h),  stop_gradient on z(t+h)
+        z_true  = z[:, h:].reshape(BT, m).detach()            # (BT, m)
+        g_true  = torch.bmm(vh_anc,
+                            z_true.unsqueeze(-1)).squeeze(-1)  # (BT, Nh)
 
-        # Target: Re(v * za(t+h)) from encoder
-        za_re_tgt = za_re[:, h:].reshape(BT, m)
-        g_tgt = (ve_f * za_re_tgt).sum(dim=-1).reshape(B, T_anc)
+        total = total + F.mse_loss(g_pred, g_true)
 
-        loss_action = loss_action + F.mse_loss(g_pred, g_tgt.detach())
-
-        # ── State stream prediction ──────────────────────────
-        # Autonomous ZOH: no u, just eigenvalue decay + rotation
-        zs_re_anc = zs_re[:, :T_anc].reshape(BT, m)
-        zs_im_anc = zs_im[:, :T_anc].reshape(BT, m)
-
-        decay_s  = torch.exp(mu.unsqueeze(0) * dt * h)                 # (1, m)
-        zs_re_pred = decay_s * (cos_h * zs_re_anc - sin_h * zs_im_anc)
-
-        # Target: zs_re(t+h) from encoder
-        zs_re_tgt = zs_re[:, h:].reshape(BT, m)
-
-        loss_state = loss_state + F.mse_loss(zs_re_pred, zs_re_tgt.detach())
-
-    n = max(H, 1)
-    return (loss_action + loss_state) / n
+    return total / max(H, 1)
 
 
 # ─────────────────────────────────────────────────────────────
-# Contrastive loss
+# Reconstruction
 # ─────────────────────────────────────────────────────────────
 
-def kodac_contrastive_loss(
-    gru_hidden: torch.Tensor,      # (B, m)  GRU h_T projected
-    skill_z_summary: torch.Tensor, # (B, m)  skill-conditioned za summary
-    tau: float = 0.1,
+def reconstruction_loss(
+    pred: torch.Tensor,        # (..., dim)  symlog space
+    target: torch.Tensor,      # (..., dim)  symlog space
 ) -> torch.Tensor:
-    """
-    InfoNCE: aligns temporal skill identity (GRU) with action eigenfunction
-    summary (skill-conditioned mean of za_re over trajectory).
-
-    Query: h_T_proj   (temporal context — WHICH skill)
-    Key:   z_a_summary (eigenfunction state summary — WHERE in latent)
-
-    NOT aligned with raw za_t to preserve GRU/encoder role separation.
-    """
-    q = F.normalize(gru_hidden,      dim=-1)
-    k = F.normalize(skill_z_summary, dim=-1)
-    logits = torch.mm(q, k.T) / tau
-    labels = torch.arange(logits.shape[0], device=logits.device)
-    return F.cross_entropy(logits, labels)
+    return F.mse_loss(pred, target)
 
 
 # ─────────────────────────────────────────────────────────────
-# Eigenvalue regularization
+# Decorrelation (scale-invariant, off-diagonal only)
 # ─────────────────────────────────────────────────────────────
-
-def eigenvalue_frequency_repulsion(
-    omega: torch.Tensor,  # (m,)
-    sigma: float = 0.3,
-) -> torch.Tensor:
-    """
-    Penalize nearby frequencies to prevent mode collapse.
-    L_eig = mean_{k != k'} exp(-(omega_k - omega_k')^2 / sigma^2)
-    """
-    diff = omega.unsqueeze(0) - omega.unsqueeze(1)   # (m, m)
-    repulsion = torch.exp(-(diff ** 2) / (sigma ** 2))
-    mask = 1.0 - torch.eye(omega.shape[0], device=omega.device)
-    return (repulsion * mask).sum() / (omega.shape[0] * (omega.shape[0] - 1) + 1e-8)
-
-
-# ─────────────────────────────────────────────────────────────
-# Skill posterior regularizers
-# ─────────────────────────────────────────────────────────────
-
-def posterior_entropy_regularization(
-    P_hat: torch.Tensor,  # (B, S)
-) -> torch.Tensor:
-    """
-    Entropy regularization: prevents posterior collapse to single skill.
-    R_ent = -H(P_hat) = sum_i P_i * log(P_i)  [positive; minimize to spread]
-    """
-    return (P_hat * (P_hat + 1e-8).log()).sum(dim=-1).mean()
-
-
-def mode_diversity_loss(
-    V: torch.Tensor,        # (S, m)  all skill mode vectors
-    margin: float = 0.2,    # stop penalizing once cosine sim drops below margin
-) -> torch.Tensor:
-    """
-    Penalize skill modes that are too similar in DIRECTION (cosine similarity).
-
-    Replaces the previous ||v_i - v_j||^2 formulation which caused norm
-    divergence: minimizing -||v_i - v_j||^2 is satisfied by growing ||v_i||
-    indefinitely without actually separating directions.
-
-    New formulation:
-        R_div = mean_{i != j} ReLU(cos_sim(v_i, v_j) - margin)^2
-
-    Properties:
-      - Norm-invariant: only direction matters
-      - Margin: gradient is zero once cos_sim(v_i, v_j) < margin (diverse enough)
-      - Bounded: always in [0, (1 - margin)^2]
-      - No divergence: V norm is not rewarded
-    """
-    S = V.shape[0]
-    V_norm = F.normalize(V, p=2, dim=-1)               # (S, m), unit vectors
-    cos_sim = torch.mm(V_norm, V_norm.T)               # (S, S)
-    mask    = 1.0 - torch.eye(S, device=V.device)
-    # Penalize pairs that are still too similar (above margin)
-    excess  = F.relu(cos_sim - margin) ** 2            # zero when already diverse
-    return (excess * mask).sum() / max(S * (S - 1), 1)
-
 
 def decorrelation_loss(
-    z: torch.Tensor,  # (N, m)  eigenfunction output, flattened over batch/time
+    z: torch.Tensor,           # (N, m)
 ) -> torch.Tensor:
     """
-    Gauge uniqueness: E[z z^T] approx I prevents arbitrary linear transforms.
-    R_decorr = ||E[z z^T] - I||_F^2
+    Off-diagonal cosine similarity penalty.
+    Bounded [0, 1], scale-invariant.
+    Prevents arbitrary linear transforms of z (gauge uniqueness).
     """
-    N, m = z.shape
-    cov  = (z.T @ z) / (N + 1e-8)
-    return F.mse_loss(cov, torch.eye(m, device=z.device))
+    N, m   = z.shape
+    z_norm = F.normalize(z, p=2, dim=0)                       # (N, m)
+    corr   = z_norm.T @ z_norm                                # (m, m)
+    mask   = 1.0 - torch.eye(m, device=z.device)
+    return (corr ** 2 * mask).sum() / max(m * (m - 1), 1)

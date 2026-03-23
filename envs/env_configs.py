@@ -1,116 +1,64 @@
 """
-env_configs.py — environment configurations for KODAC.
-Maps environment names to KoopmanCVAEConfig parameters.
+env_configs.py — KODAC-S environment configurations.
 """
-
-import math
 from models.koopman_cvae import KoopmanCVAEConfig
 
-# ─────────────────────────────────────────────────────────────
-# Environment registry
-# ─────────────────────────────────────────────────────────────
-
 ENV_CONFIGS = {
-    # ── D4RL Adroit ──────────────────────────────────────────
-    'adroit_pen': {
-        'action_dim':  24,
-        'state_dim':   45,
-        'num_skills':  6,
-        'koopman_dim': 64,
-        'patch_size':  5,
-        'dt_control':  0.02,
-    },
-    'adroit_hammer': {
-        'action_dim':  26,
-        'state_dim':   46,
-        'num_skills':  6,
-        'koopman_dim': 64,
-        'patch_size':  5,
-        'dt_control':  0.02,
-    },
-    'adroit_door': {
-        'action_dim':  28,
-        'state_dim':   39,
-        'num_skills':  6,
-        'koopman_dim': 64,
-        'patch_size':  5,
-        'dt_control':  0.02,
-    },
-    'adroit_relocate': {
-        'action_dim':  30,
-        'state_dim':   39,
-        'num_skills':  8,
-        'koopman_dim': 64,
-        'patch_size':  5,
-        'dt_control':  0.02,
-    },
+    # ── Adroit ───────────────────────────────────────────────
+    'adroit_pen':      {'action_dim': 24, 'state_dim': 45, 'koopman_dim': 64,
+                        'patch_size': 5, 'dt_control': 0.02},
+    'adroit_hammer':   {'action_dim': 26, 'state_dim': 46, 'koopman_dim': 64,
+                        'patch_size': 5, 'dt_control': 0.02},
+    'adroit_door':     {'action_dim': 28, 'state_dim': 39, 'koopman_dim': 64,
+                        'patch_size': 5, 'dt_control': 0.02},
+    'adroit_relocate': {'action_dim': 30, 'state_dim': 39, 'koopman_dim': 64,
+                        'patch_size': 5, 'dt_control': 0.02},
 
-    # ── DMControl (synthetic fallback) ───────────────────────
-    'dm_walker': {
-        'action_dim':  6,
-        'state_dim':   24,
-        'num_skills':  4,
-        'koopman_dim': 32,
-        'patch_size':  5,
-        'dt_control':  0.025,
-    },
-    'dm_cheetah': {
-        'action_dim':  6,
-        'state_dim':   17,
-        'num_skills':  4,
-        'koopman_dim': 32,
-        'patch_size':  5,
-        'dt_control':  0.025,
-    },
+    # ── Franka Kitchen ───────────────────────────────────────
+    # obs: 60-dim (qpos 9 + qvel 9 + object 42)
+    # act: 9-dim joint velocity
+    # dt:  0.08s (12.5Hz)
+    # patch_size=1 recommended: each step is already ~80ms,
+    #   no need for additional temporal aggregation
+    'kitchen_complete': {'action_dim':  9, 'state_dim': 60, 'koopman_dim': 64,
+                         'patch_size': 1, 'dt_control': 0.08,
+                         'tcn_hidden_dim': 256, 'tcn_n_layers': 5,
+                         'num_heads': 8,  'lora_rank': 8},
+    'kitchen_partial':  {'action_dim':  9, 'state_dim': 60, 'koopman_dim': 64,
+                         'patch_size': 1, 'dt_control': 0.08,
+                         'tcn_hidden_dim': 256, 'tcn_n_layers': 5,
+                         'num_heads': 8,  'lora_rank': 8},
+    'kitchen_mixed':    {'action_dim':  9, 'state_dim': 60, 'koopman_dim': 64,
+                         'patch_size': 1, 'dt_control': 0.08,
+                         'tcn_hidden_dim': 256, 'tcn_n_layers': 5,
+                         'num_heads': 8,  'lora_rank': 8},
 
-    # ── Synthetic / default ───────────────────────────────────
-    'synthetic': {
-        'action_dim':  6,
-        'state_dim':   24,
-        'num_skills':  4,
-        'koopman_dim': 32,
-        'patch_size':  5,
-        'dt_control':  0.02,
-    },
+    # ── DMControl ────────────────────────────────────────────
+    'dm_walker':  {'action_dim':  6, 'state_dim': 24, 'koopman_dim': 32,
+                   'patch_size': 5, 'dt_control': 0.025},
+    'dm_cheetah': {'action_dim':  6, 'state_dim': 17, 'koopman_dim': 32,
+                   'patch_size': 5, 'dt_control': 0.025},
+
+    # ── Synthetic ────────────────────────────────────────────
+    'synthetic':  {'action_dim':  9, 'state_dim': 60, 'koopman_dim': 32,
+                   'patch_size': 1, 'dt_control': 0.08},
 }
 
+KITCHEN_ENVS = ['kitchen_complete', 'kitchen_partial', 'kitchen_mixed']
+ADROIT_ENVS  = ['adroit_pen', 'adroit_hammer', 'adroit_door', 'adroit_relocate']
 
 def build_config(args) -> KoopmanCVAEConfig:
-    """
-    Build KoopmanCVAEConfig from parsed args.
-
-    Priority:
-        1. Args explicitly passed on CLI
-        2. ENV_CONFIGS defaults for the environment
-        3. KoopmanCVAEConfig dataclass defaults
-    """
-    env_key = getattr(args, 'env', 'synthetic')
-    env_defaults = ENV_CONFIGS.get(env_key, ENV_CONFIGS['synthetic'])
-
-    # Start from env defaults
-    cfg_kwargs = dict(env_defaults)
-
-    # Override with explicit CLI args (non-None values).
-    # Keys must exactly match KoopmanCVAEConfig field names.
+    env_key    = getattr(args, 'env', 'synthetic')
+    cfg_kwargs = dict(ENV_CONFIGS.get(env_key, ENV_CONFIGS['synthetic']))
     for key in [
-        # environment
         'action_dim', 'state_dim', 'patch_size', 'dt_control',
-        # architecture
-        'mlp_hidden_dim', 'gru_hidden_dim', 'embed_dim',
-        'koopman_dim', 'num_skills', 'lora_rank', 'dropout',
-        # eigenvalue
-        'mu_fixed', 'omega_max',
-        # loss weights
-        'kl_prior', 'pred_steps',
-        'alpha_pred', 'alpha_recon_s', 'alpha_recon_a',
-        'beta_kl', 'gamma_eig',
-        'delta_cst', 'delta_div', 'delta_ent', 'delta_decorr',
-        'temp_contrastive', 'freq_repulsion_sigma',
-        # skill stability
-        'div_margin', 'v_max', 'beta_max',
+        'mlp_hidden_dim', 'tcn_hidden_dim', 'tcn_n_layers', 'tcn_kernel_size',
+        'koopman_dim', 'num_heads', 'lora_rank', 'b_max', 'dropout',
+        'eig_target_radius', 'eig_margin', 'eig_div_sigma',
+        'alpha_pred', 'alpha_recon', 'gamma_eig', 'gamma_div', 'delta_decorr',
+        'pred_steps',
     ]:
         val = getattr(args, key, None)
         if val is not None:
             cfg_kwargs[key] = val
-
     return KoopmanCVAEConfig(**cfg_kwargs)
