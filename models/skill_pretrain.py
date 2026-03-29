@@ -79,17 +79,18 @@ class SkillPretrainConfig:
     # NIW prior  (mu0=0, Psi0=psi_scale*I)
     kappa0:    float = 1.0
     nu0_delta: float = 2.0     # nu0 = skill_dim + nu0_delta  (> d-1 필요)
-    psi_scale: float = 1.0
+    psi_scale: float = 0.1   # small initial covariance → more sensitive birth
 
     # Birth/Merge
-    birth_thresh:  float = 0.05   # max_r < thresh → poorly explained
+    birth_thresh:  float = 0.3    # max_r < thresh → poorly explained (K>1 only)
     birth_min_pts: int   = 10
     merge_cos:     float = 0.95   # cosine similarity threshold for merge
 
     # Loss weights (HELIOS Eq.7)
+    # zeta1 dominant initially so encoder learns from reconstruction first
     zeta1: float = 1.0    # reconstruction
-    zeta2: float = 0.5    # DPM alignment
-    zeta3: float = 0.1    # prior alignment
+    zeta2: float = 0.1    # DPM alignment (reduced: early DPM is noisy)
+    zeta3: float = 0.01   # prior alignment
 
     # Training
     epochs:    int   = 100
@@ -471,13 +472,29 @@ class DPM:
         """
         Poorly explained points로 새 component 제안.
         ELBO가 개선되면 accept.
+
+        K=1 특수 처리:
+            K=1이면 softmax 결과 r[:,0]=1.0 (항상).
+            max-r threshold로는 bad points를 찾을 수 없다.
+            Mahalanobis 거리가 상위 25%인 점들을 bad points로 사용.
         """
         if self.K >= self.cfg.K_max:
             return False
 
-        # 어떤 component로도 잘 설명 안 되는 점들
-        bad_mask = r.max(axis=1) < self.cfg.birth_thresh
-        n_bad    = int(bad_mask.sum())
+        if self.K == 1:
+            # K=1: Mahalanobis 거리 기반 bad points
+            try:
+                Psi_inv = np.linalg.inv(self.Psi_hat[0])
+            except np.linalg.LinAlgError:
+                Psi_inv = np.linalg.pinv(self.Psi_hat[0])
+            diff     = X - self.mu_hat[0]                  # (N, d)
+            maha     = np.einsum("nd,de,ne->n", diff, Psi_inv, diff)
+            thresh   = np.percentile(maha, 75)             # 상위 25%
+            bad_mask = maha > thresh
+        else:
+            bad_mask = r.max(axis=1) < self.cfg.birth_thresh
+
+        n_bad = int(bad_mask.sum())
         if n_bad < self.cfg.birth_min_pts:
             return False
 

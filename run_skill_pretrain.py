@@ -38,19 +38,21 @@ def main():
         skill_dim   = 32,
         skill_horizon = 20,
         # DPM
-        alpha         = 1.0,
+        alpha         = 2.0,    # higher → more clusters expected
         K_init        = 1,
         K_max         = 20,
         kappa0        = 1.0,
         nu0_delta     = 2.0,
-        psi_scale     = 1.0,
-        birth_thresh  = 0.05,
+        psi_scale     = 0.1,    # small initial cov → sensitive birth
+        birth_thresh  = 0.3,    # K>1 only; K=1 uses Mahalanobis
         birth_min_pts = 10,
         merge_cos     = 0.95,
         # Loss weights
+        # zeta1 dominant: reconstruction teaches encoder first
+        # zeta2 small: DPM is noisy early, don't over-constrain
         zeta1 = 1.0,
-        zeta2 = 0.5,
-        zeta3 = 0.1,
+        zeta2 = 0.1,
+        zeta3 = 0.01,
         # Training
         epochs     = 100,
         batch_size = 64,
