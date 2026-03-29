@@ -92,11 +92,13 @@ class SkillPretrainConfig:
     psi_scale: float = 2.0   # broad initial covariance: winner-take-all 방지
 
     # Birth/Merge
-    birth_thresh:  float = 0.3    # max_r < thresh → poorly explained (K>1 only)
-    birth_min_pts: int   = 10
-    birth_K_fresh: int   = 4      # Hughes&Sudderth: K_fresh sub-clusters per birth
-    birth_start_epoch: int = 3    # epoch < this: birth disabled (encoder not ready)
-    merge_cos:     float = 0.90   # cosine similarity threshold for merge
+    birth_thresh:      float = 0.3
+    birth_min_pts:     int   = 5        # 10→5: 더 적은 bad pts로도 birth
+    birth_K_fresh:     int   = 4
+    birth_start_epoch: int   = 0        # Phase 2 시작 즉시 (이미 pretrain 됨)
+    birth_elbo_slack:  float = 2.0      # ELBO slack (N*d 배수): >0이면 더 관대
+    dpm_init_k:        int   = 8        # K-means++ 초기 cluster 수
+    merge_cos:         float = 0.90
 
     # Loss weights (HELIOS Eq.7)
     # zeta1 dominant initially so encoder learns from reconstruction first
@@ -620,14 +622,17 @@ class DPM:
         r_new    = self.e_step(X)
         elbo_new = self.elbo(X, r_new)
 
-        # 새 component들 중 하나라도 birth_min_pts 이상 할당된 것이 있어야 accept
-        new_N_hat = [r_new[:, k].sum() for k in range(K_old, self.K)]
+        new_N_hat  = [r_new[:, k].sum() for k in range(K_old, self.K)]
         has_viable = any(n > self.cfg.birth_min_pts for n in new_N_hat)
 
-        if elbo_new > elbo_old and has_viable:
-            return True   # accept birth
+        # slack-based ELBO: stick-breaking prior가 새 component에 불리하므로
+        # 약간의 ELBO 저하를 허용 (slack = N*d*birth_elbo_slack)
+        slack   = X.shape[0] * self.d * self.cfg.birth_elbo_slack
+        elbo_ok = (elbo_new >= elbo_old - slack)
+
+        if has_viable and elbo_ok:
+            return True
         else:
-            # revert all new components
             self.K = K_old
             self.mu_hat    = self.mu_hat[:K_old]
             self.kappa_hat = self.kappa_hat[:K_old]
@@ -810,19 +815,47 @@ class SkillPretrainer:
 
     @torch.no_grad()
     def _collect_z(self, loader) -> np.ndarray:
-        """
-        전체 데이터셋에서 encoder summary mu 수집.
-        encode_mu()는 이미 (B, d_z)를 반환 (마지막 timestep).
-        seq_len=skill_horizon=10이면 10-step action sequence summary.
-        """
+        """Encoder mu 수집 (DPM fitting용). tiny noise로 수치 안정성 확보."""
         self.encoder.eval()
         zs = []
         for actions, states in loader:
-            actions = actions.to(self.device)
-            states  = states.to(self.device)
-            mu = self.encoder.encode_mu(states, actions)  # (B, d_z)
+            mu = self.encoder.encode_mu(actions.to(self.device),
+                                        states.to(self.device))
             zs.append(mu.cpu().numpy())
-        return np.concatenate(zs, axis=0)                 # (N_total, d_z)
+        Z = np.concatenate(zs, axis=0)
+        z_std = max(float(Z.std()), 1e-6)
+        return Z + np.random.randn(*Z.shape) * z_std * 0.005
+
+    def _init_dpm_kmeans(self, loader):
+        """Phase 1 완료 후 K-means++로 DPM 초기화. K=1 birth 대기 불필요."""
+        from sklearn.cluster import KMeans
+        Z = self._collect_z(loader)
+        K = min(self.cfg.dpm_init_k, self.cfg.K_max)
+
+        print(f"  K-means++(K={K}) ...")
+        km = KMeans(n_clusters=K, init='k-means++',
+                    n_init=10, random_state=42, max_iter=300)
+        km.fit(Z)
+        labels, centers = km.labels_, km.cluster_centers_
+
+        self.dpm.K         = K
+        self.dpm.mu_hat    = centers.copy()
+        self.dpm.kappa_hat = np.full(K, self.dpm.kappa0 + 1.0)
+        self.dpm.nu_hat    = np.full(K, self.dpm.nu0 + 1.0)
+        self.dpm.Psi_hat   = np.stack([self.dpm.Psi0.copy() for _ in range(K)])
+        self.dpm.a_k1      = np.ones(K)
+        self.dpm.a_k0      = np.full(K, self.dpm.alpha)
+        self.dpm.N_hat     = np.array([float((labels==k).sum()) for k in range(K)])
+
+        for k in range(K):
+            mask = labels == k
+            if mask.sum() > self.dpm.d + 1:
+                S_k = np.cov(Z[mask].T)
+                self.dpm.Psi_hat[k]   = self.dpm.Psi0 + S_k
+                self.dpm.kappa_hat[k] = self.dpm.kappa0 + mask.sum()
+                self.dpm.nu_hat[k]    = self.dpm.nu0    + mask.sum()
+
+        print(f"  K-means init: N_hat={np.round(self.dpm.N_hat,0).astype(int).tolist()}")
 
     def _step_A(self, loader, epoch: int = 0):
         """Step A: DPM fitting. Returns (K, elbo, n_births, n_merges)."""
@@ -920,14 +953,13 @@ class SkillPretrainer:
                     + (mu_q_l - mu_p)**2 / var_p - 1.0
                 ).sum(dim=-1).mean()
 
-            # L_spread + L_vae: 두 phase 모두 사용
-            L_spread = F.relu(self.cfg.min_z_std - z_last.std(dim=0)).mean()
+            # L_spread: mu에 직접 적용 (DPM이 보는 값과 동일)
+            L_spread = F.relu(self.cfg.min_z_std - mu_q_l.std(dim=0)).mean()
+            # L_vae: Phase 1에서는 0 (mu→0 방지), Phase 2에서 소량
             L_vae    = 0.5 * (lv_q_l.exp() + mu_q_l**2 - 1.0 - lv_q_l).mean()
-
-            # Phase에 따라 weight 조정
-            vae_w = self.cfg.zeta_vae_pretrain if pretrain else self.cfg.zeta_vae
-            dpm_w = 0.0 if pretrain else self.cfg.zeta2
-            pri_w = 0.0 if pretrain else self.cfg.zeta3
+            vae_w = 0.0  if pretrain else self.cfg.zeta_vae
+            dpm_w = 0.0  if pretrain else self.cfg.zeta2
+            pri_w = 0.0  if pretrain else self.cfg.zeta3
 
             loss = (self.cfg.zeta1 * L_rec
                     + dpm_w          * L_dpm
@@ -981,9 +1013,11 @@ class SkillPretrainer:
                 m    = self._step_B(loader, pretrain=True)
                 n_births = n_merges = 0
                 if ep == self.cfg.pretrain_epochs:
-                    print("  [Phase 1 완료] z로 DPM 초기 피팅 ...")
+                    print("  [Phase 1 완료] K-means++ DPM 초기화 ...")
+                    self._init_dpm_kmeans(loader)
                     K, elbo, _, _ = self._step_A(loader, epoch=0)
-                    print(f"  [DPM init] K={K} "
+                    K_prev = K
+                    print(f"  [DPM init] K={K}(act={self.dpm.n_active}) "
                           f"N_hat={np.round(self.dpm.N_hat,0).astype(int).tolist()}")
                 birth_happened = False
             else:

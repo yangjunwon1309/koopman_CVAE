@@ -51,11 +51,13 @@ def main():
         kappa0        = 0.1,    # prior 영향 줄임
         nu0_delta     = 2.0,    # nu0 = d + 2 (minimum valid)
         psi_scale     = 2.0,    # broad initial cov: winner-take-all 방지
-        birth_thresh  = 0.3,    # K>1 only; K=1 uses Mahalanobis
-        birth_min_pts = 10,
-        birth_K_fresh = 4,      # Hughes&Sudderth: 4 sub-clusters per birth
-        birth_start_epoch = 8,  # encoder 안정화 후 birth 시작
-        merge_cos     = 0.90,
+        birth_thresh      = 0.3,
+        birth_min_pts     = 5,      # 더 관대하게
+        birth_K_fresh     = 4,
+        birth_start_epoch = 0,      # Phase 2 즉시
+        birth_elbo_slack  = 2.0,    # ELBO 허용 오차
+        dpm_init_k        = 8,      # K-means++ 초기 클러스터 수
+        merge_cos         = 0.90,
         # Loss weights
         # zeta1 dominant: reconstruction teaches encoder first
         # zeta2 very small early: DPM noisy, don't let it dominate
