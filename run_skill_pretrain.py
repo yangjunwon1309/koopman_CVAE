@@ -60,8 +60,14 @@ def main():
         # zeta1 dominant: reconstruction teaches encoder first
         # zeta2 very small early: DPM noisy, don't let it dominate
         zeta1 = 1.0,
-        zeta2 = 0.05,   # will be scaled by clamped KL (~50 max)
+        zeta2 = 0.05,
         zeta3 = 0.01,
+        # Anti-collapse: z spread 강제
+        # spr=0.0이면 z가 collapse → birth 후 act=1 지속 원인
+        zeta_spread = 0.5,   # batch std 하한 강제
+        zeta_vae    = 0.1,   # KL(q||N(0,I))
+        min_z_std   = 0.3,   # target z std per dim
+        birth_warmup_steps = 5,
         # Training
         epochs     = 100,
         batch_size = 64,

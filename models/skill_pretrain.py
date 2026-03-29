@@ -109,6 +109,14 @@ class SkillPretrainConfig:
     batch_size:int   = 64
     lr:        float = 3e-4
     device:    str   = 'cuda'
+    # Anti-collapse: z spread regularization
+    zeta_spread: float = 0.5    # batch variance lower bound weight
+    zeta_vae:    float = 0.1    # KL(q(z|a) || N(0,I)) weight
+    min_z_std:   float = 0.3    # target minimum std per z dimension
+
+    # Post-birth warm-up steps
+    birth_warmup_steps: int = 5
+
     save_dir:  str   = 'checkpoints/skill_pretrain'
 
 
@@ -587,8 +595,11 @@ class DPM:
             mask_c = np.linalg.norm(X_bad - center, axis=1) <                      np.linalg.norm(X_bad - center, axis=1).mean() * 1.5
             n_c = max(int(mask_c.sum()), 1)
             if n_c > self.d:
-                Psi_c = (np.cov(X_bad[mask_c].T) * n_c
-                         + 1e-4 * np.eye(self.d))
+                # Psi = scatter matrix (sum of squared deviations)
+                # NOT multiplied by n_c to keep variance tight
+                Psi_c = np.cov(X_bad[mask_c].T) + 1e-4 * np.eye(self.d)
+                # Psi_hat = Psi0 + scatter → tight initial covariance
+                Psi_c = self.Psi0 + Psi_c
             else:
                 Psi_c = self.Psi0.copy()
 
@@ -720,13 +731,11 @@ class DPM:
     @property
     def n_active(self) -> int:
         """
-        전체 데이터의 1% 이상 할당된 component 수.
-        N_hat > 1 기준은 N이 클 때 모든 component가 active로 보이므로
-        전체 대비 비율로 판단하는 것이 더 정확.
+        N_hat > 0 이상인 component 수.
+        birth 직후에는 새 component들이 N_hat이 작으므로
+        낮은 임계값으로 진짜 active 여부를 판단.
         """
-        total = max(self.N_hat.sum(), 1.0)
-        threshold = max(1.0, total * 0.01)   # 최소 1%, 최소 1개
-        return int((self.N_hat > threshold).sum())
+        return int((self.N_hat > 0.5).sum())
 
 
 # ─────────────────────────────────────────────────────────────
@@ -823,7 +832,7 @@ class SkillPretrainer:
             var_k = np.clip(var_k, 0.1, 5.0)
             dpm_var.append(torch.FloatTensor(var_k).to(self.device))
 
-        totals = dict(loss=0., l_rec=0., l_dpm=0., l_prior=0.)
+        totals = dict(loss=0., l_rec=0., l_dpm=0., l_prior=0., l_spread=0., l_vae=0.)
         n_b    = 0
 
         for actions, states in loader:
@@ -857,22 +866,24 @@ class SkillPretrainer:
                 pi_ik = self.dpm.soft_assign(z_np)    # (B, K)
                 pi_t  = torch.FloatTensor(pi_ik).to(self.device)
 
+            # Temperature softening on pi_ik:
+            # pi_ik가 0에 가까운 component도 소량 gradient를 흘려주어
+            # encoder가 birth로 생긴 새 component 방향을 학습할 수 있게 함.
+            # min_pi = 1/K 의 10%: 각 component에 최소 gradient 보장
+            min_pi = 0.1 / max(K, 1)
+            pi_soft = pi_t.clamp(min=min_pi)
+            pi_soft = pi_soft / pi_soft.sum(dim=-1, keepdim=True)  # renormalize
+
             L_dpm = torch.zeros(1, device=self.device)
             for k in range(K):
-                # KL( q(z|s,a) || N(mu_k, diag(var_k)) )
-                # = 0.5 * sum_d [ log(var_k/exp(lv)) + exp(lv)/var_k
-                #                 + (mu_q - mu_k)^2/var_k - 1 ]
-                # KL(q || N(mu_k, var_k))  = 0.5 * sum_d[...]
-                # 각 dim별로 계산 후 mean(dim=-1)하면 d=32에서 자연스럽게 스케일됨
                 kl_k_per_dim = 0.5 * (
                     dpm_var[k].log() - lv_q_l
                     + lv_q_l.exp() / dpm_var[k].clamp(min=1e-6)
                     + (mu_q_l - dpm_mu[k]) ** 2 / dpm_var[k].clamp(min=1e-6)
                     - 1.0
                 )  # (B, d_z)
-                # mean over dims (not sum): scale-invariant to d_z
-                kl_k = kl_k_per_dim.mean(dim=-1).clamp(min=0.0, max=100.0)  # (B,)
-                L_dpm = L_dpm + (pi_t[:, k] * kl_k).mean()
+                kl_k = kl_k_per_dim.mean(dim=-1).clamp(min=0.0, max=100.0)
+                L_dpm = L_dpm + (pi_soft[:, k] * kl_k).mean()
 
             # ── L_prior (reverse KL: q || p) ─────────────────
             mu_p, lv_p = self.prior(s0)               # (B, d_z)
@@ -884,9 +895,17 @@ class SkillPretrainer:
                 - 1.0
             ).sum(dim=-1).mean()
 
+            # L_spread: batch std 하한 강제 (z collapse 방지)
+            L_spread = F.relu(self.cfg.min_z_std
+                               - z_last.std(dim=0)).mean()
+            # L_vae: KL(q || N(0,I))
+            L_vae = 0.5 * (lv_q_l.exp() + mu_q_l**2
+                            - 1.0 - lv_q_l).mean()
             loss = (self.cfg.zeta1 * L_rec
                     + self.cfg.zeta2 * L_dpm
-                    + self.cfg.zeta3 * L_prior)
+                    + self.cfg.zeta3 * L_prior
+                    + self.cfg.zeta_spread * L_spread
+                    + self.cfg.zeta_vae    * L_vae)
 
             self.opt.zero_grad()
             loss.backward()
@@ -900,6 +919,8 @@ class SkillPretrainer:
             totals['l_rec']   += L_rec.item()
             totals['l_dpm']   += L_dpm.item()
             totals['l_prior'] += L_prior.item()
+            totals['l_spread']+= L_spread.item()
+            totals['l_vae']   += L_vae.item()
             n_b += 1
 
         self.sched.step()
@@ -918,20 +939,32 @@ class SkillPretrainer:
 
         best_loss = float('inf')
 
+        K_prev = self.dpm.K
         for ep in range(1, self.cfg.epochs + 1):
             # Step A: DPM fitting
             K, elbo = self._step_A(loader, epoch=ep)
 
+            birth_happened = K > K_prev
+            K_prev = K
+
             # Step B: network update
             m = self._step_B(loader)
 
+            if birth_happened:
+                print(f"  [birth K={K}] warm-up "
+                      f"{self.cfg.birth_warmup_steps}x step_B ...")
+                all_m = [m]
+                for _ in range(self.cfg.birth_warmup_steps - 1):
+                    all_m.append(self._step_B(loader))
+                m = {k: sum(mi[k] for mi in all_m)/len(all_m) for k in m}
+                # warm-up 후 birth 없이 DPM 재피팅 (spread된 z에 맞춤)
+                K, elbo = self._step_A(loader, epoch=ep + 10000)
+                print(f"  [post-warmup] K={K}(act={self.dpm.n_active})")
+
             print(
-                f"Ep {ep:4d} | "
-                f"K={K}(act={self.dpm.n_active}) | "
-                f"loss={m['loss']:.4f} "
-                f"rec={m['l_rec']:.4f} "
-                f"dpm={m['l_dpm']:.4f} "
-                f"pri={m['l_prior']:.4f} | "
+                f"Ep {ep:4d} | K={K}(act={self.dpm.n_active}) | "
+                f"rec={m['l_rec']:.4f} dpm={m['l_dpm']:.4f} "
+                f"spr={m['l_spread']:.4f} vae={m['l_vae']:.4f} | "
                 f"ELBO={elbo:.1f}",
                 flush=True,
             )
