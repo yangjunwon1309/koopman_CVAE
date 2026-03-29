@@ -48,13 +48,13 @@ def main():
         alpha         = 2.0,    # higher → more clusters expected
         K_init        = 1,
         K_max         = 20,
-        kappa0        = 1.0,
-        nu0_delta     = 2.0,
-        psi_scale     = 0.1,    # small initial cov → sensitive birth
+        kappa0        = 0.1,    # prior 영향 줄임
+        nu0_delta     = 2.0,    # nu0 = d + 2 (minimum valid)
+        psi_scale     = 2.0,    # broad initial cov: winner-take-all 방지
         birth_thresh  = 0.3,    # K>1 only; K=1 uses Mahalanobis
         birth_min_pts = 10,
         birth_K_fresh = 4,      # Hughes&Sudderth: 4 sub-clusters per birth
-        birth_start_epoch = 5,  # wait 5 epochs for encoder to stabilize
+        birth_start_epoch = 8,  # encoder 안정화 후 birth 시작
         merge_cos     = 0.90,
         # Loss weights
         # zeta1 dominant: reconstruction teaches encoder first
@@ -64,9 +64,13 @@ def main():
         zeta3 = 0.01,
         # Anti-collapse: z spread 강제
         # spr=0.0이면 z가 collapse → birth 후 act=1 지속 원인
-        zeta_spread = 0.5,   # batch std 하한 강제
-        zeta_vae    = 0.1,   # KL(q||N(0,I))
-        min_z_std   = 0.3,   # target z std per dim
+        # 2-Phase: pretrain_epochs 동안 β-VAE만, 그 후 DPM
+        pretrain_epochs   = 25,
+        zeta_vae_pretrain = 1.0,   # Phase 1: 강한 VAE (β=1)
+        # Phase 2 weights
+        zeta_spread = 0.5,
+        zeta_vae    = 0.5,
+        min_z_std   = 0.5,
         birth_warmup_steps = 5,
         # Training
         epochs     = 100,

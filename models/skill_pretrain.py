@@ -87,9 +87,9 @@ class SkillPretrainConfig:
     K_max:   int   = 20        # truncation upper bound
 
     # NIW prior  (mu0=0, Psi0=psi_scale*I)
-    kappa0:    float = 1.0
+    kappa0:    float = 0.1   # prior 영향 줄임: 데이터가 mu_hat 주도
     nu0_delta: float = 2.0     # nu0 = skill_dim + nu0_delta  (> d-1 필요)
-    psi_scale: float = 0.1   # small initial covariance → more sensitive birth
+    psi_scale: float = 2.0   # broad initial covariance: winner-take-all 방지
 
     # Birth/Merge
     birth_thresh:  float = 0.3    # max_r < thresh → poorly explained (K>1 only)
@@ -109,12 +109,17 @@ class SkillPretrainConfig:
     batch_size:int   = 64
     lr:        float = 3e-4
     device:    str   = 'cuda'
-    # Anti-collapse: z spread regularization
-    zeta_spread: float = 0.5    # batch variance lower bound weight
-    zeta_vae:    float = 0.1    # KL(q(z|a) || N(0,I)) weight
-    min_z_std:   float = 0.3    # target minimum std per z dimension
+    # ── 2-Phase Training ─────────────────────────────
+    pretrain_epochs:   int   = 25    # Phase 1: β-VAE only (DPM 없음)
+    zeta_vae_pretrain: float = 1.0   # Phase 1: 강한 VAE prior
+    # Phase 2: 약한 VAE + DPM
 
-    # Post-birth warm-up steps
+    # Anti-collapse (두 Phase 공통)
+    zeta_spread: float = 0.5
+    zeta_vae:    float = 0.5    # Phase 2 (Phase 1은 zeta_vae_pretrain 사용)
+    min_z_std:   float = 0.5    # target minimum z std per dim
+
+    # Post-birth warm-up
     birth_warmup_steps: int = 5
 
     save_dir:  str   = 'checkpoints/skill_pretrain'
@@ -168,7 +173,7 @@ class GRUSkillEncoder(nn.Module):
         """
         x, _ = self.gru(self._get_input(states, actions))  # (B,T,h)
         mu     = self.fc_mu(x)
-        logvar = self.fc_logvar(x).clamp(-4.0, 2.0)
+        logvar = self.fc_logvar(x).clamp(-2.0, 2.0)  # std >= 0.37 강제
         std    = (0.5 * logvar).exp()
         z      = mu + std * torch.randn_like(std)
         return z, mu, logvar
@@ -227,7 +232,7 @@ class TCNSkillEncoder(nn.Module):
             x = x + layer(x)
         c = x.transpose(1, 2)                                      # (B,T,d_c)
         mu     = self.fc_mu(c)
-        logvar = self.fc_logvar(c).clamp(-4.0, 2.0)
+        logvar = self.fc_logvar(c).clamp(-2.0, 2.0)  # std >= 0.37 강제
         std    = (0.5 * logvar).exp()
         z      = mu + std * torch.randn_like(std)
         return z, mu, logvar
@@ -322,7 +327,7 @@ class SkillPrior(nn.Module):
         """s: (B, ds) → mu, logvar: (B, d_z)"""
         h = self.net(symlog(s))
         return (self.fc_mu(h),
-                self.fc_logvar(h).clamp(-4.0, 2.0))
+                self.fc_logvar(h).clamp(-2.0, 2.0))
 
 
 # ─────────────────────────────────────────────────────────────
@@ -431,14 +436,10 @@ class DPM:
 
     # ── E-step: responsibilities ──────────────────────────────
 
-    def e_step(self, X: np.ndarray) -> np.ndarray:
+    def e_step(self, X: np.ndarray,
+               temperature: float = 1.0) -> np.ndarray:
         """
-        q(c_n = k) = r_hat_nk
-        log r_hat_nk ∝ E[log pi_k]
-                      + (1/2) E[log|Lambda_k|]
-                      - (d/2) log(2pi)
-                      - (1/2) E_mahl_nk
-        Returns r_hat: (N, K)
+        q(c_n=k) ∝ exp(m_nk / T).  T>1 → 더 uniform assignment.
         """
         E_lpi  = self._E_log_pi()        # (K,)
         E_ldet = self._E_log_det()       # (K,)
@@ -448,7 +449,11 @@ class DPM:
                   + 0.5 * E_ldet[None, :]
                   - 0.5 * (self.d * math.log(2 * math.pi) + E_mah))
 
-        # numerical stability: subtract row max
+        # Temperature scaling: log_r / T
+        # T=1: 표준 CAVI, T>1: 더 uniform (새 component도 assignment 받음)
+        if temperature != 1.0:
+            log_r = log_r / temperature
+        # numerical stability: subtract row max (softmax에 영향 없음)
         log_r -= log_r.max(axis=1, keepdims=True)
         r      = np.exp(log_r)
         r     /= r.sum(axis=1, keepdims=True) + 1e-10
@@ -476,7 +481,7 @@ class DPM:
         for k in range(self.K):
             N_k = float(r[:, k].sum())
             self.N_hat[k] = N_k
-            if N_k < 1e-6:
+            if N_k < 1e-10:   # 낮춤: birth 후 새 component도 업데이트
                 continue
 
             # Weighted statistics
@@ -601,7 +606,7 @@ class DPM:
                 # Psi_hat = Psi0 + scatter → tight initial covariance
                 Psi_c = self.Psi0 + Psi_c
             else:
-                Psi_c = self.Psi0.copy()
+                Psi_c = self.Psi0.copy() * 2.0  # 새 cluster 넓게 시작
 
             self.K += 1
             self.mu_hat    = np.vstack([self.mu_hat,    center[None]])
@@ -694,29 +699,54 @@ class DPM:
     def fit_batch(
         self,
         X: np.ndarray,           # (N, d_z)  encoder mu (no noise)
-        n_cavi: int = 5,
-        epoch: int = 0,          # current epoch (for birth_start_epoch gating)
-    ) -> np.ndarray:
+        n_cavi: int = 20,        # 5→20: full-batch CAVI 수렴에 충분
+        epoch: int = 0,
+        birth_temperature: float = 8.0,
+    ):
         """
-        1 epoch: CAVI n_cavi회 → Birth 시도 → Merge 시도
-        Returns r: (N, K_final)
+        CAVI (수렴까지) → Birth → Merge.
+        Returns: (r, n_births, n_merges)
 
-        bnpy (Hughes & Sudderth) 기준:
-          - birth_start_epoch 이전에는 birth 비활성화
-            (encoder가 안정화되기 전에 birth하면 noise cluster 생성)
-          - merge는 birth보다 늦게 시작
+        birth_temperature > 1: birth 후 CAVI에서 새 component에
+        의미 있는 assignment 강제 (stick-breaking 자기강화 완화).
         """
-        for _ in range(n_cavi):
+        n_births = 0
+        n_merges = 0
+        tol = max(1.0, X.shape[0] * 1e-4)  # N=26k → tol=2.6
+
+        # ── 표준 CAVI (수렴 기반 early stopping) ─────────────
+        elbo_prev = -np.inf
+        for it in range(n_cavi):
             r = self.e_step(X)
             self.m_step(X, r)
+            if it % 3 == 0:   # ELBO는 3 iter마다 체크 (비용 절감)
+                elbo_cur = self.elbo(X, r)
+                if abs(elbo_cur - elbo_prev) < tol and it >= 5:
+                    break
+                elbo_prev = elbo_cur
 
         r = self.e_step(X)
         birth_enabled = epoch >= self.cfg.birth_start_epoch
-        if birth_enabled and self._try_birth(X, r):
-            r = self.e_step(X)
-        if birth_enabled and self._try_merge(X, r):
-            r = self.e_step(X)
-        return r
+
+        if birth_enabled:
+            if self._try_birth(X, r):
+                n_births += 1
+                # Birth 후 temperature CAVI:
+                # T>1로 새 component에 assignment 분배
+                for _ in range(10):
+                    r = self.e_step(X, temperature=birth_temperature)
+                    self.m_step(X, r)
+                # T=1로 마무리
+                for _ in range(5):
+                    r = self.e_step(X)
+                    self.m_step(X, r)
+                r = self.e_step(X)
+
+            if self._try_merge(X, r):
+                n_merges += 1
+                r = self.e_step(X)
+
+        return r, n_births, n_merges
 
     # ── Inference helpers ─────────────────────────────────────
 
@@ -794,23 +824,20 @@ class SkillPretrainer:
             zs.append(mu.cpu().numpy())
         return np.concatenate(zs, axis=0)                 # (N_total, d_z)
 
-    def _step_A(self, loader, epoch: int = 0) -> Tuple[int, float]:
-        """Step A: DPM fitting."""
+    def _step_A(self, loader, epoch: int = 0):
+        """Step A: DPM fitting. Returns (K, elbo, n_births, n_merges)."""
         Z = self._collect_z(loader)
-        r = self.dpm.fit_batch(Z, n_cavi=5, epoch=epoch)
-        return self.dpm.K, self.dpm.elbo(Z, r)
+        r, n_births, n_merges = self.dpm.fit_batch(Z, epoch=epoch)
+        return self.dpm.K, self.dpm.elbo(Z, r), n_births, n_merges
 
     # ── Step B: DPM → networks ───────────────────────────────
 
-    def _step_B(self, loader) -> Dict[str, float]:
+    def _step_B(self, loader,
+               pretrain: bool = False) -> Dict[str, float]:
         """
-        Step B: L_rec + L_dpm + L_prior 로 네트워크 업데이트.
-
-        L_rec:   action 재구성 (primary teacher)
-        L_dpm:   sum_k pi_ik * KL(q(z|s,a) || N(mu_k, Sigma_k))
-                 → encoder z를 DPM component에 정렬
-        L_prior: KL(q(z|s,a) || p(z|s))
-                 → state-conditioned prior 학습
+        Phase 1 (pretrain=True): L_rec + L_vae_pretrain + L_spread.
+          z를 N(0,I)로 spread → 이후 DPM clustering 가능하게.
+        Phase 2 (pretrain=False): 전체 loss.
         """
         self.encoder.train()
         self.decoder.train()
@@ -866,46 +893,47 @@ class SkillPretrainer:
                 pi_ik = self.dpm.soft_assign(z_np)    # (B, K)
                 pi_t  = torch.FloatTensor(pi_ik).to(self.device)
 
-            # Temperature softening on pi_ik:
-            # pi_ik가 0에 가까운 component도 소량 gradient를 흘려주어
-            # encoder가 birth로 생긴 새 component 방향을 학습할 수 있게 함.
-            # min_pi = 1/K 의 10%: 각 component에 최소 gradient 보장
-            min_pi = 0.1 / max(K, 1)
-            pi_soft = pi_t.clamp(min=min_pi)
-            pi_soft = pi_soft / pi_soft.sum(dim=-1, keepdim=True)  # renormalize
+            if pretrain:
+                # ── Phase 1: DPM loss 없음 ─────────────────────
+                L_dpm   = torch.zeros(1, device=self.device)
+                L_prior = torch.zeros(1, device=self.device)
+            else:
+                # ── Phase 2: DPM soft assignment ───────────────
+                min_pi  = 0.1 / max(K, 1)
+                pi_soft = pi_t.clamp(min=min_pi)
+                pi_soft = pi_soft / pi_soft.sum(dim=-1, keepdim=True)
+                L_dpm   = torch.zeros(1, device=self.device)
+                for k in range(K):
+                    kl_k = 0.5 * (
+                        dpm_var[k].log() - lv_q_l
+                        + lv_q_l.exp() / dpm_var[k].clamp(min=1e-6)
+                        + (mu_q_l - dpm_mu[k])**2 / dpm_var[k].clamp(min=1e-6)
+                        - 1.0
+                    ).mean(dim=-1).clamp(0.0, 100.0)
+                    L_dpm = L_dpm + (pi_soft[:, k] * kl_k).mean()
 
-            L_dpm = torch.zeros(1, device=self.device)
-            for k in range(K):
-                kl_k_per_dim = 0.5 * (
-                    dpm_var[k].log() - lv_q_l
-                    + lv_q_l.exp() / dpm_var[k].clamp(min=1e-6)
-                    + (mu_q_l - dpm_mu[k]) ** 2 / dpm_var[k].clamp(min=1e-6)
-                    - 1.0
-                )  # (B, d_z)
-                kl_k = kl_k_per_dim.mean(dim=-1).clamp(min=0.0, max=100.0)
-                L_dpm = L_dpm + (pi_soft[:, k] * kl_k).mean()
+                mu_p, lv_p = self.prior(s0)
+                var_p = lv_p.exp().clamp(min=1e-6)
+                L_prior = 0.5 * (
+                    lv_p - lv_q_l
+                    + lv_q_l.exp() / var_p
+                    + (mu_q_l - mu_p)**2 / var_p - 1.0
+                ).sum(dim=-1).mean()
 
-            # ── L_prior (reverse KL: q || p) ─────────────────
-            mu_p, lv_p = self.prior(s0)               # (B, d_z)
-            var_p = lv_p.exp().clamp(min=1e-6)
-            L_prior = 0.5 * (
-                lv_p - lv_q_l
-                + lv_q_l.exp() / var_p
-                + (mu_q_l - mu_p) ** 2 / var_p
-                - 1.0
-            ).sum(dim=-1).mean()
+            # L_spread + L_vae: 두 phase 모두 사용
+            L_spread = F.relu(self.cfg.min_z_std - z_last.std(dim=0)).mean()
+            L_vae    = 0.5 * (lv_q_l.exp() + mu_q_l**2 - 1.0 - lv_q_l).mean()
 
-            # L_spread: batch std 하한 강제 (z collapse 방지)
-            L_spread = F.relu(self.cfg.min_z_std
-                               - z_last.std(dim=0)).mean()
-            # L_vae: KL(q || N(0,I))
-            L_vae = 0.5 * (lv_q_l.exp() + mu_q_l**2
-                            - 1.0 - lv_q_l).mean()
+            # Phase에 따라 weight 조정
+            vae_w = self.cfg.zeta_vae_pretrain if pretrain else self.cfg.zeta_vae
+            dpm_w = 0.0 if pretrain else self.cfg.zeta2
+            pri_w = 0.0 if pretrain else self.cfg.zeta3
+
             loss = (self.cfg.zeta1 * L_rec
-                    + self.cfg.zeta2 * L_dpm
-                    + self.cfg.zeta3 * L_prior
+                    + dpm_w          * L_dpm
+                    + pri_w          * L_prior
                     + self.cfg.zeta_spread * L_spread
-                    + self.cfg.zeta_vae    * L_vae)
+                    + vae_w          * L_vae)
 
             self.opt.zero_grad()
             loss.backward()
@@ -939,16 +967,31 @@ class SkillPretrainer:
 
         best_loss = float('inf')
 
-        K_prev = self.dpm.K
+        K_prev   = self.dpm.K
+        n_births = 0
+        n_merges = 0
+        elbo     = float('nan')
+
         for ep in range(1, self.cfg.epochs + 1):
-            # Step A: DPM fitting
-            K, elbo = self._step_A(loader, epoch=ep)
+            pretrain = (ep <= self.cfg.pretrain_epochs)
 
-            birth_happened = K > K_prev
-            K_prev = K
-
-            # Step B: network update
-            m = self._step_B(loader)
+            if pretrain:
+                # Phase 1: encoder만 학습 (DPM 없음)
+                K    = self.dpm.K
+                m    = self._step_B(loader, pretrain=True)
+                n_births = n_merges = 0
+                if ep == self.cfg.pretrain_epochs:
+                    print("  [Phase 1 완료] z로 DPM 초기 피팅 ...")
+                    K, elbo, _, _ = self._step_A(loader, epoch=0)
+                    print(f"  [DPM init] K={K} "
+                          f"N_hat={np.round(self.dpm.N_hat,0).astype(int).tolist()}")
+                birth_happened = False
+            else:
+                # Phase 2: DPM + encoder 교대
+                K, elbo, n_births, n_merges = self._step_A(loader, epoch=ep)
+                birth_happened = K > K_prev
+                K_prev = K
+                m = self._step_B(loader, pretrain=False)
 
             if birth_happened:
                 print(f"  [birth K={K}] warm-up "
@@ -958,14 +1001,18 @@ class SkillPretrainer:
                     all_m.append(self._step_B(loader))
                 m = {k: sum(mi[k] for mi in all_m)/len(all_m) for k in m}
                 # warm-up 후 birth 없이 DPM 재피팅 (spread된 z에 맞춤)
-                K, elbo = self._step_A(loader, epoch=ep + 10000)
-                print(f"  [post-warmup] K={K}(act={self.dpm.n_active})")
+                K, elbo, _, _ = self._step_A(loader, epoch=0)  # birth 없이
+                print(f"  [post-warmup] K={K}(act={self.dpm.n_active})"
+                      f"  N_hat={np.round(self.dpm.N_hat,0).astype(int).tolist()}")
 
+            N_hat_str = np.round(self.dpm.N_hat, 0).astype(int).tolist()
+            phase_str = "PRE" if pretrain else "DPM"
             print(
-                f"Ep {ep:4d} | K={K}(act={self.dpm.n_active}) | "
+                f"Ep {ep:4d}[{phase_str}] | K={K}(act={self.dpm.n_active}) "
+                f"B={n_births} M={n_merges} | "
                 f"rec={m['l_rec']:.4f} dpm={m['l_dpm']:.4f} "
                 f"spr={m['l_spread']:.4f} vae={m['l_vae']:.4f} | "
-                f"ELBO={elbo:.1f}",
+                f"ELBO={elbo} N_hat={N_hat_str}",
                 flush=True,
             )
 
