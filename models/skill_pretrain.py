@@ -743,15 +743,15 @@ class SkillPretrainer:
         d    = self.cfg.skill_dim
         dpm_mu  = [torch.FloatTensor(self.dpm.mu_hat[k]).to(self.device)
                    for k in range(K)]
-        # NIW 기댓값: E[Sigma_k] = Psi_hat_k / (nu_hat_k - d - 1)
+        # Empirical variance from Psi (scatter matrix / N_k)
+        # 이것이 NIW posterior에서 실제 data scatter를 반영하므로 더 안정적
+        # var_k = diag(Psi_hat_k) / max(N_hat_k, 1)
+        # clamp to [0.1, 5.0]: 너무 작으면 KL 폭발, 너무 크면 gradient 없음
         dpm_var = []
         for k in range(K):
-            # NIW E[Sigma] = Psi / (nu - d - 1)
-            # nu must be > d+1 for this to be valid
-            # clamp to [0.01, 10.0] to prevent KL explosion
-            denom = max(self.dpm.nu_hat[k] - d - 1.0, 1.0)
-            var_k = np.diag(self.dpm.Psi_hat[k]) / denom
-            var_k = np.clip(var_k, 0.01, 10.0)    # prevent extreme variance
+            N_k   = max(float(self.dpm.N_hat[k]), 1.0)
+            var_k = np.diag(self.dpm.Psi_hat[k]) / N_k
+            var_k = np.clip(var_k, 0.1, 5.0)
             dpm_var.append(torch.FloatTensor(var_k).to(self.device))
 
         totals = dict(loss=0., l_rec=0., l_dpm=0., l_prior=0.)
@@ -793,12 +793,16 @@ class SkillPretrainer:
                 # KL( q(z|s,a) || N(mu_k, diag(var_k)) )
                 # = 0.5 * sum_d [ log(var_k/exp(lv)) + exp(lv)/var_k
                 #                 + (mu_q - mu_k)^2/var_k - 1 ]
-                kl_k = 0.5 * (
+                # KL(q || N(mu_k, var_k))  = 0.5 * sum_d[...]
+                # 각 dim별로 계산 후 mean(dim=-1)하면 d=32에서 자연스럽게 스케일됨
+                kl_k_per_dim = 0.5 * (
                     dpm_var[k].log() - lv_q_l
                     + lv_q_l.exp() / dpm_var[k].clamp(min=1e-6)
                     + (mu_q_l - dpm_mu[k]) ** 2 / dpm_var[k].clamp(min=1e-6)
                     - 1.0
-                ).sum(dim=-1).clamp(max=50.0)         # (B,) clamp per-sample KL
+                )  # (B, d_z)
+                # mean over dims (not sum): scale-invariant to d_z
+                kl_k = kl_k_per_dim.mean(dim=-1).clamp(min=0.0, max=100.0)  # (B,)
                 L_dpm = L_dpm + (pi_t[:, k] * kl_k).mean()
 
             # ── L_prior (reverse KL: q || p) ─────────────────
