@@ -819,8 +819,9 @@ class SkillPretrainer:
         self.encoder.eval()
         zs = []
         for actions, states in loader:
-            mu = self.encoder.encode_mu(actions.to(self.device),
-                                        states.to(self.device))
+            # encode_mu(states, actions) — signature 순서 주의
+            mu = self.encoder.encode_mu(states.to(self.device),
+                                        actions.to(self.device))
             zs.append(mu.cpu().numpy())
         Z = np.concatenate(zs, axis=0)
         z_std = max(float(Z.std()), 1e-6)
@@ -830,6 +831,10 @@ class SkillPretrainer:
         """Phase 1 완료 후 K-means++로 DPM 초기화. K=1 birth 대기 불필요."""
         from sklearn.cluster import KMeans
         Z = self._collect_z(loader)
+        # mu 분포 진단
+        print(f"  Z stats: mean_norm={np.linalg.norm(Z, axis=1).mean():.4f}  "
+              f"std_per_dim={Z.std(axis=0).mean():.4f}  "
+              f"shape={Z.shape}")
         K = min(self.cfg.dpm_init_k, self.cfg.K_max)
 
         print(f"  K-means++(K={K}) ...")
@@ -892,7 +897,7 @@ class SkillPretrainer:
             var_k = np.clip(var_k, 0.1, 5.0)
             dpm_var.append(torch.FloatTensor(var_k).to(self.device))
 
-        totals = dict(loss=0., l_rec=0., l_dpm=0., l_prior=0., l_spread=0., l_vae=0.)
+        totals = dict(loss=0., l_rec=0., l_dpm=0., l_prior=0., l_spread=0., l_vae=0., mu_std=0.)
         n_b    = 0
 
         for actions, states in loader:
@@ -981,6 +986,7 @@ class SkillPretrainer:
             totals['l_prior'] += L_prior.item()
             totals['l_spread']+= L_spread.item()
             totals['l_vae']   += L_vae.item()
+            totals['mu_std']  += float(mu_q_l.std(dim=0).mean().item())
             n_b += 1
 
         self.sched.step()
@@ -1039,14 +1045,17 @@ class SkillPretrainer:
                 print(f"  [post-warmup] K={K}(act={self.dpm.n_active})"
                       f"  N_hat={np.round(self.dpm.N_hat,0).astype(int).tolist()}")
 
-            N_hat_str = np.round(self.dpm.N_hat, 0).astype(int).tolist()
-            phase_str = "PRE" if pretrain else "DPM"
+            N_hat_str  = np.round(self.dpm.N_hat, 0).astype(int).tolist()
+            phase_str  = "PRE" if pretrain else "DPM"
+            # Phase 1에서는 vae loss 값 자체가 찍히지만 weight=0이므로
+            # 실제 loss에 기여 안 함. 혼란 방지를 위해 0으로 표시
+            vae_disp   = m["l_vae"] if not pretrain else 0.0
             print(
                 f"Ep {ep:4d}[{phase_str}] | K={K}(act={self.dpm.n_active}) "
                 f"B={n_births} M={n_merges} | "
-                f"rec={m['l_rec']:.4f} dpm={m['l_dpm']:.4f} "
-                f"spr={m['l_spread']:.4f} vae={m['l_vae']:.4f} | "
-                f"ELBO={elbo} N_hat={N_hat_str}",
+                f"rec={m['l_rec']:.4f} mu_std={m['mu_std']:.4f} "
+                f"spr={m['l_spread']:.4f} vae={vae_disp:.4f} "
+                f"dpm={m['l_dpm']:.4f} | ELBO={elbo} N_hat={N_hat_str}",
                 flush=True,
             )
 

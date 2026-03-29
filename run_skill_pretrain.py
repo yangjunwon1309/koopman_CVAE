@@ -67,7 +67,7 @@ def main():
         # Anti-collapse: z spread 강제
         # spr=0.0이면 z가 collapse → birth 후 act=1 지속 원인
         # 2-Phase: pretrain_epochs 동안 β-VAE만, 그 후 DPM
-        pretrain_epochs   = 25,
+        pretrain_epochs   = 10,
         zeta_vae_pretrain = 1.0,   # Phase 1: 강한 VAE (β=1)
         # Phase 2 weights
         zeta_spread = 0.5,
