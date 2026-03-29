@@ -29,14 +29,21 @@ def main():
         # Kitchen
         state_dim   = 60,
         action_dim  = 9,
-        # TCN
-        tcn_hidden  = 256,
-        tcn_layers  = 5,     # RF=63 steps
+        # ── Encoder ──────────────────────────────────────────
+        # HELIOS 원본: GRU + action-only
+        # action-only: DPM이 state가 아닌 action pattern을 클러스터링
+        encoder_type  = 'gru',
+        encoder_input = 'action',
+        gru_hidden    = 128,
+        gru_layers    = 2,
+        # TCN 대안 (encoder_type='tcn'으로 변경 시)
+        tcn_hidden  = 128,
+        tcn_layers  = 5,
         tcn_kernel  = 3,
         dropout     = 0.1,
         # Skill latent
         skill_dim   = 32,
-        skill_horizon = 10,  # SPiRL: n_rollout_steps=10
+        skill_horizon = 10,
         # DPM
         alpha         = 2.0,    # higher → more clusters expected
         K_init        = 1,

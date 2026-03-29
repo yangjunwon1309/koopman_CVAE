@@ -59,21 +59,27 @@ class SkillPretrainConfig:
     state_dim:  int   = 60
     action_dim: int   = 9
 
-    # TCN (CausalConv1d 재사용)
-    # TCN (SPiRL GRU hidden=128 기준으로 맞춤)
-    tcn_hidden:  int  = 128    # SPiRL GRU hidden=128과 동일
-    tcn_layers:  int  = 5      # dilation: 1,2,4,8,16 → RF=63 steps
+    # ── Encoder type ──────────────────────────────────────────
+    # HELIOS 원본: 'gru', action-only
+    # 대안:       'tcn', state_action (더 빠름)
+    encoder_type:  str  = 'gru'       # 'gru' | 'tcn'
+    encoder_input: str  = 'action'    # 'action' (HELIOS) | 'state_action'
+
+    # GRU parameters (HELIOS 원본 구조)
+    gru_hidden: int   = 128    # SPiRL GRU hidden=128
+    gru_layers: int   = 2      # bidirectional=False (causal)
+
+    # TCN parameters (encoder_type='tcn'일 때)
+    tcn_hidden:  int  = 128
+    tcn_layers:  int  = 5      # RF=63 steps
     tcn_kernel:  int  = 3
     dropout:     float= 0.1
 
     # Skill latent dimension
-    # SPiRL: nz_vae=10 (Kitchen), HELIOS는 더 큰 값 사용
-    # 32가 합리적 (DPM clustering에 충분한 차원)
     skill_dim:   int  = 32
 
-    # Skill decoder horizon
-    # SPiRL: n_rollout_steps=10 (Kitchen)
-    skill_horizon: int = 10    # L: SPiRL 기준 10 steps
+    # Skill decoder horizon (SPiRL: n_rollout_steps=10)
+    skill_horizon: int = 10
 
     # DPM hyperparameters
     alpha:   float = 1.0       # GEM concentration
@@ -107,34 +113,80 @@ class SkillPretrainConfig:
 
 
 # ─────────────────────────────────────────────────────────────
-# TCN Skill Encoder  (GRU 대체)
+# GRU Skill Encoder  (HELIOS 원본 구조)
 # ─────────────────────────────────────────────────────────────
 
-class SkillEncoder(nn.Module):
+class GRUSkillEncoder(nn.Module):
     """
-    q(z_skill | s_{1:t}, a_{1:t}) via causal TCN.
+    HELIOS 논문 원본: q(z_skill | a_{1:L})
+    
+    핵심: action-only input.
+    Skill은 state와 무관한 action pattern으로 정의됨.
+    (state 넣으면 DPM이 skill cluster 대신 state cluster를 학습)
 
-    기존 KoopmanCVAE의 TCNSkillEncoder와 차이:
-      - 출력: (B, T, skill_dim) — VAE mu/logvar (not multi-head observable)
-      - 입력: (s, a) 시계열 전체
-      - 목적: 각 시점 t에서의 skill context 요약
-
-    Receptive field: 1 + (kernel-1)*(2^layers - 1)
-        kernel=3, layers=5 → RF = 63 steps (Kitchen subtask ~70step 커버)
-
-    CausalConv1d를 koopman_cvae.py에서 직접 import해서 재사용.
+    GRU hidden state가 action sequence의 temporal pattern을 누적.
+    마지막 hidden state가 전체 skill을 요약.
     """
 
     def __init__(self, cfg: SkillPretrainConfig):
         super().__init__()
-        in_dim = cfg.state_dim + cfg.action_dim  # 60 + 9 = 69
+        in_dim = cfg.action_dim if cfg.encoder_input == 'action'                  else cfg.state_dim + cfg.action_dim
+        d_z    = cfg.skill_dim
+
+        self.encoder_input = cfg.encoder_input
+        self.gru = nn.GRU(
+            input_size=in_dim,
+            hidden_size=cfg.gru_hidden,
+            num_layers=cfg.gru_layers,
+            batch_first=True,
+            dropout=cfg.dropout if cfg.gru_layers > 1 else 0.0,
+        )
+        self.fc_mu     = nn.Linear(cfg.gru_hidden, d_z)
+        self.fc_logvar = nn.Linear(cfg.gru_hidden, d_z)
+
+    def _get_input(self, states, actions):
+        if self.encoder_input == 'action':
+            return symlog(actions)                     # (B, T, da)
+        else:
+            return torch.cat([symlog(states),
+                               symlog(actions)], dim=-1)
+
+    def forward(self, states, actions):
+        """
+        Returns z, mu, logvar: (B, T, d_z)
+        각 timestep t에서 a_{1:t} 또는 (s,a)_{1:t}를 요약한 skill latent.
+        """
+        x, _ = self.gru(self._get_input(states, actions))  # (B,T,h)
+        mu     = self.fc_mu(x)
+        logvar = self.fc_logvar(x).clamp(-4.0, 2.0)
+        std    = (0.5 * logvar).exp()
+        z      = mu + std * torch.randn_like(std)
+        return z, mu, logvar
+
+    @torch.no_grad()
+    def encode_mu(self, states, actions):
+        _, mu, _ = self.forward(states, actions)
+        return mu
+
+
+# ─────────────────────────────────────────────────────────────
+# TCN Skill Encoder  (빠른 대안)
+# ─────────────────────────────────────────────────────────────
+
+class TCNSkillEncoder(nn.Module):
+    """
+    Causal TCN: 병렬화 가능, GRU보다 3-5x 빠름.
+    encoder_input='action'이면 HELIOS와 동일한 semantics.
+    """
+
+    def __init__(self, cfg: SkillPretrainConfig):
+        super().__init__()
+        in_dim = cfg.action_dim if cfg.encoder_input == 'action'                  else cfg.state_dim + cfg.action_dim
         d_c    = cfg.tcn_hidden
         d_z    = cfg.skill_dim
 
-        # Input projection: pointwise conv (B, in_dim, T) → (B, d_c, T)
+        self.encoder_input = cfg.encoder_input
         self.input_proj = nn.Conv1d(in_dim, d_c, kernel_size=1)
-
-        # Dilated causal conv stack (동일한 CausalConv1d 블록 재사용)
         self.layers = nn.ModuleList([
             CausalConv1d(d_c, d_c,
                          kernel_size=cfg.tcn_kernel,
@@ -142,50 +194,47 @@ class SkillEncoder(nn.Module):
                          dropout=cfg.dropout)
             for i in range(cfg.tcn_layers)
         ])
-
-        # VAE head
         self.fc_mu     = nn.Linear(d_c, d_z)
         self.fc_logvar = nn.Linear(d_c, d_z)
 
-    def forward(
-        self,
-        states:  torch.Tensor,   # (B, T, ds)
-        actions: torch.Tensor,   # (B, T, da)
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Returns
-            z:      (B, T, d_z)  reparameterized sample
-            mu:     (B, T, d_z)
-            logvar: (B, T, d_z)
-        """
-        # symlog 정규화 (koopman_cvae와 동일한 전처리)
-        x = torch.cat([symlog(states), symlog(actions)], dim=-1)  # (B,T,69)
-        x = x.transpose(1, 2)                                      # (B,69,T)
-        x = F.silu(self.input_proj(x))                             # (B,d_c,T)
+    def _get_input(self, states, actions):
+        if self.encoder_input == 'action':
+            x = symlog(actions).transpose(1, 2)                    # (B,da,T)
+        else:
+            x = torch.cat([symlog(states), symlog(actions)], -1
+                          ).transpose(1, 2)                        # (B,ds+da,T)
+        return x
 
+    def forward(self, states, actions):
+        x = F.silu(self.input_proj(self._get_input(states, actions)))
         for layer in self.layers:
-            x = x + layer(x)                                       # residual
-
+            x = x + layer(x)
         c = x.transpose(1, 2)                                      # (B,T,d_c)
-
-        mu     = self.fc_mu(c)                                     # (B,T,d_z)
+        mu     = self.fc_mu(c)
         logvar = self.fc_logvar(c).clamp(-4.0, 2.0)
-
-        # Reparameterization trick
-        std = (0.5 * logvar).exp()
-        eps = torch.randn_like(std)
-        z   = mu + std * eps
+        std    = (0.5 * logvar).exp()
+        z      = mu + std * torch.randn_like(std)
         return z, mu, logvar
 
     @torch.no_grad()
-    def encode_mu(
-        self,
-        states:  torch.Tensor,
-        actions: torch.Tensor,
-    ) -> torch.Tensor:
-        """DPM fitting용: mu만 반환 (noise 없음). (B,T,d_z)"""
+    def encode_mu(self, states, actions):
         _, mu, _ = self.forward(states, actions)
         return mu
+
+
+# ── Factory: cfg.encoder_type에 따라 선택 ────────────────────
+
+def build_encoder(cfg: SkillPretrainConfig) -> nn.Module:
+    if cfg.encoder_type == 'gru':
+        return GRUSkillEncoder(cfg)
+    elif cfg.encoder_type == 'tcn':
+        return TCNSkillEncoder(cfg)
+    else:
+        raise ValueError(f"encoder_type must be 'gru' or 'tcn', got {cfg.encoder_type!r}")
+
+
+# ── SkillEncoder = alias for backward compat ─────────────────
+SkillEncoder = GRUSkillEncoder
 
 
 # ─────────────────────────────────────────────────────────────
@@ -546,7 +595,11 @@ class DPM:
         r_new    = self.e_step(X)
         elbo_new = self.elbo(X, r_new)
 
-        if elbo_new > elbo_old:
+        # 새 component들 중 하나라도 birth_min_pts 이상 할당된 것이 있어야 accept
+        new_N_hat = [r_new[:, k].sum() for k in range(K_old, self.K)]
+        has_viable = any(n > self.cfg.birth_min_pts for n in new_N_hat)
+
+        if elbo_new > elbo_old and has_viable:
             return True   # accept birth
         else:
             # revert all new components
@@ -657,8 +710,14 @@ class DPM:
 
     @property
     def n_active(self) -> int:
-        """N_hat > 1인 component 수."""
-        return int((self.N_hat > 1.0).sum())
+        """
+        전체 데이터의 1% 이상 할당된 component 수.
+        N_hat > 1 기준은 N이 클 때 모든 component가 active로 보이므로
+        전체 대비 비율로 판단하는 것이 더 정확.
+        """
+        total = max(self.N_hat.sum(), 1.0)
+        threshold = max(1.0, total * 0.01)   # 최소 1%, 최소 1개
+        return int((self.N_hat > threshold).sum())
 
 
 # ─────────────────────────────────────────────────────────────
@@ -683,7 +742,7 @@ class SkillPretrainer:
         self.device = torch.device(
             cfg.device if torch.cuda.is_available() else 'cpu')
 
-        self.encoder = SkillEncoder(cfg).to(self.device)
+        self.encoder = build_encoder(cfg).to(self.device)
         self.decoder = SkillDecoder(cfg).to(self.device)
         self.prior   = SkillPrior(cfg).to(self.device)
         self.dpm     = DPM(cfg)
@@ -839,9 +898,12 @@ class SkillPretrainer:
     # ── Training loop ─────────────────────────────────────────
 
     def train(self, loader, val_loader=None):
+        enc_str = (f"GRU(h={self.cfg.gru_hidden},L={self.cfg.gru_layers})"
+                   if self.cfg.encoder_type == 'gru'
+                   else f"TCN(h={self.cfg.tcn_hidden},L={self.cfg.tcn_layers})")
         print(f"[SkillPretrain] epochs={self.cfg.epochs}  "
-              f"d_z={self.cfg.skill_dim}  "
-              f"K_max={self.cfg.K_max}  "
+              f"enc={enc_str}  input={self.cfg.encoder_input}  "
+              f"d_z={self.cfg.skill_dim}  K_max={self.cfg.K_max}  "
               f"device={self.device}")
 
         best_loss = float('inf')
