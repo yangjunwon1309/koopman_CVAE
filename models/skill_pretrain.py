@@ -871,7 +871,8 @@ class SkillPretrainer:
     # ── Step B: DPM → networks ───────────────────────────────
 
     def _step_B(self, loader,
-               pretrain: bool = False) -> Dict[str, float]:
+               pretrain: bool = False,
+               dpm_scale: float = 1.0) -> Dict[str, float]:
         """
         Phase 1 (pretrain=True): L_rec + L_vae_pretrain + L_spread.
           z를 N(0,I)로 spread → 이후 DPM clustering 가능하게.
@@ -963,8 +964,9 @@ class SkillPretrainer:
             # L_vae: Phase 1에서는 0 (mu→0 방지), Phase 2에서 소량
             L_vae    = 0.5 * (lv_q_l.exp() + mu_q_l**2 - 1.0 - lv_q_l).mean()
             vae_w = 0.0  if pretrain else self.cfg.zeta_vae
-            dpm_w = 0.0  if pretrain else self.cfg.zeta2
-            pri_w = 0.0  if pretrain else self.cfg.zeta3
+            # dpm_scale: Phase 2 초기에 gradient를 서서히 켜서 collapse 방지
+            dpm_w = 0.0  if pretrain else self.cfg.zeta2 * dpm_scale
+            pri_w = 0.0  if pretrain else self.cfg.zeta3 * dpm_scale
 
             loss = (self.cfg.zeta1 * L_rec
                     + dpm_w          * L_dpm
@@ -1031,7 +1033,11 @@ class SkillPretrainer:
                 K, elbo, n_births, n_merges = self._step_A(loader, epoch=ep)
                 birth_happened = K > K_prev
                 K_prev = K
-                m = self._step_B(loader, pretrain=False)
+                # DPM gradient ramp-up: 첫 10 epoch은 서서히 켜기
+                phase2_ep  = ep - self.cfg.pretrain_epochs   # 1, 2, 3, ...
+                dpm_scale  = min(1.0, phase2_ep / 10.0)
+                m = self._step_B(loader, pretrain=False,
+                                 dpm_scale=dpm_scale)
 
             if birth_happened:
                 print(f"  [birth K={K}] warm-up "
@@ -1047,15 +1053,20 @@ class SkillPretrainer:
 
             N_hat_str  = np.round(self.dpm.N_hat, 0).astype(int).tolist()
             phase_str  = "PRE" if pretrain else "DPM"
+            if not pretrain:
+                phase2_ep_log = ep - self.cfg.pretrain_epochs
+                dpm_sc_log    = min(1.0, phase2_ep_log / 10.0)
+            else:
+                dpm_sc_log = 0.0
             # Phase 1에서는 vae loss 값 자체가 찍히지만 weight=0이므로
             # 실제 loss에 기여 안 함. 혼란 방지를 위해 0으로 표시
             vae_disp   = m["l_vae"] if not pretrain else 0.0
             print(
-                f"Ep {ep:4d}[{phase_str}] | K={K}(act={self.dpm.n_active}) "
-                f"B={n_births} M={n_merges} | "
+                f"Ep {ep:4d}[{phase_str} dsc={dpm_sc_log:.1f}] | "
+                f"K={K}(act={self.dpm.n_active}) B={n_births} M={n_merges} | "
                 f"rec={m['l_rec']:.4f} mu_std={m['mu_std']:.4f} "
                 f"spr={m['l_spread']:.4f} vae={vae_disp:.4f} "
-                f"dpm={m['l_dpm']:.4f} | ELBO={elbo} N_hat={N_hat_str}",
+                f"dpm={m['l_dpm']:.4f} | ELBO={elbo:.0f} N_hat={N_hat_str}",
                 flush=True,
             )
 

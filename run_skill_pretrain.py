@@ -62,17 +62,17 @@ def main():
         # zeta1 dominant: reconstruction teaches encoder first
         # zeta2 very small early: DPM noisy, don't let it dominate
         zeta1 = 1.0,
-        zeta2 = 0.05,
-        zeta3 = 0.01,
-        # Anti-collapse: z spread 강제
-        # spr=0.0이면 z가 collapse → birth 후 act=1 지속 원인
-        # 2-Phase: pretrain_epochs 동안 β-VAE만, 그 후 DPM
-        pretrain_epochs   = 10,
-        zeta_vae_pretrain = 1.0,   # Phase 1: 강한 VAE (β=1)
-        # Phase 2 weights
-        zeta_spread = 0.5,
-        zeta_vae    = 0.5,
-        min_z_std   = 0.5,
+        # Phase 2: DPM/VAE weight 최소화 → mu를 당기는 힘 감소
+        # Ep11에서 mu_std 2.08→0.35 급락 원인: zeta2+zeta_vae가 너무 강함
+        zeta2 = 0.005,   # 0.05→0.005: DPM alignment 최소
+        zeta3 = 0.001,   # prior: 거의 끄기
+        # 2-Phase config
+        pretrain_epochs   = 9,     # mu_std~2.0 달성 시점 (로그 기준)
+        zeta_vae_pretrain = 0.0,   # Phase 1: VAE 완전 끄기 (mu→0 방지)
+        # Phase 2 spread 유지 (L_spread가 핵심)
+        zeta_spread = 10.0,  # 0.5→10: Phase 2 전환 후 spread 강하게 유지
+        zeta_vae    = 0.0,   # VAE 끄기: mu를 원점으로 당기지 않음
+        min_z_std   = 1.5,   # 0.5→1.5: Phase 1 mu_std~2.0 기준
         birth_warmup_steps = 5,
         # Training
         epochs     = 100,
