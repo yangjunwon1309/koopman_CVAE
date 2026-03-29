@@ -60,16 +60,20 @@ class SkillPretrainConfig:
     action_dim: int   = 9
 
     # TCN (CausalConv1d 재사용)
-    tcn_hidden:  int  = 256
+    # TCN (SPiRL GRU hidden=128 기준으로 맞춤)
+    tcn_hidden:  int  = 128    # SPiRL GRU hidden=128과 동일
     tcn_layers:  int  = 5      # dilation: 1,2,4,8,16 → RF=63 steps
     tcn_kernel:  int  = 3
     dropout:     float= 0.1
 
-    # Skill latent dimension (Koopman dim과 별도)
+    # Skill latent dimension
+    # SPiRL: nz_vae=10 (Kitchen), HELIOS는 더 큰 값 사용
+    # 32가 합리적 (DPM clustering에 충분한 차원)
     skill_dim:   int  = 32
 
     # Skill decoder horizon
-    skill_horizon: int = 20    # L: 한 번에 재구성할 action sequence 길이
+    # SPiRL: n_rollout_steps=10 (Kitchen)
+    skill_horizon: int = 10    # L: SPiRL 기준 10 steps
 
     # DPM hyperparameters
     alpha:   float = 1.0       # GEM concentration
@@ -84,7 +88,9 @@ class SkillPretrainConfig:
     # Birth/Merge
     birth_thresh:  float = 0.3    # max_r < thresh → poorly explained (K>1 only)
     birth_min_pts: int   = 10
-    merge_cos:     float = 0.95   # cosine similarity threshold for merge
+    birth_K_fresh: int   = 4      # Hughes&Sudderth: K_fresh sub-clusters per birth
+    birth_start_epoch: int = 3    # epoch < this: birth disabled (encoder not ready)
+    merge_cos:     float = 0.90   # cosine similarity threshold for merge
 
     # Loss weights (HELIOS Eq.7)
     # zeta1 dominant initially so encoder learns from reconstruction first
@@ -501,27 +507,41 @@ class DPM:
         X_bad    = X[bad_mask]
         elbo_old = self.elbo(X, r)
 
-        # 새 component: bad points의 평균/공분산으로 초기화
-        mu_new  = X_bad.mean(axis=0)
-        if n_bad > self.d:
-            Psi_new = (np.cov(X_bad.T) * n_bad
-                       + 1e-4 * np.eye(self.d))
-        else:
-            Psi_new = self.Psi0.copy()
+        # Hughes & Sudderth (2013) MemoVB:
+        # bad points에 K_fresh개 cluster를 k-means로 초기화
+        # (단일 component가 아닌 여러 sub-cluster 제안)
+        K_fresh = min(self.cfg.birth_K_fresh,
+                      self.cfg.K_max - self.K,
+                      max(1, n_bad // self.cfg.birth_min_pts))
+        if K_fresh < 1:
+            return False
 
-        # 임시로 K+1 component 추가
+        # K-means로 K_fresh 개 centroid 초기화
+        from sklearn.cluster import MiniBatchKMeans
+        km = MiniBatchKMeans(n_clusters=K_fresh, n_init=3,
+                             random_state=42, max_iter=50)
+        km.fit(X_bad)
+        new_centers = km.cluster_centers_               # (K_fresh, d)
+
         K_old = self.K
-        self.K += 1
-        for attr, val in [
-            ('mu_hat',    np.vstack([self.mu_hat,    mu_new[None]])),
-            ('kappa_hat', np.append(self.kappa_hat,  self.kappa0 + n_bad)),
-            ('nu_hat',    np.append(self.nu_hat,     self.nu0 + n_bad)),
-            ('Psi_hat',   np.concatenate([self.Psi_hat, Psi_new[None]], axis=0)),
-            ('a_k1',      np.append(self.a_k1, 1.0 + n_bad)),
-            ('a_k0',      np.append(self.a_k0, self.alpha)),
-            ('N_hat',     np.append(self.N_hat, float(n_bad))),
-        ]:
-            setattr(self, attr, val)
+        # 새 component들 추가
+        for center in new_centers:
+            mask_c = np.linalg.norm(X_bad - center, axis=1) <                      np.linalg.norm(X_bad - center, axis=1).mean() * 1.5
+            n_c = max(int(mask_c.sum()), 1)
+            if n_c > self.d:
+                Psi_c = (np.cov(X_bad[mask_c].T) * n_c
+                         + 1e-4 * np.eye(self.d))
+            else:
+                Psi_c = self.Psi0.copy()
+
+            self.K += 1
+            self.mu_hat    = np.vstack([self.mu_hat,    center[None]])
+            self.kappa_hat = np.append(self.kappa_hat,  self.kappa0 + n_c)
+            self.nu_hat    = np.append(self.nu_hat,     self.nu0 + n_c)
+            self.Psi_hat   = np.concatenate([self.Psi_hat, Psi_c[None]], axis=0)
+            self.a_k1      = np.append(self.a_k1, 1.0 + n_c)
+            self.a_k0      = np.append(self.a_k0, self.alpha)
+            self.N_hat     = np.append(self.N_hat, float(n_c))
 
         r_new    = self.e_step(X)
         elbo_new = self.elbo(X, r_new)
@@ -529,7 +549,7 @@ class DPM:
         if elbo_new > elbo_old:
             return True   # accept birth
         else:
-            # revert
+            # revert all new components
             self.K = K_old
             self.mu_hat    = self.mu_hat[:K_old]
             self.kappa_hat = self.kappa_hat[:K_old]
@@ -600,21 +620,28 @@ class DPM:
 
     def fit_batch(
         self,
-        X: np.ndarray,       # (N, d_z)  encoder mu (no noise)
+        X: np.ndarray,           # (N, d_z)  encoder mu (no noise)
         n_cavi: int = 5,
+        epoch: int = 0,          # current epoch (for birth_start_epoch gating)
     ) -> np.ndarray:
         """
         1 epoch: CAVI n_cavi회 → Birth 시도 → Merge 시도
         Returns r: (N, K_final)
+
+        bnpy (Hughes & Sudderth) 기준:
+          - birth_start_epoch 이전에는 birth 비활성화
+            (encoder가 안정화되기 전에 birth하면 noise cluster 생성)
+          - merge는 birth보다 늦게 시작
         """
         for _ in range(n_cavi):
             r = self.e_step(X)
             self.m_step(X, r)
 
         r = self.e_step(X)
-        if self._try_birth(X, r):
+        birth_enabled = epoch >= self.cfg.birth_start_epoch
+        if birth_enabled and self._try_birth(X, r):
             r = self.e_step(X)
-        if self._try_merge(X, r):
+        if birth_enabled and self._try_merge(X, r):
             r = self.e_step(X)
         return r
 
@@ -689,10 +716,10 @@ class SkillPretrainer:
             zs.append(mu[:, -1, :].cpu().numpy())         # 마지막 timestep
         return np.concatenate(zs, axis=0)                 # (N_total, d_z)
 
-    def _step_A(self, loader) -> Tuple[int, float]:
+    def _step_A(self, loader, epoch: int = 0) -> Tuple[int, float]:
         """Step A: DPM fitting."""
         Z = self._collect_z(loader)
-        r = self.dpm.fit_batch(Z, n_cavi=5)
+        r = self.dpm.fit_batch(Z, n_cavi=5, epoch=epoch)
         return self.dpm.K, self.dpm.elbo(Z, r)
 
     # ── Step B: DPM → networks ───────────────────────────────
@@ -719,8 +746,12 @@ class SkillPretrainer:
         # NIW 기댓값: E[Sigma_k] = Psi_hat_k / (nu_hat_k - d - 1)
         dpm_var = []
         for k in range(K):
-            denom = max(self.dpm.nu_hat[k] - d - 1.0, 1e-3)
-            var_k = np.diag(self.dpm.Psi_hat[k]) / denom  # diagonal approx
+            # NIW E[Sigma] = Psi / (nu - d - 1)
+            # nu must be > d+1 for this to be valid
+            # clamp to [0.01, 10.0] to prevent KL explosion
+            denom = max(self.dpm.nu_hat[k] - d - 1.0, 1.0)
+            var_k = np.diag(self.dpm.Psi_hat[k]) / denom
+            var_k = np.clip(var_k, 0.01, 10.0)    # prevent extreme variance
             dpm_var.append(torch.FloatTensor(var_k).to(self.device))
 
         totals = dict(loss=0., l_rec=0., l_dpm=0., l_prior=0.)
@@ -767,7 +798,7 @@ class SkillPretrainer:
                     + lv_q_l.exp() / dpm_var[k].clamp(min=1e-6)
                     + (mu_q_l - dpm_mu[k]) ** 2 / dpm_var[k].clamp(min=1e-6)
                     - 1.0
-                ).sum(dim=-1)                          # (B,)
+                ).sum(dim=-1).clamp(max=50.0)         # (B,) clamp per-sample KL
                 L_dpm = L_dpm + (pi_t[:, k] * kl_k).mean()
 
             # ── L_prior (reverse KL: q || p) ─────────────────
@@ -813,7 +844,7 @@ class SkillPretrainer:
 
         for ep in range(1, self.cfg.epochs + 1):
             # Step A: DPM fitting
-            K, elbo = self._step_A(loader)
+            K, elbo = self._step_A(loader, epoch=ep)
 
             # Step B: network update
             m = self._step_B(loader)

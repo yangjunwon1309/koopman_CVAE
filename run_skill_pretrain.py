@@ -36,7 +36,7 @@ def main():
         dropout     = 0.1,
         # Skill latent
         skill_dim   = 32,
-        skill_horizon = 20,
+        skill_horizon = 10,  # SPiRL: n_rollout_steps=10
         # DPM
         alpha         = 2.0,    # higher → more clusters expected
         K_init        = 1,
@@ -46,12 +46,14 @@ def main():
         psi_scale     = 0.1,    # small initial cov → sensitive birth
         birth_thresh  = 0.3,    # K>1 only; K=1 uses Mahalanobis
         birth_min_pts = 10,
-        merge_cos     = 0.95,
+        birth_K_fresh = 4,      # Hughes&Sudderth: 4 sub-clusters per birth
+        birth_start_epoch = 5,  # wait 5 epochs for encoder to stabilize
+        merge_cos     = 0.90,
         # Loss weights
         # zeta1 dominant: reconstruction teaches encoder first
-        # zeta2 small: DPM is noisy early, don't over-constrain
+        # zeta2 very small early: DPM noisy, don't let it dominate
         zeta1 = 1.0,
-        zeta2 = 0.1,
+        zeta2 = 0.05,   # will be scaled by clamped KL (~50 max)
         zeta3 = 0.01,
         # Training
         epochs     = 100,
