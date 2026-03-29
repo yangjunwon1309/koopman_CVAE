@@ -154,7 +154,9 @@ class GRUSkillEncoder(nn.Module):
     def forward(self, states, actions):
         """
         Returns z, mu, logvar: (B, T, d_z)
-        각 timestep t에서 a_{1:t} 또는 (s,a)_{1:t}를 요약한 skill latent.
+
+        각 timestep t의 출력 = a_{1:t}까지 본 GRU hidden state 기반.
+        DPM fitting에는 마지막 timestep (전체 sequence summary)을 사용.
         """
         x, _ = self.gru(self._get_input(states, actions))  # (B,T,h)
         mu     = self.fc_mu(x)
@@ -165,7 +167,13 @@ class GRUSkillEncoder(nn.Module):
 
     @torch.no_grad()
     def encode_mu(self, states, actions):
-        _, mu, _ = self.forward(states, actions)
+        """
+        DPM fitting용: 마지막 timestep mu 반환 (noise 없음).
+        seq_len=10이면 10-step 전체를 본 summary.
+        Returns (B, d_z) — timestep 차원 없음.
+        """
+        x, _ = self.gru(self._get_input(states, actions))   # (B,T,h)
+        mu    = self.fc_mu(x[:, -1, :])                      # (B, d_z)
         return mu
 
 
@@ -218,8 +226,9 @@ class TCNSkillEncoder(nn.Module):
 
     @torch.no_grad()
     def encode_mu(self, states, actions):
+        """Returns (B, d_z) — last timestep summary."""
         _, mu, _ = self.forward(states, actions)
-        return mu
+        return mu[:, -1, :]
 
 
 # ── Factory: cfg.encoder_type에 따라 선택 ────────────────────
@@ -763,16 +772,17 @@ class SkillPretrainer:
     @torch.no_grad()
     def _collect_z(self, loader) -> np.ndarray:
         """
-        전체 데이터셋에서 encoder mu 수집 (마지막 timestep 사용).
-        DPM fitting에 사용 (noise 없는 mu).
+        전체 데이터셋에서 encoder summary mu 수집.
+        encode_mu()는 이미 (B, d_z)를 반환 (마지막 timestep).
+        seq_len=skill_horizon=10이면 10-step action sequence summary.
         """
         self.encoder.eval()
         zs = []
         for actions, states in loader:
             actions = actions.to(self.device)
             states  = states.to(self.device)
-            mu = self.encoder.encode_mu(states, actions)  # (B, T, d_z)
-            zs.append(mu[:, -1, :].cpu().numpy())         # 마지막 timestep
+            mu = self.encoder.encode_mu(states, actions)  # (B, d_z)
+            zs.append(mu.cpu().numpy())
         return np.concatenate(zs, axis=0)                 # (N_total, d_z)
 
     def _step_A(self, loader, epoch: int = 0) -> Tuple[int, float]:
@@ -826,19 +836,19 @@ class SkillPretrainer:
             z, mu_q, lv_q = self.encoder(states, actions)
             # z: (B, T, d_z)  — 각 timestep의 skill latent
 
-            # skill window: 마지막 L steps (또는 전체 T가 짧을 경우 처리)
-            L_eff  = min(L, T)
-            z_last = z[:, -1, :]              # (B, d_z)  마지막 timestep
+            # seq_len=skill_horizon=10 → T=10
+            # GRU/TCN의 마지막 timestep = 전체 skill sequence summary
+            z_last = z[:, -1, :]              # (B, d_z)  skill summary
             mu_q_l = mu_q[:, -1, :]          # (B, d_z)
             lv_q_l = lv_q[:, -1, :]          # (B, d_z)
-            s0     = states[:, -L_eff, :]    # (B, ds)  window 시작 state
+            s0     = states[:, 0, :]          # (B, ds)  skill 시작 state
 
             # ── L_rec ────────────────────────────────────────
-            a_target = actions[:, -L_eff:, :]         # (B, L_eff, da)
-            a_hat    = self.decoder(z_last, s0)        # (B, L, da)
-            if a_hat.shape[1] != L_eff:
-                a_hat = a_hat[:, :L_eff, :]
-            L_rec = F.mse_loss(a_hat, a_target)
+            # seq_len=10 이므로 전체 sequence를 reconstruct
+            a_hat = self.decoder(z_last, s0)           # (B, L, da)
+            L_eff = min(a_hat.shape[1], T)
+            L_rec = F.mse_loss(a_hat[:, :L_eff, :],
+                               actions[:, :L_eff, :])
 
             # ── L_dpm ────────────────────────────────────────
             # soft assignment (no grad, numpy)
@@ -958,21 +968,22 @@ class SkillPretrainer:
             states  = states.to(self.device)
             B, T, _ = states.shape
 
-            mu = self.encoder.encode_mu(states, actions)  # (B, T, d_z)
-            z_np = mu.cpu().numpy().reshape(B * T, self.cfg.skill_dim)
+            # encode_mu: (B, d_z) — one skill label per sequence
+            mu = self.encoder.encode_mu(states, actions)  # (B, d_z)
+            z_np = mu.cpu().numpy()                        # (B, d_z)
 
-            r = self.dpm.soft_assign(z_np)                # (B*T, K)
+            r = self.dpm.soft_assign(z_np)                # (B, K)
 
             if hard:
-                lbl = r.argmax(axis=1).reshape(B, T).astype(np.int32)
+                lbl = r.argmax(axis=1).astype(np.int32)   # (B,)
             else:
-                lbl = r.reshape(B, T, self.dpm.K).astype(np.float32)
+                lbl = r.astype(np.float32)                 # (B, K)
 
             all_labels.append(lbl)
-            all_z.append(mu.cpu().numpy())
+            all_z.append(z_np)
 
-        labels = np.concatenate(all_labels, axis=0)       # (N, T) or (N,T,K)
-        z_all  = np.concatenate(all_z, axis=0)            # (N, T, d_z)
+        labels = np.concatenate(all_labels, axis=0)       # (N,) or (N,K)
+        z_all  = np.concatenate(all_z, axis=0)            # (N, d_z)
 
         print(f"Assigned labels: shape={labels.shape}  K={self.dpm.K}")
         return labels, z_all

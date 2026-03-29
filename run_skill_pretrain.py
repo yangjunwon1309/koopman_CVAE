@@ -73,18 +73,23 @@ def main():
     # ── 데이터 로딩 ───────────────────────────────────────────
     print("Loading kitchen_mixed ...")
     try:
+        # SPiRL/HELIOS 방식:
+        # skill_horizon=10 step 단위로 잘라서 각각이 하나의 skill sample
+        # stride=1: 136937 steps → ~136k samples (DPM에 충분한 데이터)
+        # stride=5: ~27k samples (빠른 실험용)
         dataset = load_d4rl_trajectories(
             'kitchen_mixed',
-            seq_len=200,
-            stride=50,          # 50-step sliding window
-            min_episode_len=100,
+            seq_len=cfg.skill_horizon,   # 10 steps = 1 skill sample
+            stride=5,                    # 27k samples (속도/품질 균형)
+            min_episode_len=cfg.skill_horizon,
         )
-        print(f"  Dataset size: {len(dataset)}")
+        print(f"  Dataset size: {len(dataset)}  "
+              f"(seq_len={cfg.skill_horizon}, stride=5)")
     except Exception as e:
         print(f"D4RL load failed ({e}), using synthetic dataset")
         dataset = make_synthetic_dataset(
             action_dim=9, state_dim=60,
-            n_samples=2000, seq_len=200,
+            n_samples=5000, seq_len=cfg.skill_horizon,
         )
 
     # Train / val split (90 / 10)
@@ -123,14 +128,18 @@ def main():
 
     save_path = os.path.join(cfg.save_dir, 'labels.npz')
     np.savez(save_path,
-             labels_hard=labels_hard,   # (N, T)      int32
-             labels_soft=labels_soft,   # (N, T, K)   float32
-             z_all=z_all,               # (N, T, d_z) float32
-             K=np.array([trainer.dpm.K]))
+             labels_hard=labels_hard,   # (N,)     int32   — one label per skill seq
+             labels_soft=labels_soft,   # (N, K)   float32
+             z_all=z_all,               # (N, d_z) float32
+             K=np.array([trainer.dpm.K]),
+             skill_horizon=np.array([cfg.skill_horizon]))
     print(f"Labels saved: {save_path}")
     print(f"  labels_hard: {labels_hard.shape}  "
           f"K={trainer.dpm.K}  "
           f"unique={np.unique(labels_hard).tolist()}")
+    print(f"  label counts: "
+          + str({int(k): int((labels_hard==k).sum())
+                 for k in np.unique(labels_hard)}))
 
 
 if __name__ == '__main__':

@@ -1,19 +1,13 @@
 """
 visualize_skills.py
 ====================
-Skill pretraining 결과 시각화:
-  1. t-SNE of skill latents (z_all), colored by skill label
-  2. K evolution would be logged during training
-  3. Skill label distribution (per-episode)
-  4. Action reconstruction (sampled episodes per skill)
+Skill pretraining 결과 시각화.
 
 Usage:
     python visualize_skills.py \
         --npz checkpoints/skill_pretrain/labels.npz \
-        --ckpt checkpoints/skill_pretrain/best.pt \
         --out checkpoints/skill_pretrain/tsne.png
 """
-
 import sys, os
 sys.path.insert(0, os.path.expanduser('~/koopman_CVAE'))
 
@@ -26,196 +20,128 @@ from sklearn.manifold import TSNE
 from sklearn.decomposition import PCA
 import argparse
 
-
-# ─── palette ──────────────────────────────────────────────────
 PALETTE = [
     '#E53935', '#1E88E5', '#43A047', '#FB8C00',
     '#8E24AA', '#00ACC1', '#FFB300', '#6D4C41',
     '#546E7A', '#D81B60', '#00897B', '#F4511E',
 ]
-
-def color_for(k: int) -> str:
-    return PALETTE[k % len(PALETTE)]
+def color_for(k): return PALETTE[k % len(PALETTE)]
 
 
-def load_npz(path: str):
-    data = np.load(path)
-    labels_hard = data['labels_hard']   # (N, T) int32
-    z_all       = data['z_all']          # (N, T, d_z)
-    K           = int(data['K'][0])
-    labels_soft = data.get('labels_soft', None)  # (N, T, K)
-    return labels_hard, z_all, K, labels_soft
-
-
-def run_tsne(Z: np.ndarray, perplexity: float = 30) -> np.ndarray:
-    """Z: (M, d_z) → (M, 2)"""
-    print(f"  Running t-SNE on {Z.shape[0]} points, d={Z.shape[1]} ...")
-    # PCA pre-reduction if d > 50
+def run_tsne(Z, perplexity=30):
+    print(f"  t-SNE: {Z.shape[0]} pts, d={Z.shape[1]}")
     if Z.shape[1] > 50:
         Z = PCA(n_components=50).fit_transform(Z)
-    tsne = TSNE(n_components=2, perplexity=perplexity,
-                random_state=42, n_iter=1000, verbose=0)
-    return tsne.fit_transform(Z)
+    return TSNE(n_components=2, perplexity=perplexity,
+                random_state=42, n_iter=1000).fit_transform(Z)
 
 
-def plot_tsne_by_skill(Z2d, labels, K, ax, title="t-SNE by skill"):
-    """Z2d: (M,2), labels: (M,)"""
+def scatter_by_skill(Z2d, labels, K, ax, title):
     for k in range(K):
-        mask = labels == k
-        if mask.sum() == 0:
-            continue
-        ax.scatter(Z2d[mask, 0], Z2d[mask, 1],
-                   c=color_for(k), alpha=0.5, s=8,
-                   label=f'Skill {k} (n={mask.sum()})')
-    ax.set_title(title, fontsize=10)
-    ax.legend(fontsize=7, markerscale=2, loc='best')
-    ax.axis('off')
+        m = labels == k
+        if m.sum() == 0: continue
+        ax.scatter(Z2d[m,0], Z2d[m,1], c=color_for(k), alpha=0.5,
+                   s=10, label=f'Skill {k} (n={m.sum()})')
+    ax.set_title(title, fontsize=9); ax.legend(fontsize=7, markerscale=2); ax.axis('off')
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--npz',  default='checkpoints/skill_pretrain/labels.npz')
-    parser.add_argument('--ckpt', default='checkpoints/skill_pretrain/best.pt')
-    parser.add_argument('--out',  default='checkpoints/skill_pretrain/tsne.png')
-    parser.add_argument('--subsample', type=int, default=5000,
-                        help='max points for t-SNE (speed)')
-    parser.add_argument('--perplexity', type=float, default=30)
-    args = parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument('--npz',  default='checkpoints/skill_pretrain/labels.npz')
+    p.add_argument('--out',  default='checkpoints/skill_pretrain/tsne.png')
+    p.add_argument('--n',    type=int, default=5000, help='max pts for t-SNE')
+    p.add_argument('--perp', type=float, default=30)
+    args = p.parse_args()
+    npz = os.path.expanduser(args.npz)
+    if not os.path.exists(npz):
+        print(f"Not found: {npz}"); return
 
-    npz_path = os.path.expanduser(args.npz)
-    out_path = os.path.expanduser(args.out)
+    data = np.load(npz, allow_pickle=True)
+    labels = data['labels_hard']   # (N,) or (N,T)
+    Z_all  = data['z_all']         # (N, d_z) or (N, T, d_z)
+    K      = int(data['K'][0])
+    L      = int(data['skill_horizon'][0]) if 'skill_horizon' in data else 10
 
-    if not os.path.exists(npz_path):
-        print(f"NPZ not found: {npz_path}")
-        return
+    # Flatten to (N, d_z) and (N,)
+    if Z_all.ndim == 3:
+        N, T, d_z = Z_all.shape
+        Z = Z_all[:, -1, :]
+        Y = labels[:, -1] if labels.ndim == 2 else labels
+    else:
+        Z, Y = Z_all, labels
+        N, d_z = Z.shape
 
-    labels_hard, z_all, K, labels_soft = load_npz(npz_path)
-    N, T, d_z = z_all.shape
-    print(f"Loaded: N={N}  T={T}  d_z={d_z}  K={K}")
-    print(f"  label unique: {np.unique(labels_hard).tolist()}")
+    print(f"N={N}  d_z={d_z}  K={K}  skill_horizon={L}")
+    counts = {int(k): int((Y==k).sum()) for k in np.unique(Y)}
+    print(f"counts: {counts}")
 
-    # ── 1. Flatten for t-SNE ─────────────────────────────────
-    # Use last timestep of each segment
-    Z_last   = z_all[:, -1, :]             # (N, d_z)
-    L_last   = labels_hard[:, -1]          # (N,)
+    # Subsample
+    if N > args.n:
+        idx = np.random.choice(N, args.n, replace=False)
+        Zs, Ys = Z[idx], Y[idx]
+    else:
+        Zs, Ys = Z, Y
 
-    # Also use every 10th timestep for temporal view
-    stride   = max(1, T // 10)
-    Z_temp   = z_all[:, ::stride, :].reshape(-1, d_z)
-    L_temp   = labels_hard[:, ::stride].reshape(-1)
+    # t-SNE
+    Z2d  = run_tsne(Zs, args.perp)
+    Zpca = PCA(n_components=2).fit_transform(Zs)
+    var  = PCA(n_components=2).fit(Zs).explained_variance_ratio_
 
-    # Subsample for speed
-    def subsample(Z, L, maxn):
-        if len(Z) <= maxn:
-            return Z, L
-        idx = np.random.choice(len(Z), maxn, replace=False)
-        return Z[idx], L[idx]
+    # Plot
+    fig = plt.figure(figsize=(16, 12))
+    gs  = plt.GridSpec(2, 3, figure=fig, hspace=0.4, wspace=0.35)
 
-    Z_last_s, L_last_s = subsample(Z_last, L_last, args.subsample)
-    Z_temp_s, L_temp_s = subsample(Z_temp, L_temp, args.subsample)
+    # t-SNE
+    scatter_by_skill(Z2d, Ys, K, fig.add_subplot(gs[0,0]),
+                     f't-SNE (n={len(Zs)}, perp={args.perp})')
+    # PCA
+    scatter_by_skill(Zpca, Ys, K, fig.add_subplot(gs[0,1]),
+                     f'PCA (var={var[0]:.2f}+{var[1]:.2f}={sum(var):.2f})')
 
-    # ── 2. t-SNE ─────────────────────────────────────────────
-    print("Computing t-SNE (last timestep)...")
-    Z2d_last = run_tsne(Z_last_s, args.perplexity)
-
-    print("Computing t-SNE (temporal)...")
-    Z2d_temp = run_tsne(Z_temp_s, args.perplexity)
-
-    # ── 3. PCA for fast view ──────────────────────────────────
-    pca = PCA(n_components=2)
-    Z_pca = pca.fit_transform(Z_last_s)
-    var_exp = pca.explained_variance_ratio_
-
-    # ── 4. Label distribution ─────────────────────────────────
-    label_counts = np.bincount(labels_hard.flatten(), minlength=K)
-    label_frac   = label_counts / label_counts.sum()
-
-    # ── 5. Per-episode skill trajectory (first 8 episodes) ───
-    n_ep_show = min(8, N)
-    ep_indices = np.linspace(0, N-1, n_ep_show, dtype=int)
-
-    # ── Plotting ─────────────────────────────────────────────
-    fig = plt.figure(figsize=(18, 14))
-    gs  = plt.GridSpec(3, 3, figure=fig, hspace=0.4, wspace=0.35)
-
-    # Row 0: t-SNE last timestep
-    ax00 = fig.add_subplot(gs[0, 0])
-    plot_tsne_by_skill(Z2d_last, L_last_s, K, ax00,
-                       f't-SNE (last step, n={len(Z_last_s)})')
-
-    # Row 0: t-SNE temporal
-    ax01 = fig.add_subplot(gs[0, 1])
-    plot_tsne_by_skill(Z2d_temp, L_temp_s, K, ax01,
-                       f't-SNE (temporal, stride={stride})')
-
-    # Row 0: PCA
-    ax02 = fig.add_subplot(gs[0, 2])
-    plot_tsne_by_skill(Z_pca, L_last_s, K, ax02,
-                       f'PCA (var={var_exp[0]:.2f}+{var_exp[1]:.2f}={sum(var_exp):.2f})')
-
-    # Row 1: label distribution pie
-    ax10 = fig.add_subplot(gs[1, 0])
-    wedge_labels = [f'Skill {k}\n{label_frac[k]*100:.1f}%'
-                    for k in range(K) if label_frac[k] > 0]
-    wedge_sizes  = [label_frac[k] for k in range(K) if label_frac[k] > 0]
-    wedge_colors = [color_for(k) for k in range(K) if label_frac[k] > 0]
-    ax10.pie(wedge_sizes, labels=wedge_labels, colors=wedge_colors,
-             autopct='%1.1f%%', startangle=90, textprops={'fontsize': 8})
-    ax10.set_title('Skill Label Distribution', fontsize=10)
-
-    # Row 1: per-timestep label fraction across all episodes
-    ax11 = fig.add_subplot(gs[1, 1])
-    frac_over_t = np.zeros((T, K))
+    # Count bar
+    ax = fig.add_subplot(gs[0,2])
     for k in range(K):
-        frac_over_t[:, k] = (labels_hard == k).mean(axis=0)
-    t_ax = np.arange(T)
-    bottom = np.zeros(T)
+        ax.bar(k, counts.get(k,0), color=color_for(k), alpha=0.8)
+    ax.set_xticks(range(K)); ax.set_xlabel('Skill k')
+    ax.set_title(f'Sample count per skill  (total={N})'); ax.grid(alpha=0.3)
+
+    # ||z|| per skill
+    ax = fig.add_subplot(gs[1,0])
+    norms = np.linalg.norm(Z, axis=-1)
     for k in range(K):
-        ax11.fill_between(t_ax, bottom, bottom + frac_over_t[:, k],
-                          color=color_for(k), alpha=0.8,
-                          label=f'Skill {k}')
-        bottom += frac_over_t[:, k]
-    ax11.set_xlabel('Timestep t'); ax11.set_ylabel('Fraction')
-    ax11.set_title('Skill Label Fraction over Time\n(stacked, all episodes)', fontsize=10)
-    ax11.legend(fontsize=7, loc='upper right')
+        m = Y == k
+        if m.sum() > 0:
+            ax.hist(norms[m], bins=30, alpha=0.6,
+                    color=color_for(k), label=f'Sk{k}', density=True)
+    ax.set_xlabel('||z||'); ax.set_title('||z|| distribution by skill')
+    ax.legend(fontsize=7); ax.grid(alpha=0.3)
 
-    # Row 1: z_all mean norm over time
-    ax12 = fig.add_subplot(gs[1, 2])
-    z_norm_t = np.linalg.norm(z_all, axis=-1).mean(axis=0)  # (T,)
-    ax12.plot(t_ax, z_norm_t, lw=2, color='#2196F3')
-    ax12.set_xlabel('Timestep t'); ax12.set_ylabel('||z||')
-    ax12.set_title('Mean ||z_t|| over Time', fontsize=10)
-    ax12.grid(alpha=0.3)
+    # Skill labels over sequence index
+    ax = fig.add_subplot(gs[1,1])
+    show = min(1000, N)
+    ax.scatter(range(show), Y[:show],
+               c=[color_for(int(l)) for l in Y[:show]], s=8, alpha=0.7)
+    ax.set_xlabel('Sequence index'); ax.set_ylabel('Skill')
+    ax.set_yticks(range(K)); ax.grid(alpha=0.3)
+    ax.set_title(f'Skill sequence (first {show})')
 
-    # Row 2: per-episode skill trajectory heatmap
-    ax20 = fig.add_subplot(gs[2, :])
-    ep_labels = labels_hard[ep_indices, :]  # (n_ep_show, T)
-    im = ax20.imshow(ep_labels, aspect='auto', interpolation='nearest',
-                     cmap=plt.cm.get_cmap('tab10', K),
-                     vmin=-0.5, vmax=K-0.5)
-    plt.colorbar(im, ax=ax20, ticks=range(K),
-                 label='Skill index')
-    ax20.set_yticks(range(n_ep_show))
-    ax20.set_yticklabels([f'Ep {ep_indices[i]}' for i in range(n_ep_show)],
-                          fontsize=8)
-    ax20.set_xlabel('Timestep t')
-    ax20.set_title(f'Skill Label Trajectory per Episode (K={K})', fontsize=10)
+    # Pie
+    ax = fig.add_subplot(gs[1,2])
+    vals  = [counts.get(k,0) for k in range(K) if counts.get(k,0)>0]
+    lbls  = [f'Sk{k}\n{counts.get(k,0)/N*100:.1f}%'
+             for k in range(K) if counts.get(k,0)>0]
+    cols  = [color_for(k) for k in range(K) if counts.get(k,0)>0]
+    ax.pie(vals, labels=lbls, colors=cols, startangle=90,
+           textprops={'fontsize':8})
+    ax.set_title('Skill distribution')
 
-    fig.suptitle(
-        f'Skill Pretraining Visualization  |  K={K}  N={N}  T={T}  d_z={d_z}',
-        fontsize=13, fontweight='bold',
-    )
-
-    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(out_path, dpi=150, bbox_inches='tight')
+    fig.suptitle(f'Skill Pretraining  K={K}  N={N}  d_z={d_z}  L={L}',
+                 fontsize=12, fontweight='bold')
+    out = os.path.expanduser(args.out)
+    Path(out).parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out, dpi=150, bbox_inches='tight')
     plt.close()
-    print(f"Saved: {out_path}")
-
-    # ── Summary stats ─────────────────────────────────────────
-    print(f"\nSkill statistics:")
-    for k in range(K):
-        n_k = label_counts[k]
-        print(f"  Skill {k}: {n_k:6d} steps ({label_frac[k]*100:.1f}%)")
+    print(f"Saved: {out}")
 
 
 if __name__ == '__main__':
