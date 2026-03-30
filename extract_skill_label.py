@@ -47,7 +47,9 @@ from collections import Counter
 class ExtractClusterConfig:
     K:             int   = 8       # EXTRACT default
     median_window: int   = 7       # EXTRACT default
-    state_dim:     int   = 60   # diff_dim = state_dim
+    state_dim:          int   = 60
+    use_object_only:    bool  = True   # True: object states(18:60) only
+    # True가 권장: qvel(9:18)은 noise, object states만 skill 구분에 유효
     kmeans_n_init: int   = 20
     kmeans_seed:   int   = 42
     min_seg_len:   int   = 5
@@ -78,20 +80,31 @@ def load_d4rl_flat(env_name: str = 'kitchen-mixed-v0'):
 # Embedding + Difference
 # ─────────────────────────────────────────────────────────────
 
-def compute_state_diff(obs: np.ndarray) -> np.ndarray:
+# Kitchen D4RL observation layout (60-dim)
+# [0:9]   robot qpos    — joint positions
+# [9:18]  robot qvel    — joint velocities  (noisy, skip)
+# [18:60] object states — microwave, kettle, burner, light, cabinet...
+#                         각 subtask마다 독립적으로 변함 → skill 구분 핵심
+KITCHEN_OBJ_SLICE = slice(18, 60)   # 42-dim object states only
+
+
+def compute_state_diff(obs: np.ndarray,
+                       use_object_only: bool = True) -> np.ndarray:
     """
-    Δs_t = s_t - s_{t-1}  (raw state difference, 60-dim).
+    Δs_t = s_t - s_{t-1}.
 
-    EXTRACT: VLM(image_t) → e_t → Δe_t
-    우리:    s_t → Δs_t (직접 사용 — random MLP는 의미없는 noise 생성)
+    use_object_only=True: object states (dim 18~59) 만 사용.
+    qvel(dim 9~17)은 noise가 많아 cluster 구분을 방해.
+    object states는 subtask별로 독립적으로 변하므로 skill 경계가 명확.
 
-    Kitchen state = robot qpos(9) + qvel(9) + object states(42)
-    subtask마다 다른 object state dims가 변하므로 Δs_t가 skill을 구분.
     t=0: Δs_0 = Δs_1 (EXTRACT footnote 방식)
-    Returns (N, 60)
+    Returns (N, 42) if use_object_only else (N, 60)
     """
-    diff = np.diff(obs, axis=0)             # (N-1, 60)
-    diff = np.vstack([diff[0:1], diff])     # (N, 60)
+    if use_object_only:
+        obs = obs[:, KITCHEN_OBJ_SLICE]   # (N, 42)
+
+    diff = np.diff(obs, axis=0)           # (N-1, d)
+    diff = np.vstack([diff[0:1], diff])   # (N, d)
     print(f"State diff Δs_t: {diff.shape}  "
           f"mean_norm={np.linalg.norm(diff, axis=1).mean():.4f}  "
           f"std={diff.std(axis=0).mean():.4f}")
@@ -300,8 +313,9 @@ def run_extract_pipeline(
 
     obs, actions, terminals = load_d4rl_flat(env_name)
 
-    print("Computing Δs_t (raw state differences) ...")
-    diff = compute_state_diff(obs)
+    print(f"Computing Δs_t "
+          f"({'object states only [18:60]' if cfg.use_object_only else 'full 60-dim'}) ...")
+    diff = compute_state_diff(obs, use_object_only=cfg.use_object_only)
 
     km, raw_labels, logprobs = run_kmeans(
         diff, cfg.K, cfg.kmeans_n_init, cfg.kmeans_seed)
@@ -564,7 +578,7 @@ def main():
         visualize_episodes(asgn, term, K_viz, args.viz)
         # PCA: 재계산
         print("Computing Δs_t for PCA viz ...")
-        diff_v = compute_state_diff(obs)
+        diff_v = compute_state_diff(obs, use_object_only=True)
         # centroid: 각 cluster 평균으로 설정 (K-means 재학습 없음)
         from sklearn.cluster import KMeans
         km_v = KMeans.__new__(KMeans)
