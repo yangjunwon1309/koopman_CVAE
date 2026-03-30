@@ -103,7 +103,7 @@ def load_r3m(device: str = 'cuda'):
             "  pip install r3m\n"
             "  or: pip install git+https://github.com/facebookresearch/r3m.git"
         )
-    model = _load("r3m_50")                 # ResNet50 backbone, 2048-dim
+    model = _load("resnet50")               # ResNet50 backbone, 2048-dim
     model.eval()
     model.to(torch.device(device if torch.cuda.is_available() else 'cpu'))
     # R3M expects [0-255] uint8 images, (B, 3, H, W)
