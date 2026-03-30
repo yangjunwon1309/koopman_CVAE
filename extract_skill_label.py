@@ -435,11 +435,21 @@ def visualize_pca_clusters(
            '#8E24AA','#00ACC1','#FFB300','#6D4C41',
            '#546E7A','#D81B60']
 
+    # ── 전처리: StandardScaler + outlier clip ───────────────
+    # diff 대부분이 0 근방 → outlier가 축척 왜곡
+    # 1. StandardScaler: 각 dim을 mean=0, std=1로 정규화
+    # 2. 3σ clip: 극단 outlier 제거
+    from sklearn.preprocessing import StandardScaler
+    scaler = StandardScaler()
+    diff_s = scaler.fit_transform(diff)             # (N, d)
+    diff_s = np.clip(diff_s, -3, 3)                 # 3σ clip
+
     # ── PCA 2D 투영 ──────────────────────────────────────────
     pca = PCA(n_components=2, random_state=42)
-    Z2  = pca.fit_transform(diff)              # (N, 2)
+    Z2  = pca.fit_transform(diff_s)                 # (N, 2)
     var = pca.explained_variance_ratio_
-    C2  = pca.transform(km.cluster_centers_)  # (K, 2) centroids in PCA space
+    # centroid도 동일한 scaler + PCA로 투영
+    C2  = pca.transform(np.clip(scaler.transform(km.cluster_centers_), -3, 3))
 
     # 서브샘플 (시각화 속도)
     if len(Z2) > subsample:
