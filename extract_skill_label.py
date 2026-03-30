@@ -27,7 +27,10 @@ sys.path.insert(0, os.path.expanduser('~/koopman_CVAE'))
 
 import h5py
 import numpy as np
+import torch
+import torchvision.transforms as T
 from pathlib import Path
+from PIL import Image
 from scipy.signal import medfilt
 from sklearn.cluster import KMeans
 from typing import List, Dict, Tuple
@@ -48,8 +51,10 @@ class ExtractClusterConfig:
     K:             int   = 8       # EXTRACT default
     median_window: int   = 7       # EXTRACT default
     state_dim:          int   = 60
-    use_object_only:    bool  = True   # True: object states(18:60) only
-    # True가 권장: qvel(9:18)은 noise, object states만 skill 구분에 유효
+    use_r3m:            bool  = False  # True: R3M image embedding (EXTRACT 원본)
+    use_object_only:    bool  = True   # use_r3m=False 시: object states(18:60)만
+    r3m_device:         str   = 'cuda'
+    img_size:           int   = 128    # 렌더링 해상도
     kmeans_n_init: int   = 20
     kmeans_seed:   int   = 42
     min_seg_len:   int   = 5
@@ -79,6 +84,149 @@ def load_d4rl_flat(env_name: str = 'kitchen-mixed-v0'):
 # ─────────────────────────────────────────────────────────────
 # Embedding + Difference
 # ─────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────
+# R3M Image Embedding  (EXTRACT 원본 방식)
+# ─────────────────────────────────────────────────────────────
+
+def load_r3m(device: str = 'cuda'):
+    """
+    R3M pretrained visual encoder 로드.
+    pip install r3m 필요.
+    Returns: (model, transform)  model: image → 2048-dim embedding
+    """
+    try:
+        from r3m import load_r3m as _load
+    except ImportError:
+        raise ImportError(
+            "R3M not installed.\n"
+            "  pip install r3m\n"
+            "  or: pip install git+https://github.com/facebookresearch/r3m.git"
+        )
+    model = _load("r3m_50")                 # ResNet50 backbone, 2048-dim
+    model.eval()
+    model.to(torch.device(device if torch.cuda.is_available() else 'cpu'))
+    # R3M expects [0-255] uint8 images, (B, 3, H, W)
+    transform = T.Compose([
+        T.Resize(256),
+        T.CenterCrop(224),
+        T.ToTensor(),                       # → [0,1]
+    ])
+    return model, transform
+
+
+def render_and_embed_r3m(
+    env_name:    str = 'kitchen-mixed-v0',
+    model=None,
+    transform=None,
+    device:      str = 'cuda',
+    img_size:    int = 128,
+    batch_size:  int = 256,
+    cache_path:  str = None,   # 캐시 경로: 있으면 로드, 없으면 생성 후 저장
+) -> tuple:
+    """
+    EXTRACT generate_kitchen_data.py 방식:
+    각 obs로 env를 reset → 렌더링 → R3M embedding.
+
+    cache_path 지정 시: 첫 실행에서 embedding을 npz로 저장,
+    이후 실행에서는 바로 로드 (136k 렌더링 수 시간 절약).
+
+    Returns: obs(N,60), actions(N,9), terminals(N,), embeddings(N,2048)
+    """
+    import d4rl, gym
+    dev = torch.device(device if torch.cuda.is_available() else 'cpu')
+
+    print(f"Loading {env_name} ...")
+    env     = gym.make(env_name)
+    dataset = env.get_dataset()
+    obs       = dataset['observations'].copy()
+    actions   = dataset['actions'].copy()
+    terminals = dataset['terminals'].astype(bool)
+    N = len(obs)
+
+    # ── 캐시 확인 ────────────────────────────────────────────
+    if cache_path and Path(cache_path).exists():
+        print(f"Loading cached R3M embeddings: {cache_path}")
+        embeddings = np.load(cache_path)['embeddings']
+        assert len(embeddings) == N,             f"Cache size mismatch: {len(embeddings)} vs {N}"
+        print(f"  Loaded: {embeddings.shape}")
+        return obs, actions, terminals, embeddings
+
+    # ── R3M 모델 로드 ─────────────────────────────────────────
+    if model is None:
+        print("Loading R3M (r3m_50) ...")
+        model, transform = load_r3m(device)
+
+    # ── reset_model_state 메서드 확인 ────────────────────────
+    # 일반 d4rl에는 없을 수 있음 → env.env.set_state() 사용
+    has_reset_model = hasattr(env, 'reset_model_state')
+    has_env_env     = hasattr(env, 'env') and hasattr(env.env, 'set_state')
+    if not has_reset_model and not has_env_env:
+        # 마지막 수단: obs를 qpos/qvel로 분리해서 set_state
+        print("Warning: env.reset_model_state not found, "
+              "using env.env.set_state(qpos, qvel)")
+
+    print(f"Rendering + R3M embedding {N} frames "
+          f"(batch={batch_size}) ...")
+    all_emb     = []
+    frames_batch = []
+
+    for i in range(N):
+        # ── 렌더링을 위한 state 설정 ─────────────────────────
+        if has_reset_model:
+            env.reset_model_state(obs[i])
+        elif has_env_env:
+            # D4RL Kitchen: obs = [qpos(9), qvel(9), obj(42)]
+            qpos = obs[i, :9]
+            qvel = obs[i, 9:18]
+            env.env.set_state(qpos, qvel)
+        else:
+            # fallback: robot qpos만 설정
+            try:
+                env.env.set_state(obs[i, :9], obs[i, 9:18])
+            except Exception:
+                pass
+
+        frame = env.render(mode='rgb_array',
+                           width=img_size, height=img_size)
+
+        img = transform(Image.fromarray(frame.astype(np.uint8)))
+        frames_batch.append(img)
+
+        if len(frames_batch) == batch_size or i == N - 1:
+            imgs = torch.stack(frames_batch).to(dev)
+            with torch.no_grad():
+                emb = model(imgs * 255.0)         # R3M expects [0-255]
+            all_emb.append(emb.cpu().numpy())
+            frames_batch = []
+
+        if (i + 1) % 10000 == 0:
+            print(f"  {i+1}/{N}  ({(i+1)/N*100:.0f}%)", flush=True)
+
+    embeddings = np.vstack(all_emb)               # (N, 2048)
+    print(f"R3M embeddings done: {embeddings.shape}")
+
+    # ── 캐시 저장 ─────────────────────────────────────────────
+    if cache_path:
+        Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(cache_path, embeddings=embeddings)
+        print(f"Saved cache: {cache_path}")
+
+    return obs, actions, terminals, embeddings
+
+
+def compute_r3m_diff(embeddings: np.ndarray) -> np.ndarray:
+    """
+    Δe_t = e_t - e_{t-1}  (EXTRACT 원본 방식).
+    t=0: Δe_0 = Δe_1
+    Returns (N, 2048)
+    """
+    diff = np.diff(embeddings, axis=0)
+    diff = np.vstack([diff[0:1], diff])
+    print(f"R3M diff: {diff.shape}  "
+          f"mean_norm={np.linalg.norm(diff, axis=1).mean():.4f}")
+    return diff
+
 
 # Kitchen D4RL observation layout (60-dim)
 # [0:9]   robot qpos    — joint positions
@@ -313,9 +461,19 @@ def run_extract_pipeline(
 
     obs, actions, terminals = load_d4rl_flat(env_name)
 
-    print(f"Computing Δs_t "
-          f"({'object states only [18:60]' if cfg.use_object_only else 'full 60-dim'}) ...")
-    diff = compute_state_diff(obs, use_object_only=cfg.use_object_only)
+    if cfg.use_r3m:
+        print("Using R3M image embedding (EXTRACT 원본 방식) ...")
+        model, transform = load_r3m(cfg.r3m_device)
+        cache = str(Path(out_h5).parent / 'r3m_embeddings.npz')
+        obs, actions, terminals, embeddings = render_and_embed_r3m(
+            env_name, model, transform,
+            cfg.r3m_device, cfg.img_size,
+            cache_path=cache)
+        diff = compute_r3m_diff(embeddings)
+    else:
+        print(f"Computing Δs_t "
+              f"({'object states [18:60]' if cfg.use_object_only else 'full 60-dim'}) ...")
+        diff = compute_state_diff(obs, use_object_only=cfg.use_object_only)
 
     km, raw_labels, logprobs = run_kmeans(
         diff, cfg.K, cfg.kmeans_n_init, cfg.kmeans_seed)
@@ -559,6 +717,8 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument('--out',      default='checkpoints/skill_pretrain/cluster_data.h5')
     p.add_argument('--K',        type=int, default=8)
+    p.add_argument('--r3m',      action='store_true',
+                   help='Use R3M image embedding (EXTRACT original)')
     p.add_argument('--window',   type=int, default=7)
     p.add_argument('--env',      default='kitchen-mixed-v0')
     p.add_argument('--device',   default='cuda')
@@ -591,7 +751,8 @@ def main():
         return
 
     cfg = ExtractClusterConfig(
-        K=args.K, median_window=args.window, device=args.device)
+        K=args.K, median_window=args.window,
+        use_r3m=args.r3m, device=args.device)
 
     smoothed, logprobs, segs, diff, km = run_extract_pipeline(
         cfg, args.out, args.env)
