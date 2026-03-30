@@ -27,8 +27,6 @@ sys.path.insert(0, os.path.expanduser('~/koopman_CVAE'))
 
 import h5py
 import numpy as np
-import torch
-import torch.nn as nn
 from pathlib import Path
 from scipy.signal import medfilt
 from sklearn.cluster import KMeans
@@ -41,23 +39,6 @@ from collections import Counter
 # State Embedding  (VLM 대체)
 # ─────────────────────────────────────────────────────────────
 
-class StateEmbedder(nn.Module):
-    """
-    60-dim state → embed_dim. EXTRACT의 VLM embedding에 대응.
-    Pre-trained weights 불필요: random init MLP도 충분히
-    state space를 embed_dim으로 projection.
-    """
-    def __init__(self, state_dim: int = 60, embed_dim: int = 64):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(state_dim, 256), nn.ReLU(),
-            nn.Linear(256, embed_dim),
-        )
-
-    def forward(self, s: torch.Tensor) -> torch.Tensor:
-        return self.net(s)
-
-
 # ─────────────────────────────────────────────────────────────
 # Config
 # ─────────────────────────────────────────────────────────────
@@ -66,8 +47,7 @@ class StateEmbedder(nn.Module):
 class ExtractClusterConfig:
     K:             int   = 8       # EXTRACT default
     median_window: int   = 7       # EXTRACT default
-    embed_dim:     int   = 64
-    state_dim:     int   = 60
+    state_dim:     int   = 60   # diff_dim = state_dim
     kmeans_n_init: int   = 20
     kmeans_seed:   int   = 42
     min_seg_len:   int   = 5
@@ -98,35 +78,23 @@ def load_d4rl_flat(env_name: str = 'kitchen-mixed-v0'):
 # Embedding + Difference
 # ─────────────────────────────────────────────────────────────
 
-def compute_state_embeddings(
-    obs:       np.ndarray,
-    embedder:  StateEmbedder,
-    device:    str = 'cuda',
-    batch:     int = 4096,
-) -> np.ndarray:
-    """per-timestep state → embedding. Returns (N, embed_dim)"""
-    embedder.eval()
-    dev = torch.device(device if torch.cuda.is_available() else 'cpu')
-    embedder.to(dev)
-    out = []
-    with torch.no_grad():
-        for i in range(0, len(obs), batch):
-            x = torch.FloatTensor(obs[i:i+batch]).to(dev)
-            out.append(embedder(x).cpu().numpy())
-    E = np.vstack(out)
-    print(f"Embeddings: {E.shape}  "
-          f"mean_norm={np.linalg.norm(E, axis=1).mean():.4f}")
-    return E
-
-
-def compute_embedding_differences(E: np.ndarray) -> np.ndarray:
+def compute_state_diff(obs: np.ndarray) -> np.ndarray:
     """
-    EXTRACT: Δe_t = e_t - e_{t-1}
-    t=0: Δe_0 = Δe_1  (논문 footnote: e_1 ← e_2)
-    Returns (N, embed_dim)
+    Δs_t = s_t - s_{t-1}  (raw state difference, 60-dim).
+
+    EXTRACT: VLM(image_t) → e_t → Δe_t
+    우리:    s_t → Δs_t (직접 사용 — random MLP는 의미없는 noise 생성)
+
+    Kitchen state = robot qpos(9) + qvel(9) + object states(42)
+    subtask마다 다른 object state dims가 변하므로 Δs_t가 skill을 구분.
+    t=0: Δs_0 = Δs_1 (EXTRACT footnote 방식)
+    Returns (N, 60)
     """
-    diff = np.diff(E, axis=0)             # (N-1, d)
-    diff = np.vstack([diff[0:1], diff])   # (N, d)
+    diff = np.diff(obs, axis=0)             # (N-1, 60)
+    diff = np.vstack([diff[0:1], diff])     # (N, 60)
+    print(f"State diff Δs_t: {diff.shape}  "
+          f"mean_norm={np.linalg.norm(diff, axis=1).mean():.4f}  "
+          f"std={diff.std(axis=0).mean():.4f}")
     return diff
 
 
@@ -332,12 +300,8 @@ def run_extract_pipeline(
 
     obs, actions, terminals = load_d4rl_flat(env_name)
 
-    print("Computing state embeddings ...")
-    embedder = StateEmbedder(cfg.state_dim, cfg.embed_dim)
-    E = compute_state_embeddings(obs, embedder, cfg.device)
-
-    print("Computing Δe_t ...")
-    diff = compute_embedding_differences(E)
+    print("Computing Δs_t (raw state differences) ...")
+    diff = compute_state_diff(obs)
 
     km, raw_labels, logprobs = run_kmeans(
         diff, cfg.K, cfg.kmeans_n_init, cfg.kmeans_seed)
@@ -410,7 +374,7 @@ def visualize_episodes(
 
 
 def visualize_pca_clusters(
-    diff:        np.ndarray,    # (N, embed_dim) — embedding differences
+    diff:        np.ndarray,    # (N, 60) — state differences Δs_t
     assignments: np.ndarray,    # (N,) cluster labels
     km:          KMeans,        # fitted KMeans (for centroids)
     K:           int,
@@ -563,7 +527,6 @@ def main():
     p.add_argument('--out',      default='checkpoints/skill_pretrain/cluster_data.h5')
     p.add_argument('--K',        type=int, default=8)
     p.add_argument('--window',   type=int, default=7)
-    p.add_argument('--embed',    type=int, default=64)
     p.add_argument('--env',      default='kitchen-mixed-v0')
     p.add_argument('--device',   default='cuda')
     p.add_argument('--visualize', action='store_true')
@@ -581,29 +544,21 @@ def main():
         # Episode timeline
         visualize_episodes(asgn, term, K_viz, args.viz)
         # PCA: 재계산
-        print("Recomputing embeddings for PCA viz ...")
-        cfg_v   = ExtractClusterConfig(K=K_viz, embed_dim=args.embed,
-                                        device=args.device)
-        emb     = compute_state_embeddings(
-            obs, StateEmbedder(cfg_v.state_dim, cfg_v.embed_dim),
-            cfg_v.device)
-        diff_v  = compute_embedding_differences(emb)
-        # K-means predict (재학습 없이 assign)
+        print("Computing Δs_t for PCA viz ...")
+        diff_v = compute_state_diff(obs)
+        # centroid: 각 cluster 평균으로 설정 (K-means 재학습 없음)
         from sklearn.cluster import KMeans
-        km_v = KMeans(n_clusters=K_viz, init='k-means++',
-                      n_init=1, random_state=42, max_iter=10)
-        km_v.fit(diff_v[:10000])  # 빠른 초기화
-        # centroid는 각 cluster의 평균으로 설정
-        centers = np.array([diff_v[asgn==k].mean(axis=0)
-                             for k in range(K_viz)])
-        km_v.cluster_centers_ = centers
+        km_v = KMeans.__new__(KMeans)
+        km_v.cluster_centers_ = np.array(
+            [diff_v[asgn==k].mean(axis=0) if (asgn==k).sum() > 0
+             else np.zeros(diff_v.shape[1])
+             for k in range(K_viz)])
         pca_path = args.viz.replace('.png', '_pca.png')
         visualize_pca_clusters(diff_v, asgn, km_v, K_viz, pca_path)
         return
 
     cfg = ExtractClusterConfig(
-        K=args.K, median_window=args.window,
-        embed_dim=args.embed, device=args.device)
+        K=args.K, median_window=args.window, device=args.device)
 
     smoothed, logprobs, segs, diff, km = run_extract_pipeline(
         cfg, args.out, args.env)
