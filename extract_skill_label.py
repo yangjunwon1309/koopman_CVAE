@@ -399,21 +399,31 @@ def visualize_pca_clusters(
            '#8E24AA','#00ACC1','#FFB300','#6D4C41',
            '#546E7A','#D81B60']
 
-    # ── 전처리: StandardScaler + outlier clip ───────────────
-    # diff 대부분이 0 근방 → outlier가 축척 왜곡
-    # 1. StandardScaler: 각 dim을 mean=0, std=1로 정규화
-    # 2. 3σ clip: 극단 outlier 제거
+    # ── 전처리: percentile clip + StandardScaler ────────────
+    # Δs_t는 대부분 0 근방 (steady state) + 소수 큰 값 (skill boundary)
+    # → heavy-tail 분포: StandardScaler + 3σ clip 으로도 뭉침
+    #
+    # Fix: percentile 1~99 범위로 먼저 clip → StandardScaler
+    #      PCA 후에도 시각화 범위를 percentile로 추가 제한
     from sklearn.preprocessing import StandardScaler
+
+    # Step 1: per-dim percentile clip (1~99th)
+    lo  = np.percentile(diff, 1,  axis=0)
+    hi  = np.percentile(diff, 99, axis=0)
+    diff_c = np.clip(diff, lo, hi)
+
+    # Step 2: StandardScaler
     scaler = StandardScaler()
-    diff_s = scaler.fit_transform(diff)             # (N, d)
-    diff_s = np.clip(diff_s, -3, 3)                 # 3σ clip
+    diff_s = scaler.fit_transform(diff_c)           # (N, d)
 
     # ── PCA 2D 투영 ──────────────────────────────────────────
     pca = PCA(n_components=2, random_state=42)
     Z2  = pca.fit_transform(diff_s)                 # (N, 2)
     var = pca.explained_variance_ratio_
-    # centroid도 동일한 scaler + PCA로 투영
-    C2  = pca.transform(np.clip(scaler.transform(km.cluster_centers_), -3, 3))
+
+    # centroid도 동일한 전처리 + PCA
+    cent_c = np.clip(km.cluster_centers_, lo, hi)
+    C2     = pca.transform(scaler.transform(cent_c))
 
     # 서브샘플 (시각화 속도)
     if len(Z2) > subsample:
@@ -503,6 +513,15 @@ def visualize_pca_clusters(
                for k in range(K) if (assignments == k).sum() > 0]
     ax.legend(handles=handles, fontsize=8, loc='lower right',
               framealpha=0.8, ncol=2)
+
+    # ── 시각화 범위: PCA 후에도 percentile 5~95로 제한 ─────────
+    # 극소수 outlier가 전체를 작게 보이게 만드는 것을 방지
+    x_lo, x_hi = np.percentile(Z2[:,0], [2, 98])
+    y_lo, y_hi = np.percentile(Z2[:,1], [2, 98])
+    margin = 0.1
+    xr = x_hi - x_lo; yr = y_hi - y_lo
+    ax.set_xlim(x_lo - xr*margin, x_hi + xr*margin)
+    ax.set_ylim(y_lo - yr*margin, y_hi + yr*margin)
 
     ax.spines[['top','right']].set_visible(False)
     plt.tight_layout()
