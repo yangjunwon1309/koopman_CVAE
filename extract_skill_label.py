@@ -195,13 +195,16 @@ def render_and_embed_r3m(
         _set_env_state(obs[i])
 
         frame = env.render(mode='rgb_array')
-        if frame is None:
+        # 일부 gym 버전에서 list 반환 → ndarray 변환
+        if isinstance(frame, list):
+            frame = np.array(frame, dtype=np.uint8)
+        if frame is None or (hasattr(frame, 'size') and frame.size == 0):
             frame = last_frame if last_frame is not None \
                     else np.zeros((480, 480, 3), dtype=np.uint8)
         else:
             last_frame = frame
 
-        img = transform(Image.fromarray(frame.astype(np.uint8)))
+        img = transform(Image.fromarray(np.asarray(frame, dtype=np.uint8)))
         frames_batch.append(img)
 
         if len(frames_batch) == batch_size or i == N - 1:
