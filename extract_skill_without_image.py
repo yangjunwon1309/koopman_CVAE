@@ -116,6 +116,7 @@ def load_minari_flat(hdf5_path: str):
     """
     Minari의 계층형(에피소드별) 구조를 
     기존 D4RL의 Flat(1차원 연속) 구조로 변환하여 로드합니다.
+    (Dict Observation Space 호환 패치 적용)
     """
     obs_list, act_list, term_list = [], [], []
     
@@ -126,10 +127,24 @@ def load_minari_flat(hdf5_path: str):
         
         for ep_key in ep_keys:
             ep = f[ep_key]
-            # Minari는 마지막 observation이 1개 더 많을 수 있으므로 행동 길이에 맞춤
             act_len = ep['actions'].shape[0]
             
-            obs_list.append(ep['observations'][:act_len])
+            # --- 수정된 부분: observations가 Group인지 검사 ---
+            obs_data = ep['observations']
+            if isinstance(obs_data, h5py.Group):
+                # Minari의 Dict Observation (Gymnasium-Robotics 규격)
+                # 주로 'observation', 'achieved_goal', 'desired_goal'로 구성됨
+                if 'observation' in obs_data:
+                    # 기본 상태값(State) 배열 추출
+                    obs_array = obs_data['observation'][()]
+                else:
+                    # 'observation' 키가 명시적으로 없다면 내부 배열을 모두 병합 (Flatten)
+                    obs_array = np.hstack([obs_data[k][()] for k in obs_data.keys()])
+            else:
+                obs_array = obs_data[()]
+            # ---------------------------------------------------
+            
+            obs_list.append(obs_array[:act_len])
             act_list.append(ep['actions'][()])
             term_list.append(ep['terminations'][()])
             
