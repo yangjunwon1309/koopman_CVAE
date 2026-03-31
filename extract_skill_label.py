@@ -157,35 +157,49 @@ def render_and_embed_r3m(
         print("Loading R3M (r3m_50) ...")
         model, transform = load_r3m(device)
 
-    # ── reset_model_state 메서드 확인 ────────────────────────
-    # 일반 d4rl에는 없을 수 있음 → env.env.set_state() 사용
-    has_reset_model = hasattr(env, 'reset_model_state')
-    has_env_env     = hasattr(env, 'env') and hasattr(env.env, 'set_state')
-    if not has_reset_model and not has_env_env:
-        # 마지막 수단: obs를 qpos/qvel로 분리해서 set_state
-        print("Warning: env.reset_model_state not found, "
-              "using env.env.set_state(qpos, qvel)")
+    # ── wrapper를 벗겨서 set_state/reset_model_state를 가진 env 탐색 ──
+    def _find_base_env(e):
+        """gym.make() 반환값에서 실제 MuJoCo env 탐색."""
+        visited = []
+        while e is not None:
+            if hasattr(e, 'reset_model_state'):
+                return e, 'reset_model_state'
+            if hasattr(e, 'set_state'):
+                return e, 'set_state'
+            visited.append(type(e).__name__)
+            e = getattr(e, 'env', None)
+        return None, None
+
+    base_env, state_fn = _find_base_env(env)
+    print(f"base_env={type(base_env).__name__}  method={state_fn}")
+
+    # obs(60) 구조: robot_qpos(9)+robot_qvel(9)+obj_qpos(21)+obj_qvel(21)
+    # MuJoCo set_state(qpos(30), qvel(30)): robot+obj 합쳐서 전달
+    def _set_env_state(ob):
+        robot_qpos = ob[0:9]
+        robot_qvel = ob[9:18]
+        obj_qpos   = ob[18:39]
+        obj_qvel   = ob[39:60]
+        qpos = np.concatenate([robot_qpos, obj_qpos])  # (30,)
+        qvel = np.concatenate([robot_qvel, obj_qvel])  # (30,)
+        if state_fn == 'reset_model_state':
+            base_env.reset_model_state(ob)
+        elif state_fn == 'set_state':
+            base_env.set_state(qpos, qvel)
+        else:
+            # 최후 수단: sim.data 직접 설정
+            uw = env.unwrapped
+            uw.sim.data.qpos[:len(qpos)] = qpos
+            uw.sim.data.qvel[:len(qvel)] = qvel
+            uw.sim.forward()
 
     print(f"Rendering + R3M embedding {N} frames "
           f"(batch={batch_size}) ...")
-    all_emb     = []
+    all_emb      = []
     frames_batch = []
 
     for i in range(N):
-        # ── 렌더링을 위한 state 설정 ─────────────────────────
-        if has_reset_model:
-            env.reset_model_state(obs[i])
-        elif has_env_env:
-            # D4RL Kitchen: obs = [qpos(9), qvel(9), obj(42)]
-            qpos = obs[i, :9]
-            qvel = obs[i, 9:18]
-            env.env.set_state(qpos, qvel)
-        else:
-            # fallback: robot qpos만 설정
-            try:
-                env.env.set_state(obs[i, :9], obs[i, 9:18])
-            except Exception:
-                pass
+        _set_env_state(obs[i])
 
         frame = env.render(mode='rgb_array',
                            width=img_size, height=img_size)
