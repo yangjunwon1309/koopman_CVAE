@@ -182,16 +182,25 @@ def render_and_embed_r3m(
         sim.data.qvel[:] = qvel
         sim.forward()
 
+    # 렌더러 초기화: reset() 없이 render()하면 None 반환하는 경우 있음
+    env.reset()
+
     print(f"Rendering + R3M embedding {N} frames "
           f"(batch={batch_size}) ...")
     all_emb      = []
     frames_batch = []
+    last_frame   = None
 
     for i in range(N):
         _set_env_state(obs[i])
 
-        frame = env.render(mode='rgb_array')  # (H, W, 3) uint8
-        # width/height 인자 미지원 → PIL로 리사이즈
+        frame = env.render(mode='rgb_array')
+        if frame is None:
+            frame = last_frame if last_frame is not None \
+                    else np.zeros((480, 480, 3), dtype=np.uint8)
+        else:
+            last_frame = frame
+
         img = transform(Image.fromarray(frame.astype(np.uint8)))
         frames_batch.append(img)
 
