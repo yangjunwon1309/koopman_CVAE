@@ -190,9 +190,8 @@ def render_and_embed_r3m(
     for i in range(N):
         _set_env_state(obs[i])
 
-        frame = env.render(mode='rgb_array',
-                           width=img_size, height=img_size)
-
+        frame = env.render(mode='rgb_array')  # (H, W, 3) uint8
+        # width/height 인자 미지원 → PIL로 리사이즈
         img = transform(Image.fromarray(frame.astype(np.uint8)))
         frames_batch.append(img)
 
