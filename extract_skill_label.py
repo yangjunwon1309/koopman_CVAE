@@ -157,41 +157,30 @@ def render_and_embed_r3m(
         print("Loading R3M (r3m_50) ...")
         model, transform = load_r3m(device)
 
-    # ── wrapper를 벗겨서 set_state/reset_model_state를 가진 env 탐색 ──
-    def _find_base_env(e):
-        """gym.make() 반환값에서 실제 MuJoCo env 탐색."""
-        visited = []
-        while e is not None:
-            if hasattr(e, 'reset_model_state'):
-                return e, 'reset_model_state'
-            if hasattr(e, 'set_state'):
-                return e, 'set_state'
-            visited.append(type(e).__name__)
-            e = getattr(e, 'env', None)
-        return None, None
+    # ── env.unwrapped.sim 직접 접근 ─────────────────────────────
+    # set_state()는 nq/nv assert가 있어서 obs layout 불일치 시 실패
+    # sim.data.qpos/qvel에 직접 쓰는 것이 가장 안전
+    uw  = env.unwrapped
+    sim = uw.sim
+    nq  = sim.model.nq   # 30
+    nv  = sim.model.nv   # 29
 
-    base_env, state_fn = _find_base_env(env)
-    print(f"base_env={type(base_env).__name__}  method={state_fn}")
+    # obs(60) = robot_qpos(9) + robot_qvel(9) + obj_qpos(21) + obj_qvel(21)
+    # MuJoCo qpos(nq=30) = robot_qpos(9) + obj_qpos(21)
+    # MuJoCo qvel(nv=29) = robot_qvel(9) + obj_qvel(20)  ← obs의 obj_qvel 21-dim 중 앞 20만
+    print(f"MuJoCo nq={nq}  nv={nv}  obs_dim=60")
 
-    # obs(60) 구조: robot_qpos(9)+robot_qvel(9)+obj_qpos(21)+obj_qvel(21)
-    # MuJoCo set_state(qpos(30), qvel(30)): robot+obj 합쳐서 전달
     def _set_env_state(ob):
         robot_qpos = ob[0:9]
         robot_qvel = ob[9:18]
-        obj_qpos   = ob[18:39]
-        obj_qvel   = ob[39:60]
-        qpos = np.concatenate([robot_qpos, obj_qpos])  # (30,)
-        qvel = np.concatenate([robot_qvel, obj_qvel])  # (30,)
-        if state_fn == 'reset_model_state':
-            base_env.reset_model_state(ob)
-        elif state_fn == 'set_state':
-            base_env.set_state(qpos, qvel)
-        else:
-            # 최후 수단: sim.data 직접 설정
-            uw = env.unwrapped
-            uw.sim.data.qpos[:len(qpos)] = qpos
-            uw.sim.data.qvel[:len(qvel)] = qvel
-            uw.sim.forward()
+        obj_qpos   = ob[18:39]             # 21-dim
+        obj_qvel   = ob[39:39+(nv-9)]      # nv-9 dim (nv=29 → 20)
+        qpos = np.concatenate([robot_qpos, obj_qpos])   # (30,)
+        qvel = np.concatenate([robot_qvel, obj_qvel])   # (29,)
+        # sim.data 직접 설정 → assert 없음
+        sim.data.qpos[:] = qpos
+        sim.data.qvel[:] = qvel
+        sim.forward()
 
     print(f"Rendering + R3M embedding {N} frames "
           f"(batch={batch_size}) ...")
