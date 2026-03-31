@@ -728,62 +728,71 @@ def visualize(assignments, terminals, K, out_path, n_ep=8):
 
 def main():
     import argparse
+    from pathlib import Path
+    
     p = argparse.ArgumentParser()
-    p.add_argument('--out',      default='checkpoints/skill_pretrain/cluster_data.h5')
-    p.add_argument('--K',        type=int, default=8)
-    p.add_argument('--r3m',      action='store_true',
-                   help='Use R3M image embedding (EXTRACT original)')
-    p.add_argument('--window',   type=int, default=7)
-    p.add_argument('--env',      default='kitchen-mixed-v0')
-    p.add_argument('--device',   default='cuda')
-    p.add_argument('--visualize', action='store_true')
-    p.add_argument('--viz',      default='checkpoints/skill_pretrain/cluster_viz.png')
+    p.add_argument('--env', default='kitchen-mixed-v0', 
+                   help='MuJoCo 환경 이름 (원래 EXTRACT 호환용)')
+    p.add_argument('--out', default='checkpoints/skill_pretrain/cluster_data.h5',
+                   help='저장할 h5 파일 경로')
+    p.add_argument('--K', type=int, default=8,
+                   help='K-means 클러스터 개수')
+    p.add_argument('--data_path', type=str, 
+                   default='/home/yangjunwon1309/.minari/datasets/D4RL/kitchen/mixed-v2/data/main_data.hdf5',
+                   help='Minari HDF5 데이터셋 절대 경로')
     args = p.parse_args()
 
-    if args.visualize:
-        import d4rl, gym
-        env     = gym.make(args.env)
-        dataset = env.get_dataset()
-        term    = dataset['terminals'].astype(bool)
-        obs     = dataset['observations']
-        asgn, _ = load_cluster_data(args.out)
-        K_viz   = int(asgn.max()) + 1
-        # Episode timeline
-        visualize_episodes(asgn, term, K_viz, args.viz)
-        # PCA: 재계산
-        print("Computing Δs_t for PCA viz ...")
-        diff_v = compute_state_diff(obs, use_object_only=True)
-        # centroid: 각 cluster 평균으로 설정 (K-means 재학습 없음)
-        from sklearn.cluster import KMeans
-        km_v = KMeans.__new__(KMeans)
-        km_v.cluster_centers_ = np.array(
-            [diff_v[asgn==k].mean(axis=0) if (asgn==k).sum() > 0
-             else np.zeros(diff_v.shape[1])
-             for k in range(K_viz)])
-        pca_path = args.viz.replace('.png', '_pca.png')
-        visualize_pca_clusters(diff_v, asgn, km_v, K_viz, pca_path)
-        return
+    # 1. 설정 초기화
+    cfg = ExtractClusterConfig(K=args.K)
 
-    cfg = ExtractClusterConfig(
-        K=args.K, median_window=args.window,
-        use_r3m=args.r3m, device=args.device)
+    # 2. Minari HDF5에서 데이터 직접 로드
+    print(f"Loading Minari dataset from {args.data_path} ...")
+    obs, actions, terminals = load_minari_flat(args.data_path)
+    print(f"Dataset Loaded -> obs: {obs.shape}, actions: {actions.shape}, terminals: {terminals.sum()} ends")
 
-    smoothed, logprobs, segs, diff, km = run_extract_pipeline(
-        cfg, args.out, args.env)
+    # 3. Feature Engineering (HELIOS 최적화: Δs + Δa)
+    # diff 대신 features라는 이름으로 스케일링된 데이터를 받습니다.
+    features = compute_helios_features(obs, actions, cfg)
 
+    # 4. Clustering (K-means)
+    km, labels, logprobs = run_kmeans(features, cfg.K, cfg.kmeans_n_init, cfg.kmeans_seed)
+
+    # 5. Smoothing (Median Filter)
+    smoothed_labels = apply_median_filter(labels, terminals, cfg.median_window)
+
+    # 6. Save (HDF5)
+    save_for_helios(args.out, smoothed_labels, logprobs)
+
+    # ---------------------------------------------------------
+    # 7. Visualization (PNG 이미지 생성)
+    # ---------------------------------------------------------
+    print("\nGenerating visualizations...")
+    viz_ep_path = args.out.replace('.h5', '_timeline.png')
+    viz_pca_path = args.out.replace('.h5', '_pca.png')
+    
     try:
-        import d4rl, gym
-        term = gym.make(args.env).get_dataset()['terminals'].astype(bool)
-        # 1. Per-episode skill timeline
-        visualize_episodes(smoothed, term, cfg.K, args.viz)
-        # 2. PCA cluster distribution
-        pca_path = args.viz.replace('.png', '_pca.png')
-        visualize_pca_clusters(diff, smoothed, km, cfg.K, pca_path)
+        # 에피소드별 타임라인 시각화
+        visualize_episodes(
+            assignments=smoothed_labels, 
+            terminals=terminals, 
+            K=cfg.K, 
+            out_path=viz_ep_path, 
+            n_ep=8  # 확인할 에피소드 수
+        )
+        
+        # PCA 기반 클러스터 분포 시각화
+        # diff 인자에는 K-means 학습에 사용한 features를 넘겨줍니다.
+        visualize_pca_clusters(
+            diff=features, 
+            assignments=smoothed_labels, 
+            km=km, 
+            K=cfg.K, 
+            out_path=viz_pca_path
+        )
+        print("\nAll tasks completed successfully!")
+        
     except Exception as ex:
-        print(f"Viz failed: {ex}")
-
-    print(f"\nDone. cluster_data.h5 → {args.out}")
-
+        print(f"Visualization failed: {ex}")
 
 if __name__ == '__main__':
     main()
