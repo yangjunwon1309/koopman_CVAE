@@ -120,19 +120,26 @@ def render_and_embed_r3m(
     model=None,
     transform=None,
     device:      str = 'cuda',
-    img_size:    int = 128,
+    img_size:    int = 64,
     batch_size:  int = 256,
-    cache_path:  str = None,   # 캐시 경로: 있으면 로드, 없으면 생성 후 저장
+    cache_path:  str = None,
 ) -> tuple:
     """
-    EXTRACT generate_kitchen_data.py 방식:
-    각 obs로 env를 reset → 렌더링 → R3M embedding.
+    EXTRACT generate_kitchen_data.py 방식 재현:
+    D4RL 에피소드별 env.reset() → action replay → 매 step sim.render().
 
-    cache_path 지정 시: 첫 실행에서 embedding을 npz로 저장,
-    이후 실행에서는 바로 로드 (136k 렌더링 수 시간 절약).
+    - action replay: 렌더러 연속성 보장 (state 직접 설정보다 안정적)
+    - sim.render(width, height): mujoco-py offscreen API
+    - MUJOCO_GL=egl: headless 서버에서 필수
+    - cache_path: 첫 실행에서 npz 저장, 이후 즉시 로드
 
     Returns: obs(N,60), actions(N,9), terminals(N,), embeddings(N,2048)
     """
+    import os
+    if 'MUJOCO_GL' not in os.environ:
+        os.environ['MUJOCO_GL'] = 'egl'
+        print("Set MUJOCO_GL=egl for offscreen rendering")
+
     import d4rl, gym
     dev = torch.device(device if torch.cuda.is_available() else 'cpu')
 
@@ -144,89 +151,73 @@ def render_and_embed_r3m(
     terminals = dataset['terminals'].astype(bool)
     N = len(obs)
 
-    # ── 캐시 확인 ────────────────────────────────────────────
+    # ── 캐시 확인 ─────────────────────────────────────────────
     if cache_path and Path(cache_path).exists():
         print(f"Loading cached R3M embeddings: {cache_path}")
         embeddings = np.load(cache_path)['embeddings']
-        assert len(embeddings) == N,             f"Cache size mismatch: {len(embeddings)} vs {N}"
+        assert len(embeddings) == N, f"Cache mismatch: {len(embeddings)} vs {N}"
         print(f"  Loaded: {embeddings.shape}")
         return obs, actions, terminals, embeddings
 
     # ── R3M 모델 로드 ─────────────────────────────────────────
     if model is None:
-        print("Loading R3M (r3m_50) ...")
+        print("Loading R3M (resnet50) ...")
         model, transform = load_r3m(device)
 
-    # ── env.unwrapped.sim 직접 접근 ─────────────────────────────
-    # set_state()는 nq/nv assert가 있어서 obs layout 불일치 시 실패
-    # sim.data.qpos/qvel에 직접 쓰는 것이 가장 안전
-    uw  = env.unwrapped
-    sim = uw.sim
-    nq  = sim.model.nq   # 30
-    nv  = sim.model.nv   # 29
+    sim = env.unwrapped.sim
 
-    # obs(60) = robot_qpos(9) + robot_qvel(9) + obj_qpos(21) + obj_qvel(21)
-    # MuJoCo qpos(nq=30) = robot_qpos(9) + obj_qpos(21)
-    # MuJoCo qvel(nv=29) = robot_qvel(9) + obj_qvel(20)  ← obs의 obj_qvel 21-dim 중 앞 20만
-    print(f"MuJoCo nq={nq}  nv={nv}  obs_dim=60")
+    # ── 에피소드 경계 ─────────────────────────────────────────
+    ep_ends   = list(np.where(terminals)[0])
+    ep_starts = [0] + [e + 1 for e in ep_ends[:-1]]
+    print(f"Episodes: {len(ep_starts)}  Steps: {N}")
+    print(f"Action replay + sim.render (img={img_size}, batch={batch_size}) ...")
 
-    def _set_env_state(ob):
-        robot_qpos = ob[0:9]
-        robot_qvel = ob[9:18]
-        obj_qpos   = ob[18:39]             # 21-dim
-        obj_qvel   = ob[39:39+(nv-9)]      # nv-9 dim (nv=29 → 20)
-        qpos = np.concatenate([robot_qpos, obj_qpos])   # (30,)
-        qvel = np.concatenate([robot_qvel, obj_qvel])   # (29,)
-        # sim.data 직접 설정 → assert 없음
-        sim.data.qpos[:] = qpos
-        sim.data.qvel[:] = qvel
-        sim.forward()
-
-    # 렌더러 초기화: reset() 없이 render()하면 None 반환하는 경우 있음
-    env.reset()
-
-    print(f"Rendering + R3M embedding {N} frames "
-          f"(batch={batch_size}) ...")
-    all_emb      = []
+    embeddings   = np.zeros((N, 2048), dtype=np.float32)
     frames_batch = []
-    last_frame   = None
+    idx_batch    = []
 
-    for i in range(N):
-        _set_env_state(obs[i])
+    def flush():
+        if not frames_batch:
+            return
+        imgs = torch.stack(frames_batch).to(dev)
+        with torch.no_grad():
+            emb = model(imgs * 255.0)
+        for i, e in zip(idx_batch, emb.cpu().numpy()):
+            embeddings[i] = e
+        frames_batch.clear()
+        idx_batch.clear()
 
-        frame = env.render(mode='rgb_array')
-        # 일부 gym 버전에서 list 반환 → ndarray 변환
-        if isinstance(frame, list):
-            frame = np.array(frame, dtype=np.uint8)
-        if frame is None or (hasattr(frame, 'size') and frame.size == 0):
-            frame = last_frame if last_frame is not None \
-                    else np.zeros((480, 480, 3), dtype=np.uint8)
-        else:
-            last_frame = frame
+    # ── Action replay ─────────────────────────────────────────
+    for ep_i, (ep_s, ep_e) in enumerate(zip(ep_starts, ep_ends)):
+        env.reset()
+        for t in range(ep_s, ep_e + 1):
+            # render at current state → (H, W, 3) upside-down
+            frame = sim.render(width=img_size, height=img_size, depth=False)
+            frame = frame[::-1].copy()   # flip vertically
 
-        img = transform(Image.fromarray(np.asarray(frame, dtype=np.uint8)))
-        frames_batch.append(img)
+            frames_batch.append(transform(Image.fromarray(frame)))
+            idx_batch.append(t)
+            if len(frames_batch) >= batch_size:
+                flush()
 
-        if len(frames_batch) == batch_size or i == N - 1:
-            imgs = torch.stack(frames_batch).to(dev)
-            with torch.no_grad():
-                emb = model(imgs * 255.0)         # R3M expects [0-255]
-            all_emb.append(emb.cpu().numpy())
-            frames_batch = []
+            if t < ep_e:
+                env.step(actions[t])
 
-        if (i + 1) % 10000 == 0:
-            print(f"  {i+1}/{N}  ({(i+1)/N*100:.0f}%)", flush=True)
+        if (ep_i + 1) % 50 == 0:
+            print(f"  ep {ep_i+1}/{len(ep_starts)}  "
+                  f"t={ep_e+1}/{N} ({(ep_e+1)/N*100:.0f}%)", flush=True)
 
-    embeddings = np.vstack(all_emb)               # (N, 2048)
-    print(f"R3M embeddings done: {embeddings.shape}")
+    flush()
+    print(f"R3M done: {embeddings.shape}  "
+          f"mean_norm={np.linalg.norm(embeddings, axis=1).mean():.2f}")
 
-    # ── 캐시 저장 ─────────────────────────────────────────────
     if cache_path:
         Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(cache_path, embeddings=embeddings)
         print(f"Saved cache: {cache_path}")
 
     return obs, actions, terminals, embeddings
+
 
 
 def compute_r3m_diff(embeddings: np.ndarray) -> np.ndarray:
@@ -728,71 +719,62 @@ def visualize(assignments, terminals, K, out_path, n_ep=8):
 
 def main():
     import argparse
-    from pathlib import Path
-    
     p = argparse.ArgumentParser()
-    p.add_argument('--env', default='kitchen-mixed-v0', 
-                   help='MuJoCo 환경 이름 (원래 EXTRACT 호환용)')
-    p.add_argument('--out', default='checkpoints/skill_pretrain/cluster_data.h5',
-                   help='저장할 h5 파일 경로')
-    p.add_argument('--K', type=int, default=8,
-                   help='K-means 클러스터 개수')
-    p.add_argument('--data_path', type=str, 
-                   default='/home/yangjunwon1309/.minari/datasets/D4RL/kitchen/mixed-v2/data/main_data.hdf5',
-                   help='Minari HDF5 데이터셋 절대 경로')
+    p.add_argument('--out',      default='checkpoints/skill_pretrain/cluster_data.h5')
+    p.add_argument('--K',        type=int, default=8)
+    p.add_argument('--r3m',      action='store_true',
+                   help='Use R3M image embedding (EXTRACT original)')
+    p.add_argument('--window',   type=int, default=7)
+    p.add_argument('--env',      default='kitchen-mixed-v0')
+    p.add_argument('--device',   default='cuda')
+    p.add_argument('--visualize', action='store_true')
+    p.add_argument('--viz',      default='checkpoints/skill_pretrain/cluster_viz.png')
     args = p.parse_args()
 
-    # 1. 설정 초기화
-    cfg = ExtractClusterConfig(K=args.K)
+    if args.visualize:
+        import d4rl, gym
+        env     = gym.make(args.env)
+        dataset = env.get_dataset()
+        term    = dataset['terminals'].astype(bool)
+        obs     = dataset['observations']
+        asgn, _ = load_cluster_data(args.out)
+        K_viz   = int(asgn.max()) + 1
+        # Episode timeline
+        visualize_episodes(asgn, term, K_viz, args.viz)
+        # PCA: 재계산
+        print("Computing Δs_t for PCA viz ...")
+        diff_v = compute_state_diff(obs, use_object_only=True)
+        # centroid: 각 cluster 평균으로 설정 (K-means 재학습 없음)
+        from sklearn.cluster import KMeans
+        km_v = KMeans.__new__(KMeans)
+        km_v.cluster_centers_ = np.array(
+            [diff_v[asgn==k].mean(axis=0) if (asgn==k).sum() > 0
+             else np.zeros(diff_v.shape[1])
+             for k in range(K_viz)])
+        pca_path = args.viz.replace('.png', '_pca.png')
+        visualize_pca_clusters(diff_v, asgn, km_v, K_viz, pca_path)
+        return
 
-    # 2. Minari HDF5에서 데이터 직접 로드
-    print(f"Loading Minari dataset from {args.data_path} ...")
-    obs, actions, terminals = load_minari_flat(args.data_path)
-    print(f"Dataset Loaded -> obs: {obs.shape}, actions: {actions.shape}, terminals: {terminals.sum()} ends")
+    cfg = ExtractClusterConfig(
+        K=args.K, median_window=args.window,
+        use_r3m=args.r3m, device=args.device)
 
-    # 3. Feature Engineering (HELIOS 최적화: Δs + Δa)
-    # diff 대신 features라는 이름으로 스케일링된 데이터를 받습니다.
-    features = compute_helios_features(obs, actions, cfg)
+    smoothed, logprobs, segs, diff, km = run_extract_pipeline(
+        cfg, args.out, args.env)
 
-    # 4. Clustering (K-means)
-    km, labels, logprobs = run_kmeans(features, cfg.K, cfg.kmeans_n_init, cfg.kmeans_seed)
-
-    # 5. Smoothing (Median Filter)
-    smoothed_labels = apply_median_filter(labels, terminals, cfg.median_window)
-
-    # 6. Save (HDF5)
-    save_for_helios(args.out, smoothed_labels, logprobs)
-
-    # ---------------------------------------------------------
-    # 7. Visualization (PNG 이미지 생성)
-    # ---------------------------------------------------------
-    print("\nGenerating visualizations...")
-    viz_ep_path = args.out.replace('.h5', '_timeline.png')
-    viz_pca_path = args.out.replace('.h5', '_pca.png')
-    
     try:
-        # 에피소드별 타임라인 시각화
-        visualize_episodes(
-            assignments=smoothed_labels, 
-            terminals=terminals, 
-            K=cfg.K, 
-            out_path=viz_ep_path, 
-            n_ep=8  # 확인할 에피소드 수
-        )
-        
-        # PCA 기반 클러스터 분포 시각화
-        # diff 인자에는 K-means 학습에 사용한 features를 넘겨줍니다.
-        visualize_pca_clusters(
-            diff=features, 
-            assignments=smoothed_labels, 
-            km=km, 
-            K=cfg.K, 
-            out_path=viz_pca_path
-        )
-        print("\nAll tasks completed successfully!")
-        
+        import d4rl, gym
+        term = gym.make(args.env).get_dataset()['terminals'].astype(bool)
+        # 1. Per-episode skill timeline
+        visualize_episodes(smoothed, term, cfg.K, args.viz)
+        # 2. PCA cluster distribution
+        pca_path = args.viz.replace('.png', '_pca.png')
+        visualize_pca_clusters(diff, smoothed, km, cfg.K, pca_path)
     except Exception as ex:
-        print(f"Visualization failed: {ex}")
+        print(f"Viz failed: {ex}")
+
+    print(f"\nDone. cluster_data.h5 → {args.out}")
+
 
 if __name__ == '__main__':
     main()
