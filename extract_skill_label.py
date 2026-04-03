@@ -475,14 +475,24 @@ def run_extract_pipeline(
     obs, actions, terminals = load_d4rl_flat(env_name)
 
     if cfg.use_r3m:
-        print("Using R3M image embedding (EXTRACT 원본 방식) ...")
+        print("Using R3M + object state diff (concat) ...")
         model, transform = load_r3m(cfg.r3m_device)
         cache = str(Path(out_h5).parent / 'r3m_embeddings.npz')
         obs, actions, terminals, embeddings = render_and_embed_r3m(
             env_name, model, transform,
-            cfg.r3m_device, cfg.img_size,
+            cfg.r3m_device,
             cache_path=cache)
-        diff = compute_r3m_diff(embeddings)
+        r3m_diff   = compute_r3m_diff(embeddings)          # (N, 2048)
+        state_diff = compute_state_diff(obs,
+                         use_object_only=True)              # (N, 42)
+
+        # 두 diff를 StandardScaler로 각각 정규화 후 concat
+        # → 스케일 차이(2048-dim vs 42-dim) 보정
+        from sklearn.preprocessing import StandardScaler
+        r3m_scaled   = StandardScaler().fit_transform(r3m_diff)
+        state_scaled = StandardScaler().fit_transform(state_diff)
+        diff = np.concatenate([r3m_scaled, state_scaled], axis=1)  # (N, 2090)
+        print(f"Concat diff: r3m(2048) + state(42) = {diff.shape[1]}-dim")
     else:
         print(f"Computing Δs_t "
               f"({'object states [18:60]' if cfg.use_object_only else 'full 60-dim'}) ...")
