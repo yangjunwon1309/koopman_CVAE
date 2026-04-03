@@ -51,10 +51,11 @@ class ExtractClusterConfig:
     K:             int   = 8       # EXTRACT default
     median_window: int   = 7       # EXTRACT default
     state_dim:          int   = 60
-    use_r3m:            bool  = False  # True: R3M image embedding (EXTRACT 원본)
-    use_object_only:    bool  = True   # use_r3m=False 시: object states(18:60)만
+    use_r3m:            bool  = False
+    use_object_only:    bool  = True
     r3m_device:         str   = 'cuda'
-    img_size:           int   = 128    # 렌더링 해상도
+    img_size:           int   = 128
+    pca_dim:            int   = 64     # K-means 전 PCA 차원 축소 (0=off)
     kmeans_n_init: int   = 20
     kmeans_seed:   int   = 42
     min_seg_len:   int   = 5
@@ -486,13 +487,23 @@ def run_extract_pipeline(
         state_diff = compute_state_diff(obs,
                          use_object_only=True)              # (N, 42)
 
-        # 두 diff를 StandardScaler로 각각 정규화 후 concat
-        # → 스케일 차이(2048-dim vs 42-dim) 보정
+        # StandardScaler로 각각 정규화 후 concat
         from sklearn.preprocessing import StandardScaler
+        from sklearn.decomposition import PCA
         r3m_scaled   = StandardScaler().fit_transform(r3m_diff)
         state_scaled = StandardScaler().fit_transform(state_diff)
-        diff = np.concatenate([r3m_scaled, state_scaled], axis=1)  # (N, 2090)
-        print(f"Concat diff: r3m(2048) + state(42) = {diff.shape[1]}-dim")
+        concat = np.concatenate([r3m_scaled, state_scaled], axis=1)  # (N, 2090)
+        print(f"Concat diff: r3m(2048) + state(42) = {concat.shape[1]}-dim")
+
+        # PCA 차원 축소: 차원의 저주 방지
+        if cfg.pca_dim > 0 and cfg.pca_dim < concat.shape[1]:
+            print(f"PCA {concat.shape[1]}d → {cfg.pca_dim}d ...")
+            pca   = PCA(n_components=cfg.pca_dim, random_state=42)
+            diff  = pca.fit_transform(concat)
+            cumvar = pca.explained_variance_ratio_.sum()
+            print(f"  cumvar={cumvar*100:.1f}%  diff={diff.shape}")
+        else:
+            diff = concat
     else:
         print(f"Computing Δs_t "
               f"({'object states [18:60]' if cfg.use_object_only else 'full 60-dim'}) ...")
@@ -740,6 +751,8 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument('--out',      default='checkpoints/skill_pretrain/cluster_data.h5')
     p.add_argument('--K',        type=int, default=8)
+    p.add_argument('--pca_dim',  type=int, default=64,
+                   help='PCA dim before K-means (0=off)')
     p.add_argument('--r3m',      action='store_true',
                    help='Use R3M image embedding (EXTRACT original)')
     p.add_argument('--window',   type=int, default=7)
@@ -775,7 +788,8 @@ def main():
 
     cfg = ExtractClusterConfig(
         K=args.K, median_window=args.window,
-        use_r3m=args.r3m, device=args.device)
+        use_r3m=args.r3m, pca_dim=args.pca_dim,
+        device=args.device)
 
     smoothed, logprobs, segs, diff, km = run_extract_pipeline(
         cfg, args.out, args.env)
