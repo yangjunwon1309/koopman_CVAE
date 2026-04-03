@@ -115,62 +115,72 @@ def load_r3m(device: str = 'cuda'):
     return model, transform
 
 
+# 렌더링 설정 (512→crop 128 확인됨)
+RENDER_SIZE = 512
+CROP_START  = 192
+CROP_END    = 320
+CROP_SIZE   = CROP_END - CROP_START   # 128
+
+
+def render_frame(sim) -> np.ndarray:
+    """512x512 렌더링 → 중앙 128x128 crop. flip 불필요."""
+    frame = sim.render(RENDER_SIZE, RENDER_SIZE, camera_id=-1)
+    return frame[CROP_START:CROP_END, CROP_START:CROP_END, :]
+
+
 def render_and_embed_r3m(
     env_name:    str = 'kitchen-mixed-v0',
     model=None,
     transform=None,
     device:      str = 'cuda',
-    img_size:    int = 64,
     batch_size:  int = 256,
     cache_path:  str = None,
 ) -> tuple:
     """
-    EXTRACT generate_kitchen_data.py 방식 재현:
-    D4RL 에피소드별 env.reset() → action replay → 매 step sim.render().
+    EXTRACT generate_kitchen_data.py 방식:
+    에피소드별 reset() → action replay → render_frame() → R3M(2048-dim).
 
-    - action replay: 렌더러 연속성 보장 (state 직접 설정보다 안정적)
-    - sim.render(width, height): mujoco-py offscreen API
-    - MUJOCO_GL=egl: headless 서버에서 필수
-    - cache_path: 첫 실행에서 npz 저장, 이후 즉시 로드
-
+    렌더링: 512x512 → 중앙 128x128 crop → R3M resnet50 → 2048-dim
+    cache_path: 첫 실행에서 저장, 이후 즉시 로드.
     Returns: obs(N,60), actions(N,9), terminals(N,), embeddings(N,2048)
     """
     import os
     if 'MUJOCO_GL' not in os.environ:
         os.environ['MUJOCO_GL'] = 'egl'
-        print("Set MUJOCO_GL=egl for offscreen rendering")
+        print("Set MUJOCO_GL=egl")
 
     import d4rl, gym
     dev = torch.device(device if torch.cuda.is_available() else 'cpu')
 
     print(f"Loading {env_name} ...")
-    env     = gym.make(env_name)
-    dataset = env.get_dataset()
+    env       = gym.make(env_name)
+    dataset   = env.get_dataset()
     obs       = dataset['observations'].copy()
     actions   = dataset['actions'].copy()
     terminals = dataset['terminals'].astype(bool)
-    N = len(obs)
+    N         = len(obs)
 
     # ── 캐시 확인 ─────────────────────────────────────────────
     if cache_path and Path(cache_path).exists():
         print(f"Loading cached R3M embeddings: {cache_path}")
         embeddings = np.load(cache_path)['embeddings']
         assert len(embeddings) == N, f"Cache mismatch: {len(embeddings)} vs {N}"
-        print(f"  Loaded: {embeddings.shape}")
+        norm = np.linalg.norm(embeddings, axis=1).mean()
+        print(f"  Loaded: {embeddings.shape}  mean_norm={norm:.2f}")
+        if norm < 0.1:
+            print("  WARNING: mean_norm~0 → invalid cache! Delete and re-run.")
         return obs, actions, terminals, embeddings
 
-    # ── R3M 모델 로드 ─────────────────────────────────────────
+    # ── R3M 로드 ──────────────────────────────────────────────
     if model is None:
         print("Loading R3M (resnet50) ...")
         model, transform = load_r3m(device)
 
     sim = env.unwrapped.sim
-
-    # ── 에피소드 경계 ─────────────────────────────────────────
     ep_ends   = list(np.where(terminals)[0])
     ep_starts = [0] + [e + 1 for e in ep_ends[:-1]]
     print(f"Episodes: {len(ep_starts)}  Steps: {N}")
-    print(f"Action replay + sim.render (img={img_size}, batch={batch_size}) ...")
+    print(f"Render: {RENDER_SIZE}px → crop[{CROP_START}:{CROP_END}]={CROP_SIZE}px → R3M")
 
     embeddings   = np.zeros((N, 2048), dtype=np.float32)
     frames_batch = []
@@ -191,15 +201,11 @@ def render_and_embed_r3m(
     for ep_i, (ep_s, ep_e) in enumerate(zip(ep_starts, ep_ends)):
         env.reset()
         for t in range(ep_s, ep_e + 1):
-            # render at current state → (H, W, 3) upside-down
-            frame = sim.render(width=img_size, height=img_size, depth=False)
-            frame = frame[::-1].copy()   # flip vertically
-
+            frame = render_frame(sim)
             frames_batch.append(transform(Image.fromarray(frame)))
             idx_batch.append(t)
             if len(frames_batch) >= batch_size:
                 flush()
-
             if t < ep_e:
                 env.step(actions[t])
 
@@ -208,13 +214,15 @@ def render_and_embed_r3m(
                   f"t={ep_e+1}/{N} ({(ep_e+1)/N*100:.0f}%)", flush=True)
 
     flush()
-    print(f"R3M done: {embeddings.shape}  "
-          f"mean_norm={np.linalg.norm(embeddings, axis=1).mean():.2f}")
+    norm = np.linalg.norm(embeddings, axis=1).mean()
+    print(f"R3M done: {embeddings.shape}  mean_norm={norm:.2f}")
+    if norm < 0.1:
+        print("WARNING: mean_norm~0 — rendering may have failed!")
 
     if cache_path:
         Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(cache_path, embeddings=embeddings)
-        print(f"Saved cache: {cache_path}")
+        print(f"Saved: {cache_path}")
 
     return obs, actions, terminals, embeddings
 
