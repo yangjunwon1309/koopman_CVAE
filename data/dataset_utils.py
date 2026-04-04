@@ -1,335 +1,328 @@
 """
 dataset_utils.py
 ================
-Offline dataset loading for KODAC-S.
+KODAQ full RSSM-Koopman용 Dataset 클래스.
 
-Supported environments:
-  Adroit:          adroit_pen, adroit_hammer, adroit_door, adroit_relocate
-  Franka Kitchen:  kitchen_complete, kitchen_partial, kitchen_mixed
-  Synthetic:       fallback for quick testing
+핵심 변경:
+  - 입력이 raw state (60-dim) 아닌 x_t = [Δe_t, Δp_t, q_t, q̇_t] ∈ ℝ^{2108}
+  - skill_labels (B, T) int64 → EXTRACT cluster assignments ĉ_t
+  - 데이터 소스:
+      (1) x_sequences.npz 캐시 (run_extract_pipeline() 생성) — 권장
+      (2) skill_segments (split_into_skill_segments() 결과)
+      (3) synthetic fallback (quick test)
 
-Franka Kitchen specifics:
-  - observation: 60-dim (robot qpos 9 + qvel 9 + object states 42)
-  - action:       9-dim joint velocity commands
-  - quality tiers: complete (4/4 tasks), partial (2-3/4), mixed (any)
-  - episode length: ~280 steps at 12.5Hz (dt=0.08s)
-  - multi-task structure: each episode completes a different task subset
-    (kettle, microwave, bottom burner, light switch, etc.)
-
-Why Kitchen is more appropriate for KODAC-S:
-  - Sequential multi-task structure naturally tests skill segmentation
-  - Contact-rich manipulation requires non-trivial Koopman dynamics
-  - Human demonstrations (motion capture) provide clean behavior modes
-  - Longer episodes give richer temporal context for TCN
+KODAQDataset:
+  __getitem__ → (x_seq, actions, skill_labels) 각각 (T, x_dim), (T, 9), (T,)
+  collate_fn  → padding + mask 지원 (가변 길이 segments)
 """
 
 import numpy as np
 import torch
-from torch.utils.data import TensorDataset
-from typing import List, Dict, Optional, Tuple
+from pathlib import Path
+from torch.utils.data import Dataset, TensorDataset
+from typing import Dict, List, Optional, Tuple
+
+from data.extract_skill_label import (
+    X_DIM, DIM_DELTA_E, DIM_DELTA_P, DIM_Q, DIM_QDOT,
+    run_extract_pipeline, load_x_sequences, load_cluster_data,
+    ExtractClusterConfig,
+    split_into_skill_segments,
+)
 
 
-# ─────────────────────────────────────────────────────────────
-# Episode splitting utilities
-# ─────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# Sliding-window dataset over flat x_t, actions, skill_labels arrays
+# ──────────────────────────────────────────────────────────────────────────────
 
-def split_into_trajectories(
-    dataset: Dict[str, np.ndarray],
-    min_len: int = 50,
-    use_timeouts: bool = True,
-) -> List[Dict[str, np.ndarray]]:
+class KODAQWindowDataset(Dataset):
     """
-    Split flat D4RL dataset dict into individual episodes.
-    Episode boundary: terminals=True OR timeouts=True (if available).
+    Sliding-window segmentation of flat (N,) arrays.
+
+    Episode boundaries are respected: windows do not cross terminal flags.
+
+    __getitem__ returns:
+        x_seq:        (T, 2108)  float32
+        actions:      (T, 9)     float32
+        skill_labels: (T,)       int64
     """
-    obs      = dataset['observations']
-    acts     = dataset['actions']
-    rews     = dataset.get('rewards', np.zeros(len(obs)))
-    terms    = dataset['terminals'].astype(bool)
-    timeouts = dataset.get('timeouts',
-                           np.zeros_like(terms, dtype=bool)) if use_timeouts \
-               else np.zeros_like(terms, dtype=bool)
-    ends = terms | timeouts
 
-    trajectories = []
-    start = 0
-    for i in range(len(ends)):
-        if ends[i] or i == len(ends) - 1:
-            end    = i + 1
-            length = end - start
-            if length >= min_len:
-                trajectories.append({
-                    'observations': obs[start:end],
-                    'actions':      acts[start:end],
-                    'rewards':      rews[start:end],
-                })
-            start = end
+    def __init__(
+        self,
+        x_seq:        np.ndarray,   # (N, 2108)
+        actions:      np.ndarray,   # (N, 9)
+        skill_labels: np.ndarray,   # (N,) int
+        terminals:    np.ndarray,   # (N,) bool
+        seq_len:      int = 64,
+        stride:       int = None,
+    ):
+        self.x_seq        = x_seq.astype(np.float32)
+        self.actions      = actions.astype(np.float32)
+        self.skill_labels = skill_labels.astype(np.int64)
+        self.seq_len      = seq_len
+        if stride is None:
+            stride = seq_len // 2
+        self.stride       = stride
 
-    print(f"  Episodes: {len(trajectories)}  "
-          f"(min_len={min_len}, total_steps={len(obs)})")
-    return trajectories
+        # Build valid windows that don't cross episode boundaries
+        self.windows = self._build_windows(terminals)
+        print(f"KODAQWindowDataset: {len(self.windows)} windows  "
+              f"seq_len={seq_len}  stride={stride}  "
+              f"N={len(x_seq)}  x_dim={x_seq.shape[1]}")
 
+    def _build_windows(self, terminals: np.ndarray) -> List[int]:
+        """
+        Returns list of start indices for valid windows.
+        A window [start, start+seq_len) is valid if it contains no terminal.
+        (Terminal at the very end of the window is allowed.)
+        """
+        N    = len(self.x_seq)
+        T    = self.seq_len
+        ends = set(np.where(terminals)[0].tolist())
+        windows = []
 
-def split_kitchen_trajectories(
-    dataset: Dict[str, np.ndarray],
-    min_len: int = 50,
-) -> List[Dict[str, np.ndarray]]:
-    """
-    Franka Kitchen-specific episode splitter.
+        for start in range(0, N - T + 1, self.stride):
+            end = start + T - 1
+            # Check if any terminal lies strictly inside [start, end-1]
+            # (terminal at end is OK: episode boundary after this window)
+            interior_terminal = any(t in ends for t in range(start, end))
+            if not interior_terminal:
+                windows.append(start)
 
-    Kitchen datasets do not reliably set terminals=True at episode boundaries
-    in all versions. Instead, we detect boundaries by checking for large
-    discontinuities in the robot qpos (first 9 dims of observation), or
-    fall back to fixed-length splits if no discontinuities are found.
+        return windows
 
-    Also extracts task completion info from dataset['infos/tasks_to_complete']
-    if available (useful for skill labeling / analysis).
-    """
-    obs  = dataset['observations']     # (N, 60)
-    acts = dataset['actions']          # (N, 9)
-    rews = dataset.get('rewards', np.zeros(len(obs)))
-    N    = len(obs)
+    def __len__(self) -> int:
+        return len(self.windows)
 
-    # 1. Try standard terminal/timeout splitting first
-    terms    = dataset['terminals'].astype(bool)
-    timeouts = dataset.get('timeouts', np.zeros_like(terms, dtype=bool))
-    ends     = terms | timeouts
-    n_ends   = ends.sum()
-
-    # 2. If no terminals found, detect via qpos discontinuity
-    if n_ends < 2:
-        print("  Kitchen: no terminal flags, using qpos discontinuity detection")
-        qpos      = obs[:, :9]
-        qpos_diff = np.linalg.norm(np.diff(qpos, axis=0), axis=1)  # (N-1,)
-        threshold = np.percentile(qpos_diff, 99)   # top 1% jumps = episode boundary
-        ends = np.zeros(N, dtype=bool)
-        ends[1:] = qpos_diff > threshold
-        ends[-1] = True
-
-    # 3. Extract task info if available
-    task_info = None
-    for key in ['infos/tasks_to_complete', 'infos/goal']:
-        if key in dataset:
-            task_info = dataset[key]
-            break
-
-    trajectories = []
-    start = 0
-    for i in range(N):
-        if ends[i] or i == N - 1:
-            end    = i + 1
-            length = end - start
-            if length >= min_len:
-                traj = {
-                    'observations': obs[start:end],
-                    'actions':      acts[start:end],
-                    'rewards':      rews[start:end],
-                }
-                if task_info is not None:
-                    traj['task_info'] = task_info[start:end]
-                trajectories.append(traj)
-            start = end
-
-    print(f"  Kitchen episodes: {len(trajectories)}  "
-          f"(min_len={min_len}, total_steps={N})")
-    if trajectories:
-        lens = [len(t['observations']) for t in trajectories]
-        print(f"  Episode length: min={min(lens)}  "
-              f"max={max(lens)}  mean={np.mean(lens):.0f}")
-    return trajectories
-
-
-def segment_trajectories(
-    trajectories: List[Dict[str, np.ndarray]],
-    seq_len: int = 100,
-    stride: Optional[int] = None,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Cut trajectories into fixed-length segments via sliding window.
-    Returns (actions_arr, states_arr) each shape (B, seq_len, dim).
-    """
-    if stride is None:
-        stride = seq_len // 2
-
-    actions_list, states_list = [], []
-    for traj in trajectories:
-        T = len(traj['observations'])
-        for start in range(0, T - seq_len + 1, stride):
-            end = start + seq_len
-            states_list.append(traj['observations'][start:end])
-            actions_list.append(traj['actions'][start:end])
-
-    if not actions_list:
-        raise ValueError(
-            f"No segments produced. "
-            f"Reduce seq_len (current={seq_len}) or min_episode_len."
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        start = self.windows[idx]
+        end   = start + self.seq_len
+        return (
+            torch.from_numpy(self.x_seq[start:end]),         # (T, 2108)
+            torch.from_numpy(self.actions[start:end]),        # (T, 9)
+            torch.from_numpy(self.skill_labels[start:end]),   # (T,)
         )
 
-    actions_arr = np.stack(actions_list).astype(np.float32)
-    states_arr  = np.stack(states_list).astype(np.float32)
-    print(f"  Segments: {actions_arr.shape[0]} x {seq_len}  "
-          f"(action_dim={actions_arr.shape[-1]}, state_dim={states_arr.shape[-1]})")
-    return actions_arr, states_arr
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Skill-segment-based dataset (variable-length segments → collate with padding)
+# ──────────────────────────────────────────────────────────────────────────────
 
-# ─────────────────────────────────────────────────────────────
-# D4RL environment name maps
-# ─────────────────────────────────────────────────────────────
-
-ADROIT_ENV_MAP = {
-    'adroit_pen':      {
-        'expert': 'pen-expert-v1',
-        'human':  'pen-human-v1',
-        'cloned': 'pen-cloned-v1',
-    },
-    'adroit_hammer':   {
-        'expert': 'hammer-expert-v1',
-        'human':  'hammer-human-v1',
-        'cloned': 'hammer-cloned-v1',
-    },
-    'adroit_door':     {
-        'expert': 'door-expert-v1',
-        'human':  'door-human-v1',
-        'cloned': 'door-cloned-v1',
-    },
-    'adroit_relocate': {
-        'expert': 'relocate-expert-v1',
-        'human':  'relocate-human-v1',
-        'cloned': 'relocate-cloned-v1',
-    },
-}
-
-# Franka Kitchen: quality maps to task-completion level
-# complete: all 4 tasks completed per episode (hardest, cleanest)
-# partial:  2-3 tasks completed
-# mixed:    any number of tasks (most diverse, largest dataset)
-KITCHEN_ENV_MAP = {
-    'kitchen_complete': 'kitchen-complete-v0',
-    'kitchen_partial':  'kitchen-partial-v0',
-    'kitchen_mixed':    'kitchen-mixed-v0',
-}
-
-# Kitchen observation/action dims (fixed in D4RL)
-KITCHEN_STATE_DIM  = 60   # robot qpos(9) + qvel(9) + object states(42)
-KITCHEN_ACTION_DIM = 9    # joint velocity targets
-KITCHEN_DT         = 0.08 # 12.5 Hz control frequency
-
-
-# ─────────────────────────────────────────────────────────────
-# Main loaders
-# ─────────────────────────────────────────────────────────────
-
-def load_d4rl_trajectories(
-    env_name: str,
-    seq_len: int = 100,
-    stride: Optional[int] = None,
-    min_episode_len: int = 50,
-    quality: str = 'human',
-) -> TensorDataset:
+class KODAQSegmentDataset(Dataset):
     """
-    Load D4RL offline dataset and return TensorDataset.
+    One sample = one EXTRACT skill segment (variable length).
+    Use with collate_fn_pad for DataLoader.
 
-    Args:
-        env_name:        shorthand key (e.g. 'adroit_pen', 'kitchen_complete')
-                         OR full D4RL name (e.g. 'pen-human-v1')
-        seq_len:         sequence length per sample
-        stride:          sliding window stride (default: seq_len // 2)
-        min_episode_len: discard episodes shorter than this
-        quality:         for Adroit: 'expert'|'human'|'cloned'
-                         for Kitchen: ignored (quality baked into env name)
-
-    Returns:
-        TensorDataset of (actions (B,T,da), states (B,T,ds))
+    __getitem__ returns:
+        x_seq:        (L, 2108)  float32
+        actions:      (L, 9)     float32
+        skill_labels: (L,)       int64
+        length:       int
     """
-    try:
-        import d4rl
-        import gym
-    except ImportError:
-        raise ImportError(
-            "d4rl not installed.\n"
-            "  pip install git+https://github.com/Farama-Foundation/d4rl@master#egg=d4rl"
+
+    def __init__(self, segments: List[Dict]):
+        self.segs = segments
+        lengths   = [s['length'] for s in segments]
+        skill_ids = [int(s['skills'][0]) for s in segments]
+        print(f"KODAQSegmentDataset: {len(segments)} segments  "
+              f"len=[{min(lengths)},{max(lengths)}]  "
+              f"mean={np.mean(lengths):.1f}")
+
+    def __len__(self) -> int:
+        return len(self.segs)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        seg = self.segs[idx]
+        return {
+            'x_seq':        torch.from_numpy(seg['x_seq'].astype(np.float32)),
+            'actions':      torch.from_numpy(seg['actions'].astype(np.float32)),
+            'skill_labels': torch.from_numpy(seg['skills'].astype(np.int64)),
+            'length':       seg['length'],
+        }
+
+
+def collate_fn_pad(batch: List[Dict]) -> Dict[str, torch.Tensor]:
+    """
+    Pad variable-length segments to max length in batch.
+    Returns mask (B, T) bool — True = valid timestep.
+    """
+    max_len = max(b['length'] for b in batch)
+    B       = len(batch)
+    x_dim   = batch[0]['x_seq'].shape[-1]
+    a_dim   = batch[0]['actions'].shape[-1]
+
+    x_pad   = torch.zeros(B, max_len, x_dim)
+    a_pad   = torch.zeros(B, max_len, a_dim)
+    lbl_pad = torch.zeros(B, max_len, dtype=torch.long)
+    mask    = torch.zeros(B, max_len, dtype=torch.bool)
+
+    for i, b in enumerate(batch):
+        L = b['length']
+        x_pad[i,   :L] = b['x_seq']
+        a_pad[i,   :L] = b['actions']
+        lbl_pad[i, :L] = b['skill_labels']
+        mask[i,    :L] = True
+
+    return {
+        'x_seq':        x_pad,
+        'actions':      a_pad,
+        'skill_labels': lbl_pad,
+        'mask':         mask,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Main loader: builds dataset from cache or runs full pipeline
+# ──────────────────────────────────────────────────────────────────────────────
+
+def load_kodaq_dataset(
+    env_name:   str  = 'kitchen-mixed-v0',
+    seq_len:    int  = 64,
+    stride:     int  = None,
+    use_r3m:    bool = True,
+    K:          int  = 8,
+    out_dir:    str  = 'checkpoints/skill_pretrain',
+    pca_dim:    int  = 64,
+    device:     str  = 'cuda',
+    mode:       str  = 'window',   # 'window' | 'segment'
+) -> Dataset:
+    """
+    Full KODAQ dataset loader.
+
+    1. Checks cache (x_sequences.npz + cluster_data.h5)
+    2. If missing: runs EXTRACT pipeline (R3M render → K-means → segments)
+    3. Returns KODAQWindowDataset or KODAQSegmentDataset
+
+    mode='window'  : sliding window over flat arrays (recommended for training)
+    mode='segment' : one sample per EXTRACT skill segment (variable length)
+    """
+    out_dir_p  = Path(out_dir)
+    h5_path    = str(out_dir_p / 'cluster_data.h5')
+    x_cache    = str(out_dir_p / 'x_sequences.npz')
+
+    # ── Check / run pipeline ──────────────────────────────────────────────────
+    if not Path(h5_path).exists() or not Path(x_cache).exists():
+        print(f"Cache not found. Running EXTRACT pipeline...")
+        cfg = ExtractClusterConfig(
+            K=K, use_r3m=use_r3m, pca_dim=pca_dim,
+            device=device, env_name=env_name,
         )
+        run_extract_pipeline(cfg, h5_path, x_cache)
 
-    # Resolve env name
-    is_kitchen = env_name.startswith('kitchen')
-    if env_name in ADROIT_ENV_MAP:
-        d4rl_name = ADROIT_ENV_MAP[env_name][quality]
-    elif env_name in KITCHEN_ENV_MAP:
-        d4rl_name = KITCHEN_ENV_MAP[env_name]
-    else:
-        d4rl_name = env_name   # assume already a full D4RL name
+    # ── Load from cache ───────────────────────────────────────────────────────
+    print(f"Loading from cache: {x_cache}")
+    x_seq, actions, terminals = load_x_sequences(x_cache)
 
-    print(f"  Loading D4RL env: {d4rl_name}")
-    env     = gym.make(d4rl_name)
-    dataset = d4rl.qlearning_dataset(env)
+    print(f"Loading skill labels: {h5_path}")
+    assignments, logprobs = load_cluster_data(h5_path)
 
-    # Print dataset info
-    obs_dim = dataset['observations'].shape[-1]
-    act_dim = dataset['actions'].shape[-1]
-    print(f"  Dataset: {len(dataset['observations'])} steps  "
-          f"obs_dim={obs_dim}  act_dim={act_dim}")
+    print(f"  x_seq={x_seq.shape}  actions={actions.shape}  "
+          f"terminals={terminals.sum()}  K={assignments.max()+1}")
 
-    # Split into episodes
-    if is_kitchen:
-        trajectories = split_kitchen_trajectories(dataset, min_len=min_episode_len)
-    else:
-        trajectories = split_into_trajectories(dataset, min_len=min_episode_len)
-
-    # Segment into fixed-length windows
-    actions_arr, states_arr = segment_trajectories(
-        trajectories, seq_len=seq_len, stride=stride
-    )
-
-    return TensorDataset(
-        torch.FloatTensor(actions_arr),
-        torch.FloatTensor(states_arr),
-    )
-
-
-def load_kitchen_all_qualities(
-    seq_len: int = 200,
-    stride: Optional[int] = None,
-    min_episode_len: int = 100,
-) -> TensorDataset:
-    """
-    Load and concatenate all three Kitchen quality tiers.
-    Useful for maximum data diversity.
-    Returns TensorDataset of (actions, states).
-    """
-    all_actions, all_states = [], []
-    for key in ['kitchen_complete', 'kitchen_partial', 'kitchen_mixed']:
+    # ── Build dataset ─────────────────────────────────────────────────────────
+    if mode == 'window':
+        return KODAQWindowDataset(
+            x_seq=x_seq,
+            actions=actions,
+            skill_labels=assignments,
+            terminals=terminals,
+            seq_len=seq_len,
+            stride=stride,
+        )
+    elif mode == 'segment':
+        # Need obs to build segments (for backward compat)
+        # Load obs from D4RL
         try:
-            ds = load_d4rl_trajectories(
-                key, seq_len=seq_len, stride=stride,
-                min_episode_len=min_episode_len,
-            )
-            a, s = ds.tensors
-            all_actions.append(a)
-            all_states.append(s)
-            print(f"  {key}: {a.shape[0]} segments")
-        except Exception as e:
-            print(f"  {key} failed: {e}")
+            import d4rl, gym
+            obs = gym.make(env_name).get_dataset()['observations']
+        except Exception:
+            obs = np.zeros((len(x_seq), 60), dtype=np.float32)
 
-    if not all_actions:
-        raise RuntimeError("All Kitchen quality tiers failed to load.")
-
-    return TensorDataset(
-        torch.cat(all_actions, dim=0),
-        torch.cat(all_states,  dim=0),
-    )
+        segs = split_into_skill_segments(
+            obs=obs, actions=actions, x_seq=x_seq,
+            terminals=terminals,
+            cluster_assignments=assignments,
+            cluster_logprobs=logprobs,
+        )
+        return KODAQSegmentDataset(segs)
+    else:
+        raise ValueError(f"mode must be 'window' or 'segment', got '{mode}'")
 
 
-# ─────────────────────────────────────────────────────────────
-# Synthetic fallback
-# ─────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# Synthetic fallback (quick testing without D4RL/R3M)
+# ──────────────────────────────────────────────────────────────────────────────
 
 def make_synthetic_dataset(
-    action_dim: int = 9,
-    state_dim: int  = 60,
-    n_samples: int  = 1000,
-    seq_len: int    = 100,
-) -> TensorDataset:
-    """Random Gaussian dataset for quick testing."""
-    actions = torch.randn(n_samples, seq_len, action_dim) * 0.3
-    states  = torch.randn(n_samples, seq_len, state_dim)
-    return TensorDataset(actions, states)
+    n_samples: int = 1000,
+    seq_len:   int = 64,
+    K:         int = 8,
+) -> KODAQWindowDataset:
+    """
+    Gaussian noise dataset for unit testing / quick runs.
+    skill_labels: random integers in [0, K).
+    """
+    N    = n_samples * seq_len
+    x    = np.random.randn(N, X_DIM).astype(np.float32) * 0.3
+    acts = np.random.randn(N, 9).astype(np.float32) * 0.1
+    lbls = np.random.randint(0, K, size=N).astype(np.int64)
+
+    # Fake terminals: every seq_len steps
+    terms = np.zeros(N, dtype=bool)
+    terms[seq_len - 1::seq_len] = True
+
+    print(f"Synthetic dataset: N={N}  x_dim={X_DIM}  K={K}")
+    return KODAQWindowDataset(x, acts, lbls, terms, seq_len=seq_len)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Multi-quality Kitchen loader
+# ──────────────────────────────────────────────────────────────────────────────
+
+def load_kitchen_all_qualities(
+    seq_len:  int  = 64,
+    use_r3m:  bool = True,
+    K:        int  = 8,
+    out_dir:  str  = 'checkpoints/skill_pretrain',
+    device:   str  = 'cuda',
+) -> KODAQWindowDataset:
+    """
+    Merge complete + partial + mixed kitchen datasets into one window dataset.
+    Each quality tier has its own x_cache / cluster_data.h5.
+    """
+    envs = ['kitchen-complete-v0', 'kitchen-partial-v0', 'kitchen-mixed-v0']
+    all_x, all_a, all_l, all_t = [], [], [], []
+    offset = 0
+
+    for env_name in envs:
+        env_tag = env_name.split('-')[1]   # 'complete' | 'partial' | 'mixed'
+        env_dir = str(Path(out_dir) / env_tag)
+        try:
+            ds = load_kodaq_dataset(
+                env_name=env_name, seq_len=seq_len,
+                use_r3m=use_r3m, K=K,
+                out_dir=env_dir, device=device, mode='window',
+            )
+            all_x.append(ds.x_seq)
+            all_a.append(ds.actions)
+            all_l.append(ds.skill_labels)
+            # Rebuild terminals from windows
+            N = len(ds.x_seq)
+            t_arr = np.zeros(N, dtype=bool)
+            # Use original terminals embedded in KODAQWindowDataset
+            # (re-run to get terminals — load from env_dir/x_sequences.npz)
+            x_cache = str(Path(env_dir) / 'x_sequences.npz')
+            _, _, terms = load_x_sequences(x_cache)
+            all_t.append(terms)
+            print(f"  {env_tag}: {N} steps")
+        except Exception as e:
+            print(f"  {env_name} failed: {e}")
+
+    if not all_x:
+        raise RuntimeError("All Kitchen quality tiers failed.")
+
+    x_cat    = np.concatenate(all_x)
+    a_cat    = np.concatenate(all_a)
+    l_cat    = np.concatenate(all_l)
+    t_cat    = np.concatenate(all_t)
+
+    return KODAQWindowDataset(x_cat, a_cat, l_cat, t_cat, seq_len=seq_len)

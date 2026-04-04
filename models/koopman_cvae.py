@@ -1,504 +1,722 @@
 """
-koopman_cvae.py — KODAC-S
-==========================
+koopman_cvae.py — KODAQ Full RSSM-Koopman
+==========================================
 
-Simplified KODAC with Full A + Low-rank B.
+Document → Implementation mapping (KODAQ §3):
 
-Removed from previous version:
-  - Diagonal A / Real Schur 2x2 block structure
-  - Action stream encoder + decoder (action is given control input only)
-  - VAE posterior (mu, sigma, KL, reparameterization)
-  - Skill-specific V_i, beta_i, discrete P_hat
-  - GRU skill posterior
-  - loss_kl, loss_div, loss_ent, loss_cst, loss_recon_a
+  Input x_t = [Δe_t (2048), Δp_t (42), q_t (9), q̇_t (9)] ∈ ℝ^{2108}
+    Δe_t = R3M(s_t) - R3M(s_1)   episode-first difference
+    Δp_t = p^obj_t - p^obj_1     object state difference
 
-New structure:
-  State stream:   z_t = tanh(MLP_Phi(s_t)) in R^m
-  Transition:     z_{t+1} = F(a_t) z_t,  F = I + (A + sum_l B^(l) a_l) * dt
-                  A in R^{m x m}: full learnable
-                  B^(l) = U^(l) @ V^(l).T: low-rank per action dim
-  Multi-head:     v^(n)_t = W^(n) c_t,  c_t = TCN({s,a}_{1:t})
-                  g^(n)_t = v^(n)_t · z_t  (observable readout)
-  Decoder:        s_hat = MLP_Ds(z_t)
-  Loss:           L = alpha*L_pred + beta*L_recon + gamma*L_eig + delta*L_decorr
+  State Variables:
+    o_t ∈ ℝ^{d_o}  : lifted (Koopman) state
+    h_t ∈ ℝ^{d_h}  : GRU hidden (temporal history)
+    c_t ∈ {1..K}    : discrete skill label (from EXTRACT)
+    u_t ∈ ℝ^{d_u}  : encoded action
+
+  Generative model (§3.2):
+    h_{t+1}  = GRU(h_t, o_t, a_t)
+    p(c_t|h_t) = Cat(softmax(W_c h_t))
+    p(o_{t+1}|o_t,a_t,h_t) = N(Ā(w)·o_t + B̄(w)·u_t, σ²I)
+    Ā(w) = U · exp(Σ_k w_k log Λ_k) · U⁻¹   [log-space interpolation]
+    B̄(w) = U · (Σ_k w_k G_k)
+
+  Recognition model (§3.3):
+    q_φ(o_t|x_t,h_t) = N(μ_φ(x_t,h_t), diag(σ_φ²(x_t,h_t)))
+
+  Decoder (§3.4):
+    p(x_t|o_t) = p(Δe_t|o_t) · p(Δp_t|o_t) · p(q_t|o_t) · p(q̇_t|o_t)
+    4 independent MLP heads, MSE loss
+
+  Action encoder:
+    u_t = ψ_θ(a_t)   (MLP)
+
+  Loss (§4):
+    L = L_rec - λ1·L_dyn - λ2·L_skill - λ3·L_reg
+    Phase 1: L_rec only
+    Phase 2: + λ1·L_dyn + λ2·L_skill
+    Phase 3: + λ3·L_reg
+
+Architecture notes:
+  - A_k, B_k initialized near identity (A_k = I + ε, B_k = ε) per §6
+  - μ_k initialized from EXTRACT cluster centroids (external call)
+  - U shared across skills (Assumption 2)
+  - Stability: tanh(r^(k)_i)·e^{iθ^(k)_i} guarantees |λ^(k)_i| ≤ 1 (Assumption 3)
+
+Module separation:
+  losses.py   : all loss functions (pure functions, no nn.Module state)
+  koopman_cvae.py : nn.Module classes + forward/loss delegation
 """
 
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
 
 from models.losses import (
-    propagate,
-    propagate_h_steps,
-    multistep_prediction_loss,
+    symlog, symexp,
+    blend_koopman, koopman_step,
     reconstruction_loss,
+    koopman_consistency_loss,
+    skill_classification_loss,
+    posterior_regularization_loss,
     eigenvalue_stability_loss,
-    eigenvalue_diversity_loss,
-    decorrelation_loss,
+    compute_total_loss,
 )
 
 
-# ─────────────────────────────────────────────────────────────
-# Utility
-# ─────────────────────────────────────────────────────────────
-
-def symlog(x: torch.Tensor) -> torch.Tensor:
-    return torch.sign(x) * torch.log(torch.abs(x) + 1.0)
-
-def symexp(x: torch.Tensor) -> torch.Tensor:
-    return torch.sign(x) * (torch.exp(torch.abs(x)) - 1.0)
-
-
-# ─────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
 # Config
-# ─────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class KoopmanCVAEConfig:
-    # Environment
-    action_dim: int   = 6
-    state_dim: int    = 24
-    patch_size: int   = 5        # dt = patch_size * dt_control
-    dt_control: float = 0.02
+    # ── Input dimensions (KODAQ §1.1) ─────────────────────────────────────────
+    # x_t = [Δe_t(2048), Δp_t(42), q_t(9), q̇_t(9)]
+    dim_delta_e:  int   = 2048   # R3M embedding diff
+    dim_delta_p:  int   = 42     # object state diff
+    dim_q:        int   = 9      # joint positions
+    dim_qdot:     int   = 9      # joint velocities
+    action_dim:   int   = 9      # robot action a_t
 
-    # Architecture
-    mlp_hidden_dim: int  = 256
-    tcn_hidden_dim: int  = 256   # TCN channel width
-    tcn_n_layers:   int  = 4     # TCN depth (number of residual blocks)
-    tcn_kernel_size: int = 3     # TCN causal kernel size
-    koopman_dim:    int  = 64    # m: z dimension
-    num_heads:      int  = 8     # Nh: number of observable heads
+    # Raw D4RL observation (60-dim) needed for GRU input fallback
+    state_dim:    int   = 60     # used in env_configs, not for x_t construction
 
-    # Full A + Low-rank B
-    lora_rank: int   = 8         # r: rank of B^(l) = U^(l) @ V^(l).T
-    # B magnitude clamp: |B^(l)| <= b_max element-wise
-    b_max: float     = 0.3
+    # ── Latent dimensions ─────────────────────────────────────────────────────
+    koopman_dim:  int   = 128    # d_o: lifted state dimension
+    gru_hidden:   int   = 256    # d_h: GRU hidden state
+    action_latent: int  = 64     # d_u: encoded action dimension
+    num_skills:   int   = 8      # K: number of skill components
 
-    # Eigenvalue stability
-    eig_target_radius: float = 0.99   # target spectral radius of A
-    eig_margin:        float = 0.01   # soft margin
-    eig_div_sigma:     float = 0.1    # diversity penalty bandwidth
+    # ── Architecture ──────────────────────────────────────────────────────────
+    mlp_hidden:   int   = 256
+    enc_layers:   int   = 3      # encoder MLP depth
+    dec_layers:   int   = 3      # decoder MLP depth
+    dropout:      float = 0.1
 
-    # Loss weights
-    alpha_pred:   float = 1.0
-    alpha_recon:  float = 0.5
-    gamma_eig:    float = 0.1    # stability loss
-    gamma_div:    float = 0.05   # eigenvalue diversity loss
-    delta_decorr: float = 0.1
+    # ── Loss weights (§4) ─────────────────────────────────────────────────────
+    lambda1:      float = 1.0    # L_dyn   (Koopman consistency)
+    lambda2:      float = 0.5    # L_skill (cross-entropy)
+    lambda3:      float = 0.1    # L_reg   (posterior regularization)
+    lambda4:      float = 0.01   # L_stab  (eigenvalue stability monitoring)
 
-    # Multi-step prediction horizon
-    pred_steps: int = 5
+    # Reconstruction head weights α_j (§4)
+    alpha_delta_e: float = 1.0
+    alpha_delta_p: float = 2.0   # object states are key for skill separation
+    alpha_q:       float = 1.0
+    alpha_qdot:    float = 0.5   # velocities noisier → lower weight
 
-    dropout: float = 0.1
+    # ── Training phase ────────────────────────────────────────────────────────
+    # Updated externally by trainer
+    phase:        int   = 1      # 1: rec, 2: +dyn+skill, 3: +reg
+
+    # ── Properties ────────────────────────────────────────────────────────────
+    @property
+    def x_dim(self) -> int:
+        """Total input dimension."""
+        return self.dim_delta_e + self.dim_delta_p + self.dim_q + self.dim_qdot
+
+    @property
+    def rec_weights(self) -> dict:
+        return {
+            'delta_e': self.alpha_delta_e,
+            'delta_p': self.alpha_delta_p,
+            'q':       self.alpha_q,
+            'qdot':    self.alpha_qdot,
+        }
+
+    @property
+    def x_slices(self) -> dict:
+        """Index slices for each x_t component."""
+        i0 = 0
+        i1 = self.dim_delta_e
+        i2 = i1 + self.dim_delta_p
+        i3 = i2 + self.dim_q
+        i4 = i3 + self.dim_qdot
+        return {
+            'delta_e': slice(i0, i1),
+            'delta_p': slice(i1, i2),
+            'q':       slice(i2, i3),
+            'qdot':    slice(i3, i4),
+        }
 
 
-# ─────────────────────────────────────────────────────────────
-# Koopman Operator: Full A + Low-rank B
-# ─────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# Utility: MLP builder
+# ──────────────────────────────────────────────────────────────────────────────
 
-class KoopmanOperator(nn.Module):
+def make_mlp(
+    in_dim:   int,
+    out_dim:  int,
+    hidden:   int,
+    n_layers: int,
+    dropout:  float = 0.1,
+    activate_last: bool = False,
+) -> nn.Sequential:
+    """Standard MLP with LayerNorm + SiLU activations."""
+    layers = []
+    d = in_dim
+    for i in range(n_layers - 1):
+        layers += [nn.Linear(d, hidden), nn.LayerNorm(hidden),
+                   nn.SiLU(), nn.Dropout(dropout)]
+        d = hidden
+    layers.append(nn.Linear(d, out_dim))
+    if activate_last:
+        layers += [nn.LayerNorm(out_dim), nn.SiLU()]
+    seq = nn.Sequential(*layers)
+    # Orthogonal init
+    for m in seq.modules():
+        if isinstance(m, nn.Linear):
+            nn.init.orthogonal_(m.weight, gain=0.1)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+    return seq
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Action Encoder: ψ_θ(a_t) → u_t
+# ──────────────────────────────────────────────────────────────────────────────
+
+class ActionEncoder(nn.Module):
     """
-    Full transition matrix A in R^{m x m}
-    Input coupling B^(l) = U^(l) @ V^(l).T in R^{m x m}, l=1,...,da
-    (low-rank, da separate matrices)
-
-    ZOH (1st-order):  z_{t+1} = (I + (A + sum_l B^(l)*a_l) * dt) z_t
-                               = F(a_t) z_t
-
-    Stability enforced via eigenvalue_stability_loss on A (not hard constraint).
-    A is NOT constrained during forward — loss penalizes unstable eigenvalues.
+    u_t = ψ_θ(a_t)  (§3.2)
+    MLP: a_t ∈ ℝ^{da} → u_t ∈ ℝ^{d_u}
     """
-
     def __init__(self, cfg: KoopmanCVAEConfig):
         super().__init__()
-        m, da, r = cfg.koopman_dim, cfg.action_dim, cfg.lora_rank
+        self.net = make_mlp(
+            cfg.action_dim, cfg.action_latent,
+            cfg.mlp_hidden, 2, cfg.dropout
+        )
 
-        self.m   = m
-        self.da  = da
-        self.r   = r
-        self.dt  = cfg.patch_size * cfg.dt_control
-        self.b_max = cfg.b_max
+    def forward(self, a: torch.Tensor) -> torch.Tensor:
+        """a: (..., da) → u: (..., d_u)"""
+        return self.net(a)
 
-        # Full A: initialized near zero to start close to identity transition
-        self.A = nn.Parameter(torch.randn(m, m) * 0.01)
 
-        # Low-rank B: B^(l) = B_U[l] @ B_V[l].T
-        self.B_U = nn.Parameter(torch.randn(da, m, r) * 0.01)
-        self.B_V = nn.Parameter(torch.randn(da, m, r) * 0.01)
+# ──────────────────────────────────────────────────────────────────────────────
+# Recognition Model: q_φ(o_t | x_t, h_t)
+# ──────────────────────────────────────────────────────────────────────────────
 
-    def get_B_clamped(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return B_U, B_V with magnitude soft-clamped via tanh."""
-        # tanh keeps values bounded without hard clamp discontinuity
-        B_U = torch.tanh(self.B_U) * self.b_max
-        B_V = torch.tanh(self.B_V) * self.b_max
-        return B_U, B_V
+class PosteriorEncoder(nn.Module):
+    """
+    q_φ(o_t | x_t, h_t) = N(μ_φ(x_t, h_t), diag(σ_φ²(x_t, h_t)))  (§3.3)
 
-    def get_B_full(self) -> torch.Tensor:
-        """Returns B: (da, m, m) — full low-rank matrices."""
-        B_U, B_V = self.get_B_clamped()
-        return torch.bmm(B_U, B_V.transpose(-1, -2))              # (da, m, m)
+    MLP conditioned on (x_t, h_t).
+    h_t resolves temporal ambiguity (same object position, different skill phase).
+    """
+    def __init__(self, cfg: KoopmanCVAEConfig):
+        super().__init__()
+        in_dim = cfg.x_dim + cfg.gru_hidden
+        self.trunk = make_mlp(
+            in_dim, cfg.mlp_hidden, cfg.mlp_hidden,
+            cfg.enc_layers, cfg.dropout, activate_last=True
+        )
+        self.mu_head    = nn.Linear(cfg.mlp_hidden, cfg.koopman_dim)
+        self.logvar_head = nn.Linear(cfg.mlp_hidden, cfg.koopman_dim)
+
+        nn.init.orthogonal_(self.mu_head.weight, gain=0.01)
+        nn.init.zeros_(self.mu_head.bias)
+        nn.init.orthogonal_(self.logvar_head.weight, gain=0.01)
+        nn.init.constant_(self.logvar_head.bias, -2.0)  # start with small σ
+
+    def forward(self, x: torch.Tensor, h: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        x: (..., x_dim)
+        h: (..., d_h)
+        Returns μ: (..., d_o), σ²: (..., d_o) [clamped]
+        """
+        feat    = self.trunk(torch.cat([x, h], dim=-1))
+        mu      = self.mu_head(feat)
+        logvar  = self.logvar_head(feat).clamp(-10, 2)
+        sigma2  = torch.exp(logvar)
+        return mu, sigma2
+
+    def sample(self, x: torch.Tensor, h: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Reparameterized sample + return μ, σ².
+        Returns (o_sample, μ, σ²)
+        """
+        mu, sigma2 = self.forward(x, h)
+        eps  = torch.randn_like(mu)
+        o    = mu + eps * torch.sqrt(sigma2 + 1e-8)
+        return o, mu, sigma2
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# GRU Recurrent Transition: h_{t+1} = f_θ(h_t, o_t, a_t)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class RecurrentTransition(nn.Module):
+    """
+    h_{t+1} = GRU(h_t, [o_t, a_t])  (§3.2)
+
+    Projects (o_t, a_t) → GRU input, then runs GRU cell.
+    """
+    def __init__(self, cfg: KoopmanCVAEConfig):
+        super().__init__()
+        gru_in = cfg.koopman_dim + cfg.action_dim
+        self.input_proj = nn.Linear(gru_in, cfg.gru_hidden)
+        self.gru_cell   = nn.GRUCell(cfg.gru_hidden, cfg.gru_hidden)
 
     def forward(
         self,
-        z: torch.Tensor,    # (batch, m) or (B, T, m)
-        a: torch.Tensor,    # (batch, da) or (B, T, da)
-        steps: int = 1,
-    ) -> torch.Tensor:
-        """Single or multi-step ZOH propagation."""
-        B_U, B_V = self.get_B_clamped()
-        shape = z.shape[:-1]
+        h: torch.Tensor,   # (B, d_h)
+        o: torch.Tensor,   # (B, d_o)
+        a: torch.Tensor,   # (B, da)
+    ) -> torch.Tensor:     # (B, d_h)
+        x_in = F.silu(self.input_proj(torch.cat([o, a], dim=-1)))
+        return self.gru_cell(x_in, h)
 
-        # Flatten leading dims
-        z_flat = z.reshape(-1, self.m)
-        a_flat = a.reshape(-1, self.da)
-
-        if steps == 1:
-            z_next = propagate(z_flat, self.A, B_U, B_V, a_flat, self.dt)
-        else:
-            z_next = propagate_h_steps(z_flat, self.A, B_U, B_V,
-                                       a_flat, self.dt, steps)
-        return z_next.reshape(shape + (self.m,))
-
-    def rollout(
-        self,
-        z0: torch.Tensor,       # (B, m)
-        actions: torch.Tensor,  # (B, T, da)
-        horizon: int,
-    ) -> torch.Tensor:
-        """
-        Closed-loop rollout: z_{t+1} = F(a_t) z_t
-        Returns z_seq: (B, horizon, m)
-        """
-        B_U, B_V = self.get_B_clamped()
-        z_list = []
-        z = z0
-        for t in range(horizon):
-            a = actions[:, t] if t < actions.shape[1] else actions[:, -1]
-            z = propagate(z, self.A, B_U, B_V, a, self.dt)
-            z_list.append(z)
-        return torch.stack(z_list, dim=1)                          # (B, horizon, m)
-
-    def get_eigenvalues(self) -> torch.Tensor:
-        """Returns complex eigenvalues of A, shape (m,)."""
-        return torch.linalg.eigvals(self.A)
+    def init_hidden(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        return torch.zeros(batch_size, self.gru_cell.hidden_size, device=device)
 
 
-# ─────────────────────────────────────────────────────────────
-# State Eigenfunction Encoder
-# ─────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# Skill Prior: p_θ(c_t | h_t)
+# ──────────────────────────────────────────────────────────────────────────────
 
-class EigenfunctionEncoder(nn.Module):
+class SkillPrior(nn.Module):
     """
-    MLP: s_t -> z_t in R^m
-    tanh output keeps z bounded in (-1, 1) per element.
+    p_θ(c_t | h_t) = Cat(softmax(W_c h_t))  (§3.2)
+    Returns logits for cross-entropy loss.
+    """
+    def __init__(self, cfg: KoopmanCVAEConfig):
+        super().__init__()
+        self.W_c = nn.Linear(cfg.gru_hidden, cfg.num_skills)
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        """h: (..., d_h) → logits: (..., K)"""
+        return self.W_c(h)
+
+    def soft_weights(self, h: torch.Tensor) -> torch.Tensor:
+        """w_k = softmax(W_c h_t): (..., K)"""
+        return torch.softmax(self.W_c(h), dim=-1)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Skill-conditioned Koopman: A_k, B_k, U (§3.2)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class SkillKoopmanOperator(nn.Module):
+    """
+    Shared eigenbasis U ∈ ℝ^{m×m}
+    Skill-specific eigenvalues: λ^(k)_i = tanh(r^(k)_i) · e^{iθ^(k)_i}
+      → |λ^(k)_i| = tanh(r^(k)_i) ≤ 1 always (Assumption 3)
+    Skill-specific input coupling: G_k ∈ ℝ^{m×d_u}
+      A_k = U Λ_k U⁻¹,   B_k = U G_k
+    Log-space interpolation (§3.2):
+      Ā(w) = U · exp(Σ_k w_k log Λ_k) · U⁻¹
+      B̄(w) = U · (Σ_k w_k G_k)
+    A_k initialized near identity (§6): r^(k) → -∞ (tanh≈0 → |λ|≈0 → A≈0),
+      so we init r small negative and θ near uniform.
     """
 
     def __init__(self, cfg: KoopmanCVAEConfig):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(cfg.state_dim, cfg.mlp_hidden_dim),
-            nn.LayerNorm(cfg.mlp_hidden_dim),
-            nn.SiLU(),
-            nn.Dropout(cfg.dropout),
-            nn.Linear(cfg.mlp_hidden_dim, cfg.mlp_hidden_dim),
-            nn.LayerNorm(cfg.mlp_hidden_dim),
-            nn.SiLU(),
-            nn.Linear(cfg.mlp_hidden_dim, cfg.koopman_dim),
-        )
-        for layer in self.net:
-            if isinstance(layer, nn.Linear):
-                nn.init.orthogonal_(layer.weight, gain=0.1)
-                if layer.bias is not None:
-                    nn.init.zeros_(layer.bias)
+        K = cfg.num_skills
+        m = cfg.koopman_dim
+        d_u = cfg.action_latent
 
-    def forward(self, s: torch.Tensor) -> torch.Tensor:
-        """s: (..., ds) -> z: (..., m)"""
-        return torch.tanh(self.net(symlog(s)))
+        # Shared eigenbasis U (orthogonal init)
+        self.U = nn.Parameter(torch.eye(m) + 0.01 * torch.randn(m, m))
 
+        # Skill-specific eigenvalue parameters
+        # r^(k): log-magnitude before tanh, init small → tanh(r) ~ r → small |λ|
+        # Near-identity: A_k ≈ I → need large r (tanh(r)→1) with θ≈0
+        # §6: A_k = I + ε → start with tanh(r)~1 → r=3, θ~0
+        self.r_k = nn.Parameter(3.0 * torch.ones(K, m))     # magnitude
+        self.theta_k = nn.Parameter(0.01 * torch.randn(K, m))  # phase
 
-# ─────────────────────────────────────────────────────────────
-# State Decoder
-# ─────────────────────────────────────────────────────────────
+        # Skill-specific input coupling G_k ∈ ℝ^{K × m × d_u}
+        # B_k = U G_k,  init small (§6: B_k = ε)
+        self.G_k = nn.Parameter(0.01 * torch.randn(K, m, d_u))
 
-class StateDecoder(nn.Module):
-    """z_t -> s_hat in symlog space."""
-
-    def __init__(self, cfg: KoopmanCVAEConfig):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(cfg.koopman_dim, cfg.mlp_hidden_dim),
-            nn.LayerNorm(cfg.mlp_hidden_dim),
-            nn.SiLU(),
-            nn.Linear(cfg.mlp_hidden_dim, cfg.mlp_hidden_dim),
-            nn.SiLU(),
-            nn.Linear(cfg.mlp_hidden_dim, cfg.state_dim),
-        )
-
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        """z: (..., m) -> s_hat: (..., ds) [symlog]"""
-        return self.net(z)
-
-
-# ─────────────────────────────────────────────────────────────
-# TCN Skill Encoder → Multi-head Observable
-# ─────────────────────────────────────────────────────────────
-
-class CausalConv1d(nn.Module):
-    """Single causal (left-padded) 1D convolution block."""
-
-    def __init__(self, in_ch: int, out_ch: int, kernel_size: int,
-                 dilation: int = 1, dropout: float = 0.1):
-        super().__init__()
-        self.pad  = (kernel_size - 1) * dilation
-        self.conv = nn.Conv1d(in_ch, out_ch, kernel_size,
-                              dilation=dilation, padding=0)
-        self.norm = nn.LayerNorm(out_ch)
-        self.drop = nn.Dropout(dropout)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (B, C, T) -> (B, C_out, T)"""
-        x = F.pad(x, (self.pad, 0))
-        x = self.conv(x)
-        # LayerNorm over channel dim
-        x = self.norm(x.transpose(1, 2)).transpose(1, 2)
-        x = F.silu(x)
-        return self.drop(x)
-
-
-class TCNSkillEncoder(nn.Module):
-    """
-    Causal TCN: {(s_t, a_t)} -> c_t in R^{d_c} for each t.
-    Multi-head readout: v^(n)_t = W^(n) c_t in R^m, n=1,...,Nh.
-
-    c_t encodes temporal skill context at time t.
-    v^(n)_t is a time-varying observable direction in z-space.
-    Different heads see z from different directions simultaneously,
-    providing richer supervision of the Koopman structure.
-    """
-
-    def __init__(self, cfg: KoopmanCVAEConfig):
-        super().__init__()
-        in_dim  = cfg.state_dim + cfg.action_dim
-        d_c     = cfg.tcn_hidden_dim
-        Nh      = cfg.num_heads
-        m       = cfg.koopman_dim
-
-        # Input projection
-        self.input_proj = nn.Conv1d(in_dim, d_c, kernel_size=1)
-
-        # Stacked causal convolutions with exponentially growing dilation
-        self.layers = nn.ModuleList([
-            CausalConv1d(d_c, d_c,
-                         kernel_size=cfg.tcn_kernel_size,
-                         dilation=2**i,
-                         dropout=cfg.dropout)
-            for i in range(cfg.tcn_n_layers)
-        ])
-
-        # Residual projections (if channel mismatch; here same channel)
-        # Multi-head readout: Nh separate linear maps
-        # W^(n) c_t -> v^(n)_t in R^m
-        self.head_projs = nn.Linear(d_c, Nh * m)
-
-        self.d_c = d_c
-        self.Nh  = Nh
+        self.K   = K
         self.m   = m
+        self.d_u = d_u
+
+    def get_log_lambdas(self) -> torch.Tensor:
+        """
+        log|λ^(k)_i| = log(tanh(r^(k)_i))
+        Since tanh(r) ∈ (0,1), log(tanh(r)) ≤ 0 → guaranteed stable.
+        Returns: (K, m)
+        """
+        return torch.log(torch.tanh(self.r_k.clamp(min=0.01)) + 1e-8)
 
     def forward(
         self,
-        states:  torch.Tensor,  # (B, T, ds)
-        actions: torch.Tensor,  # (B, T, da)
-    ) -> torch.Tensor:
+        o: torch.Tensor,   # (B, m)
+        u: torch.Tensor,   # (B, d_u)
+        w: torch.Tensor,   # (B, K) soft skill weights
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Returns v_heads: (B, T, Nh, m)
-        v_heads[b, t, n, :] = v^(n)_t = W^(n) c_t
+        Single-step Koopman prediction.
+        Returns (o_next_pred, A_bar, B_bar)
         """
-        # (B, T, ds+da) -> (B, ds+da, T) for Conv1d
-        x = torch.cat([symlog(states), symlog(actions)], dim=-1)
-        x = x.transpose(1, 2)                                     # (B, in_dim, T)
-        x = F.silu(self.input_proj(x))                            # (B, d_c, T)
+        log_lam = self.get_log_lambdas()   # (K, m)
+        A_bar, B_bar, _, _ = blend_koopman(
+            log_lam, self.theta_k, self.G_k, self.U, w
+        )
+        o_next = koopman_step(o, u, A_bar, B_bar)
+        return o_next, A_bar, B_bar
 
-        for layer in self.layers:
-            x = x + layer(x)                                       # residual
+    def get_A_k(self) -> torch.Tensor:
+        """Returns A_k for each skill: (K, m, m) — for LQR."""
+        log_lam = self.get_log_lambdas()   # (K, m)
+        U = self.U
+        U_c = U.to(dtype=torch.complex64)
+        U_inv = torch.linalg.inv(U_c)
 
-        # (B, d_c, T) -> (B, T, d_c)
-        c = x.transpose(1, 2)                                      # (B, T, d_c)
+        r_exp = torch.exp(log_lam)         # (K, m)
+        lam_c = torch.complex(
+            r_exp * torch.cos(self.theta_k),
+            r_exp * torch.sin(self.theta_k),
+        )  # (K, m)
+        Lam = torch.diag_embed(lam_c)     # (K, m, m)
+        A_c = U_c.unsqueeze(0) @ Lam @ U_inv.unsqueeze(0)
+        return A_c.real                    # (K, m, m)
 
-        # Multi-head projection
-        v_flat = self.head_projs(c)                                # (B, T, Nh*m)
-        v_heads = v_flat.reshape(c.shape[0], c.shape[1],
-                                 self.Nh, self.m)                  # (B, T, Nh, m)
-        return v_heads
+    def get_B_k(self) -> torch.Tensor:
+        """Returns B_k = U G_k for each skill: (K, m, d_u)."""
+        return self.U.unsqueeze(0) @ self.G_k   # (K, m, d_u)
 
 
-# ─────────────────────────────────────────────────────────────
-# Main Model: KODAC-S
-# ─────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# Decoder: p_θ(x_t | o_t) — 4 independent MLP heads
+# ──────────────────────────────────────────────────────────────────────────────
+
+class MultiHeadDecoder(nn.Module):
+    """
+    4 independent MLP heads (§3.4):
+      Δê_t = D_e(o_t)    (2048-dim)
+      Δp̂_t = D_p(o_t)   (42-dim)
+      q̂_t  = D_q(o_t)   (9-dim)
+      q̇̂_t  = D_qd(o_t)  (9-dim)
+
+    Output in symlog space; targets also symlog'd before MSE.
+    Weighted by α_j to balance scale differences.
+    """
+    def __init__(self, cfg: KoopmanCVAEConfig):
+        super().__init__()
+        m = cfg.koopman_dim
+        h = cfg.mlp_hidden
+        n = cfg.dec_layers
+        d = cfg.dropout
+
+        self.head_delta_e = make_mlp(m, cfg.dim_delta_e, h, n, d)
+        self.head_delta_p = make_mlp(m, cfg.dim_delta_p, h, n, d)
+        self.head_q       = make_mlp(m, cfg.dim_q,       h, n, d)
+        self.head_qdot    = make_mlp(m, cfg.dim_qdot,    h, n, d)
+
+    def forward(self, o: torch.Tensor) -> dict:
+        """o: (..., m) → dict of (..., dim_j) in symlog space"""
+        return {
+            'delta_e': self.head_delta_e(o),
+            'delta_p': self.head_delta_p(o),
+            'q':       self.head_q(o),
+            'qdot':    self.head_qdot(o),
+        }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Main Model: KODAQ Full RSSM-Koopman
+# ──────────────────────────────────────────────────────────────────────────────
 
 class KoopmanCVAE(nn.Module):
     """
-    KODAC-S — Simplified Koopman CVAE
+    KODAQ Full RSSM-Koopman (§3).
 
-    z_t = Phi(s_t)                        state eigenfunction
-    z_{t+1} = F(a_t) z_t                  full A + low-rank B ZOH
-    v^(n)_t = W^(n) TCN({s,a}_{1:t})     multi-head observable
-    g^(n)_t = v^(n)_t · z_t              observable readout
-    s_hat_t = D_s(z_t)                    state decoder
+    Forward input contract:
+        x_batch: (B, T, x_dim)  where x_dim = dim_delta_e+dim_delta_p+dim_q+dim_qdot
+        actions: (B, T, da)
+        skill_labels: (B, T) int64  — EXTRACT cluster assignments ĉ_t
 
-    Loss:
-        L_pred   : MSE(v^(n) · F^h z_t, v^(n) · z_{t+h})  multi-head
-        L_recon  : MSE(D_s(z_t), symlog(s_t))
-        L_eig    : eigenvalue stability of A
-        L_div    : eigenvalue diversity of A
-        L_decorr : off-diagonal cosine similarity of z
+    Forward output:
+        loss, loss_rec, loss_dyn, loss_skill, loss_reg, loss_stab
+        z_seq: (B, T, d_o)          posterior samples o_t
+        mu_seq: (B, T, d_o)         posterior means
+        h_seq: (B, T, d_h)          GRU hidden states
+        skill_logits: (B, T, K)     log p(c_t|h_t)
+        recon: dict of (B, T, dim)  per-head reconstructions
+
+    Data preparation (outside this file):
+        x_t is built from cached R3M embeddings + D4RL observations.
+        See data/extract_skill_label.py::build_x_sequence() and
+        data/dataset_utils.py::KODAQDataset.
     """
 
     def __init__(self, cfg: KoopmanCVAEConfig):
         super().__init__()
         self.cfg = cfg
 
-        self.encoder  = EigenfunctionEncoder(cfg)
-        self.decoder  = StateDecoder(cfg)
-        self.koopman  = KoopmanOperator(cfg)
-        self.tcn      = TCNSkillEncoder(cfg)
+        # ── Modules ────────────────────────────────────────────────────────
+        self.action_encoder    = ActionEncoder(cfg)
+        self.posterior         = PosteriorEncoder(cfg)
+        self.recurrent         = RecurrentTransition(cfg)
+        self.skill_prior       = SkillPrior(cfg)
+        self.koopman           = SkillKoopmanOperator(cfg)
+        self.decoder           = MultiHeadDecoder(cfg)
 
-    # ── Forward ──────────────────────────────────────────────
+    # ── Phase control ───────────────────────────────────────────────────────
+
+    def set_phase(self, phase: int):
+        """Update training phase (1→2→3). Called externally by trainer."""
+        assert phase in (1, 2, 3), f"Phase must be 1, 2, or 3, got {phase}"
+        self.cfg.phase = phase
+        print(f"[KoopmanCVAE] Phase → {phase}")
+
+    def init_skill_centroids(self, centroids: torch.Tensor):
+        """
+        §6: μ_k initialized from EXTRACT cluster centroids projected to lifted space.
+        centroids: (K, m) — centroids in Koopman space, e.g. from k-means on z.
+        This sets r_k, theta_k such that the prior starts near centroid distribution.
+        (Optional: can also be used to warm-start U via SVD of centroid matrix.)
+        """
+        # Warm-start: project centroids to find reasonable U initialization
+        K, m = centroids.shape
+        if K == self.cfg.num_skills and m == self.cfg.koopman_dim:
+            # SVD of centroid matrix as initial U estimate
+            U_init, _, _ = torch.linalg.svd(centroids.T, full_matrices=True)
+            with torch.no_grad():
+                self.koopman.U.copy_(U_init[:m, :m] if U_init.shape[0] >= m
+                                     else torch.eye(m))
+            print(f"[KoopmanCVAE] Initialized U from centroid SVD.")
+
+    # ── Forward ─────────────────────────────────────────────────────────────
 
     def forward(
         self,
-        actions: torch.Tensor,  # (B, T, da)
-        states:  torch.Tensor,  # (B, T, ds)
+        x_batch:      torch.Tensor,              # (B, T, x_dim)
+        actions:      torch.Tensor,              # (B, T, da)
+        skill_labels: Optional[torch.Tensor] = None,  # (B, T) int64
+        mask:         Optional[torch.Tensor] = None,  # (B, T) bool
     ) -> Dict[str, torch.Tensor]:
 
-        # Eigenfunction encoding
-        z = self.encoder(states)                                   # (B, T, m)
+        B, T, _ = x_batch.shape
+        device   = x_batch.device
+        cfg      = self.cfg
 
-        # Multi-head observable readout from TCN
-        v_heads = self.tcn(states, actions)                        # (B, T, Nh, m)
+        # ── Encode actions ──────────────────────────────────────────────────
+        # u_t = ψ_θ(a_t),  shape (B, T, d_u)
+        u_seq = self.action_encoder(actions)
 
-        # State reconstruction
-        s_hat = self.decoder(z)                                    # (B, T, ds)
+        # ── Unroll RSSM ─────────────────────────────────────────────────────
+        # h_t: GRU hidden, o_t: posterior sample, mu_t: posterior mean
+        h = self.recurrent.init_hidden(B, device)    # (B, d_h)
+        h_list        = []
+        o_list        = []
+        mu_list       = []
+        sigma2_list   = []
+        skill_logits_list = []
+        koopman_pred_list = []  # Ā·o_{t-1} + B̄·u_{t-1}  for t=1..T-1
 
-        # Losses
+        for t in range(T):
+            x_t = x_batch[:, t]      # (B, x_dim)
+            a_t = actions[:, t]      # (B, da)
+            u_t = u_seq[:, t]        # (B, d_u)
+
+            # Skill weights from current h_t
+            w_t       = self.skill_prior.soft_weights(h)         # (B, K)
+            skill_logits_list.append(self.skill_prior(h))        # (B, K)
+
+            # Posterior: o_t ~ q_φ(o_t | x_t, h_t)
+            o_t, mu_t, sig2_t = self.posterior.sample(x_t, h)
+            o_list.append(o_t)
+            mu_list.append(mu_t)
+            sigma2_list.append(sig2_t)
+
+            # Koopman prior prediction for NEXT step (t+1)
+            # Used in L_dyn and L_reg
+            if t < T - 1:
+                _, A_bar, B_bar = self.koopman(o_t, u_t, w_t)
+                o_next_pred = koopman_step(o_t, u_t, A_bar, B_bar)
+                koopman_pred_list.append(o_next_pred)          # (B, m)
+
+            # GRU update: h_{t+1} = f(h_t, o_t, a_t)
+            h = self.recurrent(h, o_t, a_t)
+            h_list.append(h)
+
+        # ── Stack sequences ──────────────────────────────────────────────────
+        h_seq           = torch.stack(h_list,         dim=1)   # (B, T, d_h)
+        o_seq           = torch.stack(o_list,         dim=1)   # (B, T, m)
+        mu_seq          = torch.stack(mu_list,        dim=1)   # (B, T, m)
+        sigma2_seq      = torch.stack(sigma2_list,    dim=1)   # (B, T, m)
+        skill_logits    = torch.stack(skill_logits_list, dim=1)  # (B, T, K)
+        koopman_pred    = torch.stack(koopman_pred_list, dim=1)  # (B, T-1, m)
+
+        # ── Decode ───────────────────────────────────────────────────────────
+        recon = self.decoder(o_seq)                             # dict of (B, T, dim)
+
+        # ── Losses ───────────────────────────────────────────────────────────
         losses = self._compute_losses(
-            states=states, z=z, s_hat=s_hat,
-            v_heads=v_heads, actions=actions,
-        )
-
-        return {**losses, 'z': z, 's_hat': s_hat, 'v_heads': v_heads}
-
-    # ── Loss ─────────────────────────────────────────────────
-
-    def _compute_losses(
-        self,
-        states:   torch.Tensor,   # (B, T, ds)
-        z:        torch.Tensor,   # (B, T, m)
-        s_hat:    torch.Tensor,   # (B, T, ds)
-        v_heads:  torch.Tensor,   # (B, T, Nh, m)
-        actions:  torch.Tensor,   # (B, T, da)
-    ) -> Dict[str, torch.Tensor]:
-        cfg = self.cfg
-        B_U, B_V = self.koopman.get_B_clamped()
-
-        # 1. Prediction loss (dominant)
-        #    Jointly supervises: Phi, A, B, TCN heads
-        loss_pred = multistep_prediction_loss(
-            z=z,
-            v_heads=v_heads,
-            actions=actions,
-            A=self.koopman.A,
-            B_U=B_U,
-            B_V=B_V,
-            dt=self.koopman.dt,
-            H=cfg.pred_steps,
-        )
-
-        # 2. State reconstruction
-        loss_recon = reconstruction_loss(s_hat, symlog(states))
-
-        # 3. Eigenvalue stability: penalize |lambda_k(A)| > target_radius
-        loss_eig_stab = eigenvalue_stability_loss(
-            self.koopman.A,
-            target_radius=cfg.eig_target_radius,
-            margin=cfg.eig_margin,
-        )
-
-        # 4. Eigenvalue diversity: penalize clustering of eigenvalues
-        loss_eig_div = eigenvalue_diversity_loss(
-            self.koopman.A,
-            sigma=cfg.eig_div_sigma,
-        )
-
-        loss_eig = loss_eig_stab + cfg.gamma_div / cfg.gamma_eig * loss_eig_div
-
-        # 5. Decorrelation: z columns should be uncorrelated
-        loss_decorr = decorrelation_loss(z.reshape(-1, cfg.koopman_dim))
-
-        loss = (
-            cfg.alpha_pred  * loss_pred
-            + cfg.alpha_recon * loss_recon
-            + cfg.gamma_eig   * loss_eig
-            + cfg.delta_decorr * loss_decorr
+            x_batch=x_batch,
+            recon=recon,
+            mu_seq=mu_seq,
+            koopman_pred=koopman_pred,
+            skill_logits=skill_logits,
+            skill_labels=skill_labels,
+            o_seq=o_seq,
+            mask=mask,
         )
 
         return {
-            'loss':           loss,
-            'loss_pred':      loss_pred,
-            'loss_recon':     loss_recon,
-            'loss_eig_stab':  loss_eig_stab,
-            'loss_eig_div':   loss_eig_div,
-            'loss_decorr':    loss_decorr,
+            **losses,
+            'z_seq':        o_seq,
+            'mu_seq':       mu_seq,
+            'sigma2_seq':   sigma2_seq,
+            'h_seq':        h_seq,
+            'skill_logits': skill_logits,
+            'recon':        recon,
         }
 
-    # ── Rollout ───────────────────────────────────────────────
+    # ── Loss computation ─────────────────────────────────────────────────────
+
+    def _compute_losses(
+        self,
+        x_batch:      torch.Tensor,              # (B, T, x_dim)
+        recon:        dict,                       # per-head decoder outputs (B, T, dim)
+        mu_seq:       torch.Tensor,              # (B, T, m)
+        koopman_pred: torch.Tensor,              # (B, T-1, m)  Ā·o_t + B̄·u_t
+        skill_logits: torch.Tensor,              # (B, T, K)
+        skill_labels: Optional[torch.Tensor],    # (B, T) int64 or None
+        o_seq:        torch.Tensor,              # (B, T, m)  (unused here, for ext)
+        mask:         Optional[torch.Tensor],    # (B, T) bool or None
+    ) -> Dict[str, torch.Tensor]:
+
+        cfg    = self.cfg
+        slices = cfg.x_slices
+
+        # ── L_rec: 4-head reconstruction in symlog space ────────────────────
+        targets = {
+            'delta_e': symlog(x_batch[..., slices['delta_e']]),
+            'delta_p': symlog(x_batch[..., slices['delta_p']]),
+            'q':       symlog(x_batch[..., slices['q']]),
+            'qdot':    symlog(x_batch[..., slices['qdot']]),
+        }
+        loss_rec, rec_per_head = reconstruction_loss(recon, targets, cfg.rec_weights)
+
+        # ── L_dyn: Koopman consistency (t → t+1) ───────────────────────────
+        # μ_φ(x_{t+1}, h_{t+1}) vs Ā(w_t)·o_t + B̄(w_t)·u_t
+        # mu_seq[:, 1:]: posterior mean at t+1
+        # koopman_pred:  Koopman prediction from t (computed during unroll)
+        loss_dyn = koopman_consistency_loss(
+            mu_next = mu_seq[:, 1:],       # (B, T-1, m)
+            o_pred  = koopman_pred,        # (B, T-1, m)
+        )
+
+        # ── L_skill: cross-entropy vs EXTRACT labels ─────────────────────────
+        if skill_labels is not None:
+            loss_skill = skill_classification_loss(
+                skill_logits, skill_labels, mask
+            )
+        else:
+            loss_skill = torch.tensor(0.0, device=x_batch.device)
+
+        # ── L_reg: posterior-prior alignment with stop_gradient ─────────────
+        # μ_φ(x_t, h_t) vs sg(Ā(w_{t-1})·o_{t-1} + B̄(w_{t-1})·u_{t-1})
+        # = mu_seq[:, 1:] vs sg(koopman_pred[:, :])
+        loss_reg = posterior_regularization_loss(
+            mu_t   = mu_seq[:, 1:],        # (B, T-1, m)
+            o_pred = koopman_pred,         # (B, T-1, m)  stop_grad inside fn
+        )
+
+        # ── L_stab: eigenvalue stability (monitoring + light push) ───────────
+        log_lam   = self.koopman.get_log_lambdas()   # (K, m), should be ≤ 0
+        loss_stab = eigenvalue_stability_loss(log_lam)
+
+        # ── Total (phase-gated) ───────────────────────────────────────────────
+        loss, weights = compute_total_loss(
+            loss_rec, loss_dyn, loss_skill, loss_reg, loss_stab,
+            cfg.lambda1, cfg.lambda2, cfg.lambda3, cfg.lambda4,
+            cfg.phase,
+        )
+
+        return {
+            'loss':       loss,
+            'loss_rec':   loss_rec,
+            'loss_dyn':   loss_dyn,
+            'loss_skill': loss_skill,
+            'loss_reg':   loss_reg,
+            'loss_stab':  loss_stab,
+            # Per-head reconstruction for diagnostics
+            'loss_rec_delta_e': rec_per_head['delta_e'],
+            'loss_rec_delta_p': rec_per_head['delta_p'],
+            'loss_rec_q':       rec_per_head['q'],
+            'loss_rec_qdot':    rec_per_head['qdot'],
+        }
+
+    # ── Inference utilities ──────────────────────────────────────────────────
+
+    @torch.no_grad()
+    def encode_sequence(
+        self,
+        x_batch: torch.Tensor,   # (B, T, x_dim)
+        actions: torch.Tensor,   # (B, T, da)
+    ) -> Dict[str, torch.Tensor]:
+        """Encode without loss computation. Returns latents + skill weights."""
+        B, T, _ = x_batch.shape
+        device   = x_batch.device
+
+        h = self.recurrent.init_hidden(B, device)
+        h_list, o_list, w_list = [], [], []
+
+        for t in range(T):
+            w_t = self.skill_prior.soft_weights(h)
+            o_t, mu_t, _ = self.posterior.sample(x_batch[:, t], h)
+            h = self.recurrent(h, o_t, actions[:, t])
+            h_list.append(h)
+            o_list.append(o_t)
+            w_list.append(w_t)
+
+        return {
+            'o_seq': torch.stack(o_list, dim=1),    # (B, T, m)
+            'h_seq': torch.stack(h_list, dim=1),    # (B, T, d_h)
+            'w_seq': torch.stack(w_list, dim=1),    # (B, T, K) skill weights
+            'A_k':   self.koopman.get_A_k(),         # (K, m, m)
+            'B_k':   self.koopman.get_B_k(),         # (K, m, d_u)
+            'U':     self.koopman.U,                 # (m, m)
+        }
 
     @torch.no_grad()
     def rollout(
         self,
-        states:   torch.Tensor,  # (B, T_cond, ds)
-        actions:  torch.Tensor,  # (B, T_cond + horizon, da)
-        horizon:  int,
+        x_cond:  torch.Tensor,   # (B, T_cond, x_dim)  conditioning context
+        a_cond:  torch.Tensor,   # (B, T_cond, da)
+        a_plan:  torch.Tensor,   # (B, H, da)           planned actions
     ) -> Dict[str, torch.Tensor]:
         """
-        Closed-loop state prediction.
-        Uses given actions for ZOH transition.
-        Returns s_preds: (B, horizon, ds)
+        Closed-loop rollout in Koopman space.
+        Conditions on x_cond/a_cond, then rolls out for H steps.
+        Returns predicted x_t components (decoded from o_t).
         """
-        self.eval()
-        B = states.shape[0]
-        T_cond = states.shape[1]
+        B = x_cond.shape[0]
+        device = x_cond.device
 
-        # Encode last conditioning step
-        z = self.encoder(states)                                   # (B, T_cond, m)
-        z_cur = z[:, -1]                                           # (B, m)
+        # Condition
+        h = self.recurrent.init_hidden(B, device)
+        o = None
+        for t in range(x_cond.shape[1]):
+            o, mu, _ = self.posterior.sample(x_cond[:, t], h)
+            h = self.recurrent(h, o, a_cond[:, t])
 
-        s_preds = []
-        for t in range(horizon):
-            a_t = actions[:, T_cond + t] if (T_cond + t) < actions.shape[1] \
-                  else actions[:, -1]
-            # Propagate
-            B_U, B_V = self.koopman.get_B_clamped()
-            z_cur = propagate(z_cur, self.koopman.A, B_U, B_V, a_t,
-                              self.koopman.dt)
-            s_hat = symexp(self.decoder(z_cur))                    # (B, ds)
-            s_preds.append(s_hat)
+        # Rollout
+        o_preds, recon_preds = [], []
+        w = self.skill_prior.soft_weights(h)
+        for t in range(a_plan.shape[1]):
+            u = self.action_encoder(a_plan[:, t])
+            o_next, A_bar, B_bar = self.koopman(o, u, w)
+            o = o_next
+            h = self.recurrent(h, o, a_plan[:, t])
+            w = self.skill_prior.soft_weights(h)
+            o_preds.append(o)
+            recon_preds.append(self.decoder(o))
 
-        return {'s_preds': torch.stack(s_preds, dim=1)}
+        # Aggregate decoder outputs
+        result = {'o_preds': torch.stack(o_preds, dim=1)}
+        for key in ['delta_e', 'delta_p', 'q', 'qdot']:
+            result[key] = symexp(torch.stack([r[key] for r in recon_preds], dim=1))
 
-    @torch.no_grad()
-    def encode_trajectory(
-        self, states: torch.Tensor, actions: torch.Tensor
-    ) -> Dict[str, torch.Tensor]:
-        z       = self.encoder(states)
-        v_heads = self.tcn(states, actions)
-        eigvals = self.koopman.get_eigenvalues()
-        return {
-            'z':       z,
-            'v_heads': v_heads,
-            'A':       self.koopman.A,
-            'B_full':  self.koopman.get_B_full(),
-            'eigvals': eigvals,
-        }
+        return result

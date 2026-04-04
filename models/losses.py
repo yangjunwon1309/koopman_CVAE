@@ -1,245 +1,265 @@
 """
-losses.py — KODAC-S loss functions
-===================================
+losses.py — KODAQ Full RSSM-Koopman Loss Functions
+====================================================
 
-Architecture change from diagonal to Full A + Low-rank B:
+Document → Implementation mapping:
 
-  REMOVED assumptions:
-    - A = diag(lambda_k)  [exact eigenfunction basis]
-    - B = diag(beta_k^(l)) [no cross-mode coupling]
-    - Real Schur 2x2 block structure
-    - schur_block_propagate / schur_block_rollout
-    - KL divergence, reparameterization
+  L_rec   : Reconstruction of x_t = [Δe_t, Δp_t, q_t, q̇_t]
+             4 independent MLP heads, weighted by signal magnitude (α_j)
+  L_dyn   : Koopman Consistency — L2 regression (NOT KL)
+             ||μ_φ(x_{t+1}, h_{t+1}) - (Ā(w)·o_t + B̄(w)·u_t)||²
+  L_skill : Cross-entropy vs EXTRACT labels ĉ_t
+             -log p_θ(c_t = ĉ_t | h_t)
+  L_reg   : Posterior-prior alignment (stop-gradient on prior)
+             ||μ_φ(x_t, h_t) - sg(Ā(w_{t-1})·o_{t-1} + B̄(w_{t-1})·u_{t-1})||²
 
-  NEW structure:
-    - A in R^{m x m}: full learnable transition matrix
-    - B^(l) = U^(l) @ V^(l).T in R^{m x m}: low-rank per action dim
-    - ZOH: z_{t+1} = (I + M(a_t)*dt) z_t,  M = A + sum_l B^(l) a_l
-                     (1st-order Taylor; exact when dt is small)
-    - eigenvalue_stability_loss: penalize eigenvalues of A outside unit disk
-    - decorrelation_loss: off-diagonal cosine similarity (scale-invariant)
-    - reconstruction_loss: MSE in symlog space
-    - multistep_prediction_loss: multi-head observable h-step prediction
-
-All functions are self-contained (no import from koopman_cvae.py).
+All functions are pure (no nn.Module state).
+koopman_cvae.py delegates all loss computation here.
 """
 
 import torch
 import torch.nn.functional as F
-from typing import Tuple
+from typing import Optional
 
 
-# ─────────────────────────────────────────────────────────────
-# ZOH propagation: Full A + Low-rank B
-# ─────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# Symlog / Symexp  (scale compression for wide-range signals)
+# ──────────────────────────────────────────────────────────────────────────────
 
-def get_transition_matrix(
-    A: torch.Tensor,         # (m, m)
-    B_U: torch.Tensor,       # (da, m, r)
-    B_V: torch.Tensor,       # (da, m, r)
-    a: torch.Tensor,         # (batch, da)
-    dt: float,
+def symlog(x: torch.Tensor) -> torch.Tensor:
+    return torch.sign(x) * torch.log(torch.abs(x) + 1.0)
+
+
+def symexp(x: torch.Tensor) -> torch.Tensor:
+    return torch.sign(x) * (torch.exp(torch.abs(x)) - 1.0)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Skill-interpolated Koopman: log-eigenvalue space blending
+# ──────────────────────────────────────────────────────────────────────────────
+
+def blend_koopman(
+    log_lambdas: torch.Tensor,   # (K, m)  log-magnitude of eigenvalues per skill
+    thetas:      torch.Tensor,   # (K, m)  phase angles per skill
+    G_k:         torch.Tensor,   # (K, m, da)  skill-specific input coupling
+    U:           torch.Tensor,   # (m, m)  shared eigenbasis
+    w:           torch.Tensor,   # (B, K)  soft skill weights (sum=1)
+) -> tuple:
+    """
+    Skill-interpolated Koopman matrices in log-eigenvalue space.
+    Guarantees |λ̄_i| ≤ 1 when all |λ^(k)_i| ≤ 1.
+
+    Ā(w) = U · diag(exp(Σ_k w_k · log_λ_k) · e^{iθ̄}) · U⁻¹
+    B̄(w) = U · (Σ_k w_k · G_k)
+
+    Returns:
+        A_bar: (B, m, m)  blended transition
+        B_bar: (B, m, da) blended input coupling
+        r_bar: (B, m)     blended log-magnitudes
+        t_bar: (B, m)     blended phases
+    """
+    # Interpolate in log-eigenvalue space: (B, m)
+    r_bar = torch.einsum('bk,km->bm', w, log_lambdas)  # (B, m)
+    t_bar = torch.einsum('bk,km->bm', w, thetas)        # (B, m)
+
+    # Build diagonal complex eigenvalues in real form
+    # λ̄_i = exp(r̄_i) · e^{iθ̄_i}  → 2x2 rotation-scaling blocks
+    # We work in real-valued block-diagonal representation
+    # Λ̄ = diag(..., [exp(r)*cos(θ), -exp(r)*sin(θ);
+    #                  exp(r)*sin(θ),  exp(r)*cos(θ)], ...)
+    # For simplicity with full U: Ā = U Λ̄ U⁻¹ using complex representation
+    r_exp = torch.exp(r_bar)                            # (B, m) magnitudes
+
+    # Build Λ̄ as complex: (B, m) complex
+    lambdas_c = torch.complex(
+        r_exp * torch.cos(t_bar),
+        r_exp * torch.sin(t_bar),
+    )  # (B, m)
+
+    # Ā = U · diag(λ̄) · U⁻¹
+    # U: (m, m) real — treat as complex
+    U_c    = U.to(dtype=torch.complex64)                       # (m, m)
+    U_inv  = torch.linalg.inv(U_c)                            # (m, m)
+
+    # (B, m, m): batch diagonal
+    Lam    = torch.diag_embed(lambdas_c)                       # (B, m, m)
+    A_c    = U_c.unsqueeze(0) @ Lam @ U_inv.unsqueeze(0)      # (B, m, m)
+    A_bar  = A_c.real                                          # (B, m, m)
+
+    # B̄ = U · (Σ_k w_k G_k): (B, m, da)
+    G_mix  = torch.einsum('bk,kmd->bmd', w, G_k)              # (B, m, da)
+    B_bar  = U.unsqueeze(0) @ G_mix                           # (B, m, da)
+
+    return A_bar, B_bar, r_bar, t_bar
+
+
+def koopman_step(
+    o:     torch.Tensor,   # (B, m)  current lifted state
+    u:     torch.Tensor,   # (B, da) encoded action
+    A_bar: torch.Tensor,   # (B, m, m)
+    B_bar: torch.Tensor,   # (B, m, da)
 ) -> torch.Tensor:
     """
-    Compute F = I + M*dt  where  M = A + sum_l B^(l) a_l
-    B^(l) = B_U[l] @ B_V[l].T  (low-rank decomposition)
-
-    Returns F: (batch, m, m)
+    o_{t+1} = Ā(w) · o_t + B̄(w) · u_t
+    Returns: (B, m)
     """
-    m = A.shape[0]
-    device = A.device
-
-    # B^(l) = U^(l) @ V^(l).T -> (da, m, m)
-    B_full = torch.bmm(B_U, B_V.transpose(-1, -2))           # (da, m, m)
-
-    # sum_l B^(l) * a_l -> (batch, m, m)
-    Ba = torch.einsum('bl,lij->bij', a, B_full)               # (batch, m, m)
-
-    # M = A + Ba
-    M = A.unsqueeze(0) + Ba                                    # (batch, m, m)
-
-    # F = I + M*dt  (1st-order ZOH)
-    I = torch.eye(m, device=device).unsqueeze(0)              # (1, m, m)
-    F = I + M * dt                                             # (batch, m, m)
-    return F
+    return (A_bar @ o.unsqueeze(-1)).squeeze(-1) + \
+           (B_bar @ u.unsqueeze(-1)).squeeze(-1)
 
 
-def propagate(
-    z: torch.Tensor,         # (batch, m)
-    A: torch.Tensor,         # (m, m)
-    B_U: torch.Tensor,       # (da, m, r)
-    B_V: torch.Tensor,       # (da, m, r)
-    a: torch.Tensor,         # (batch, da)
-    dt: float,
+# ──────────────────────────────────────────────────────────────────────────────
+# L_rec: Weighted multi-head reconstruction
+# ──────────────────────────────────────────────────────────────────────────────
+
+def reconstruction_loss(
+    preds:   dict,          # {'delta_e': (B,T,2048), 'delta_p': (B,T,42),
+                            #  'q': (B,T,9), 'qdot': (B,T,9)}
+    targets: dict,          # same keys, same shapes
+    weights: dict,          # {'delta_e': α_e, 'delta_p': α_p, 'q': α_q, 'qdot': α_qd}
+) -> tuple:
+    """
+    L_rec = Σ_j α_j · MSE(x̂^(j), x^(j))
+
+    Returns (total_loss, {key: per_head_loss})
+    """
+    per_head = {}
+    total    = torch.tensor(0.0, device=next(iter(preds.values())).device)
+
+    for key in preds:
+        p = preds[key]
+        t = targets[key]
+        w = weights.get(key, 1.0)
+        loss = F.mse_loss(p, t)
+        per_head[key] = loss
+        total = total + w * loss
+
+    return total, per_head
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# L_dyn: Koopman Consistency (L2, NOT KL — avoids posterior collapse)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def koopman_consistency_loss(
+    mu_next:   torch.Tensor,   # (B, T-1, m)  posterior mean at t+1
+    o_pred:    torch.Tensor,   # (B, T-1, m)  Koopman prediction Ā·o_t + B̄·u_t
 ) -> torch.Tensor:
-    """Single-step ZOH: z_{t+1} = F(a) z_t"""
-    F = get_transition_matrix(A, B_U, B_V, a, dt)             # (batch, m, m)
-    return torch.bmm(F, z.unsqueeze(-1)).squeeze(-1)           # (batch, m)
+    """
+    L_dyn = ||μ_φ(x_{t+1}, h_{t+1}) - (Ā·o_t + B̄·u_t)||²
+
+    Regresses the posterior mean at t+1 onto the Koopman prediction.
+    Enforces linear dynamics structure without KL-induced collapse.
+    No stop_gradient here: gradient flows to both encoder and A/B matrices.
+    """
+    return F.mse_loss(mu_next, o_pred)
 
 
-def propagate_h_steps(
-    z: torch.Tensor,         # (BT, m)  flattened batch x time
-    A: torch.Tensor,         # (m, m)
-    B_U: torch.Tensor,       # (da, m, r)
-    B_V: torch.Tensor,       # (da, m, r)
-    a: torch.Tensor,         # (BT, da)  action at anchor time
-    dt: float,
-    h: int,
+# ──────────────────────────────────────────────────────────────────────────────
+# L_skill: Cross-entropy vs EXTRACT labels
+# ──────────────────────────────────────────────────────────────────────────────
+
+def skill_classification_loss(
+    logits: torch.Tensor,   # (B, T, K)  log p_θ(c_t | h_t)
+    labels: torch.Tensor,   # (B, T)     int64, EXTRACT cluster assignments
+    mask:   Optional[torch.Tensor] = None,  # (B, T) bool, valid timesteps
 ) -> torch.Tensor:
     """
-    h-step ZOH assuming constant action over [t, t+h*dt) (ZOH assumption).
-    F^h = (I + M*dt)^h via matrix power.
+    L_skill = -log p_θ(c_t = ĉ_t | h_t)
+            = CrossEntropy(logits, labels)
 
-    Returns z_pred: (BT, m)
+    mask: optionally exclude padding timesteps.
     """
-    F = get_transition_matrix(A, B_U, B_V, a, dt)             # (BT, m, m)
+    B, T, K = logits.shape
+    logits_flat = logits.reshape(B * T, K)
+    labels_flat = labels.reshape(B * T).long()
 
-    # F^h via repeated matmul (h is small, typically 1-5)
-    Fh = F
-    for _ in range(h - 1):
-        Fh = torch.bmm(Fh, F)
+    if mask is not None:
+        valid = mask.reshape(B * T)
+        logits_flat = logits_flat[valid]
+        labels_flat = labels_flat[valid]
 
-    return torch.bmm(Fh, z.unsqueeze(-1)).squeeze(-1)         # (BT, m)
+    return F.cross_entropy(logits_flat, labels_flat)
 
 
-# ─────────────────────────────────────────────────────────────
-# Eigenvalue stability loss (on full A)
-# ─────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# L_reg: Posterior-prior alignment (stop-gradient on prior)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def posterior_regularization_loss(
+    mu_t:   torch.Tensor,   # (B, T-1, m)  posterior mean at t (t=1..T-1)
+    o_pred: torch.Tensor,   # (B, T-1, m)  Koopman prior prediction at t
+                            #              = Ā(w_{t-1})·o_{t-1} + B̄(w_{t-1})·u_{t-1}
+) -> torch.Tensor:
+    """
+    L_reg = ||μ_φ(x_t, h_t) - sg(Ā(w_{t-1})·o_{t-1} + B̄(w_{t-1})·u_{t-1})||²
+
+    stop_gradient on the prior prediction prevents h_t drift.
+    Gradient flows only to the posterior encoder φ.
+    """
+    target = o_pred.detach()
+    return F.mse_loss(mu_t, target)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Stability: |λ^(k)_i| ≤ 1 via tanh parameterization (no additional loss needed)
+# But we add a soft penalty for monitoring and robustness
+# ──────────────────────────────────────────────────────────────────────────────
 
 def eigenvalue_stability_loss(
-    A: torch.Tensor,           # (m, m)
-    target_radius: float = 0.99,
-    margin: float = 0.01,
+    log_lambdas: torch.Tensor,   # (K, m)  log-magnitudes (should be ≤ 0 for stable)
+    margin: float = 0.0,
 ) -> torch.Tensor:
     """
-    Penalize eigenvalues of A whose modulus exceeds target_radius.
+    Soft penalty for log_lambdas > margin (i.e., |λ| > exp(margin)).
+    Since we use tanh(r)·e^{iθ}, |λ| = tanh(r) < 1 is guaranteed.
+    This loss monitors for near-boundary values and adds a soft push.
 
-    For full A (not necessarily symmetric), eigenvalues are complex.
-    We use torch.linalg.eigvals which returns complex eigenvalues.
-
-    Loss = mean over eigenvalues of ReLU(|lambda_k| - target_radius + margin)^2
-
-    This replaces the diagonal mu_k fixed constraint.
-    gradient flows through the real eigenvalue magnitudes.
-
-    Note: torch.linalg.eigvals is differentiable w.r.t. A.
+    With tanh parameterization this is primarily a diagnostic / light regularizer.
     """
-    # eigvals: complex (m,)
-    eigvals = torch.linalg.eigvals(A)
-    modulus = eigvals.abs()                                    # (m,) real
-
-    # Penalize moduli that exceed target_radius (soft margin)
-    excess = F.relu(modulus - (target_radius - margin))       # (m,)
+    # tanh(r) → log_lambda should be <= 0
+    # Penalize if log_lambda > margin (exp(margin) = target_radius > 1: forbidden)
+    excess = F.relu(log_lambdas - margin)
     return (excess ** 2).mean()
 
 
-def eigenvalue_diversity_loss(
-    A: torch.Tensor,           # (m, m)
-    sigma: float = 0.1,
-) -> torch.Tensor:
+# ──────────────────────────────────────────────────────────────────────────────
+# Combined loss (called from KoopmanCVAE._compute_losses)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def compute_total_loss(
+    loss_rec:   torch.Tensor,
+    loss_dyn:   torch.Tensor,
+    loss_skill: torch.Tensor,
+    loss_reg:   torch.Tensor,
+    loss_stab:  torch.Tensor,
+    lambda1: float,   # Koopman weight
+    lambda2: float,   # Skill supervision weight
+    lambda3: float,   # Posterior regularization weight
+    lambda4: float,   # Stability weight
+    phase:   int,     # 1: rec only, 2: +dyn+skill, 3: +reg
+) -> tuple:
     """
-    Penalize eigenvalues of A that are too close together (frequency collapse).
-    Replaces frequency repulsion loss on omega_k.
+    Phase-gated loss aggregation.
 
-    Loss = mean_{i != j} exp(-|lambda_i - lambda_j|^2 / sigma^2)
+    Phase 1 (warm-up) : L_rec only
+    Phase 2 (Koopman) : L_rec + λ1·L_dyn + λ2·L_skill
+    Phase 3 (full)    : L_rec + λ1·L_dyn + λ2·L_skill + λ3·L_reg
 
-    Uses complex eigenvalues directly.
+    Returns (total, weights_used_dict)
     """
-    eigvals = torch.linalg.eigvals(A)                         # (m,) complex
-    diff    = eigvals.unsqueeze(0) - eigvals.unsqueeze(1)     # (m, m) complex
-    dist_sq = diff.real**2 + diff.imag**2                     # (m, m) real
-    repul   = torch.exp(-dist_sq / (sigma**2 + 1e-8))
-    mask    = 1.0 - torch.eye(A.shape[0], device=A.device)
-    m       = A.shape[0]
-    return (repul * mask).sum() / max(m * (m - 1), 1)
+    total = loss_rec
 
+    if phase >= 2:
+        total = total + lambda1 * loss_dyn + lambda2 * loss_skill
+    if phase >= 3:
+        total = total + lambda3 * loss_reg
+    # Stability always active (lightweight)
+    total = total + lambda4 * loss_stab
 
-# ─────────────────────────────────────────────────────────────
-# Multi-head prediction loss
-# ─────────────────────────────────────────────────────────────
-
-def multistep_prediction_loss(
-    z: torch.Tensor,           # (B, T, m)  encoder output
-    v_heads: torch.Tensor,     # (B, T, Nh, m)  multi-head readout vectors
-    actions: torch.Tensor,     # (B, T, da)
-    A: torch.Tensor,           # (m, m)
-    B_U: torch.Tensor,         # (da, m, r)
-    B_V: torch.Tensor,         # (da, m, r)
-    dt: float,
-    H: int,
-) -> torch.Tensor:
-    """
-    Multi-head Koopman prediction loss.
-
-    For each anchor t, horizon h, head n:
-        g_pred^(n)(t+h) = v^(n)(t) · z_pred(t+h)
-                        = v^(n)(t) · F^h(a_t) z(t)
-
-        g_true^(n)(t+h) = v^(n)(t) · z(t+h)   [stop_gradient on z(t+h)]
-
-    Loss = mean over h, n of MSE(g_pred, g_true)
-
-    Jointly supervises: Phi (encoder), A, B_U, B_V, TCN heads W^(n).
-    """
-    B, T, m  = z.shape
-    Nh       = v_heads.shape[2]
-    H        = min(H, T - 1)
-
-    total = torch.tensor(0.0, device=z.device)
-
-    for h in range(1, H + 1):
-        T_anc = T - h
-        BT    = B * T_anc
-
-        # Flatten batch x time for vectorized matmul
-        z_anc   = z[:, :T_anc].reshape(BT, m)                 # (BT, m)
-        a_anc   = actions[:, :T_anc].reshape(BT, -1)          # (BT, da)
-        vh_anc  = v_heads[:, :T_anc].reshape(BT, Nh, m)       # (BT, Nh, m)
-
-        # h-step ZOH prediction
-        z_pred  = propagate_h_steps(z_anc, A, B_U, B_V,
-                                    a_anc, dt, h)              # (BT, m)
-
-        # Observable: g^(n) = v^(n) · z
-        # g_pred: (BT, Nh)
-        g_pred  = torch.bmm(vh_anc,
-                            z_pred.unsqueeze(-1)).squeeze(-1)  # (BT, Nh)
-
-        # Target: v^(n)(t) · z(t+h),  stop_gradient on z(t+h)
-        z_true  = z[:, h:].reshape(BT, m).detach()            # (BT, m)
-        g_true  = torch.bmm(vh_anc,
-                            z_true.unsqueeze(-1)).squeeze(-1)  # (BT, Nh)
-
-        total = total + F.mse_loss(g_pred, g_true)
-
-    return total / max(H, 1)
-
-
-# ─────────────────────────────────────────────────────────────
-# Reconstruction
-# ─────────────────────────────────────────────────────────────
-
-def reconstruction_loss(
-    pred: torch.Tensor,        # (..., dim)  symlog space
-    target: torch.Tensor,      # (..., dim)  symlog space
-) -> torch.Tensor:
-    return F.mse_loss(pred, target)
-
-
-# ─────────────────────────────────────────────────────────────
-# Decorrelation (scale-invariant, off-diagonal only)
-# ─────────────────────────────────────────────────────────────
-
-def decorrelation_loss(
-    z: torch.Tensor,           # (N, m)
-) -> torch.Tensor:
-    """
-    Off-diagonal cosine similarity penalty.
-    Bounded [0, 1], scale-invariant.
-    Prevents arbitrary linear transforms of z (gauge uniqueness).
-    """
-    N, m   = z.shape
-    z_norm = F.normalize(z, p=2, dim=0)                       # (N, m)
-    corr   = z_norm.T @ z_norm                                # (m, m)
-    mask   = 1.0 - torch.eye(m, device=z.device)
-    return (corr ** 2 * mask).sum() / max(m * (m - 1), 1)
+    return total, {
+        'rec':   1.0,
+        'dyn':   lambda1 if phase >= 2 else 0.0,
+        'skill': lambda2 if phase >= 2 else 0.0,
+        'reg':   lambda3 if phase >= 3 else 0.0,
+        'stab':  lambda4,
+    }
