@@ -229,17 +229,35 @@ def render_and_embed_r3m(
 
 
 
-def compute_r3m_diff(embeddings: np.ndarray) -> np.ndarray:
+def compute_r3m_diff(embeddings: np.ndarray,
+                     terminals: np.ndarray = None) -> np.ndarray:
     """
-    Δe_t = e_t - e_{t-1}  (EXTRACT 원본 방식).
-    t=0: Δe_0 = Δe_1
+    EXTRACT 논문 수식 (1): e_t = VLM(s_t) - VLM(s_1)
+    각 timestep에서 해당 episode의 첫 frame embedding을 뺀다.
+
+    → 초기 로봇/환경 위치의 영향 제거
+    → 'episode 시작 이후 얼마나 변했는가'를 표현
+    → 같은 행동이라면 초기 위치 무관하게 비슷한 embedding
+
+    terminals: (N,) bool. None이면 전체를 단일 episode로 처리.
     Returns (N, 2048)
     """
-    diff = np.diff(embeddings, axis=0)
-    diff = np.vstack([diff[0:1], diff])
-    print(f"R3M diff: {diff.shape}  "
-          f"mean_norm={np.linalg.norm(diff, axis=1).mean():.4f}")
-    return diff
+    N = len(embeddings)
+    out = np.zeros_like(embeddings)
+
+    if terminals is None:
+        # 단일 episode
+        out = embeddings - embeddings[0:1]
+    else:
+        ep_ends   = list(np.where(terminals)[0])
+        ep_starts = [0] + [e + 1 for e in ep_ends[:-1]]
+        for ep_s, ep_e in zip(ep_starts, ep_ends):
+            e1 = embeddings[ep_s]              # episode 첫 frame
+            out[ep_s:ep_e+1] = embeddings[ep_s:ep_e+1] - e1
+
+    print(f"R3M diff (e_t - e_1): {out.shape}  "
+          f"mean_norm={np.linalg.norm(out, axis=1).mean():.4f}")
+    return out
 
 
 # Kitchen D4RL observation layout (60-dim)
@@ -251,26 +269,38 @@ KITCHEN_OBJ_SLICE = slice(18, 60)   # 42-dim object states only
 
 
 def compute_state_diff(obs: np.ndarray,
+                       terminals: np.ndarray = None,
                        use_object_only: bool = True) -> np.ndarray:
     """
-    Δs_t = s_t - s_{t-1}.
+    EXTRACT 논문 방식 적용: s_t - s_1 (episode 첫 state 차분).
 
-    use_object_only=True: object states (dim 18~59) 만 사용.
-    qvel(dim 9~17)은 noise가 많아 cluster 구분을 방해.
-    object states는 subtask별로 독립적으로 변하므로 skill 경계가 명확.
+    연속 차분(s_t - s_{t-1}) 대신 episode 시작 기준 차분:
+    → 초기 로봇/물체 위치의 영향 제거
+    → 특정 subtask 수행 중 object state 변화량만 포착
 
-    t=0: Δs_0 = Δs_1 (EXTRACT footnote 방식)
+    use_object_only=True: object states (dim 18~59, 42-dim) 만 사용.
+    terminals: None이면 전체를 단일 episode로 처리.
     Returns (N, 42) if use_object_only else (N, 60)
     """
     if use_object_only:
         obs = obs[:, KITCHEN_OBJ_SLICE]   # (N, 42)
 
-    diff = np.diff(obs, axis=0)           # (N-1, d)
-    diff = np.vstack([diff[0:1], diff])   # (N, d)
-    print(f"State diff Δs_t: {diff.shape}  "
-          f"mean_norm={np.linalg.norm(diff, axis=1).mean():.4f}  "
-          f"std={diff.std(axis=0).mean():.4f}")
-    return diff
+    N   = len(obs)
+    out = np.zeros_like(obs, dtype=np.float64)
+
+    if terminals is None:
+        out = obs - obs[0:1]
+    else:
+        ep_ends   = list(np.where(terminals)[0])
+        ep_starts = [0] + [e + 1 for e in ep_ends[:-1]]
+        for ep_s, ep_e in zip(ep_starts, ep_ends):
+            s1 = obs[ep_s]                 # episode 첫 state
+            out[ep_s:ep_e+1] = obs[ep_s:ep_e+1] - s1
+
+    print(f"State diff (s_t - s_1): {out.shape}  "
+          f"mean_norm={np.linalg.norm(out, axis=1).mean():.4f}  "
+          f"std={out.std(axis=0).mean():.4f}")
+    return out.astype(np.float32)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -483,8 +513,10 @@ def run_extract_pipeline(
             env_name, model, transform,
             cfg.r3m_device,
             cache_path=cache)
-        r3m_diff   = compute_r3m_diff(embeddings)          # (N, 2048)
+        r3m_diff   = compute_r3m_diff(embeddings,
+                         terminals=terminals)               # (N, 2048)
         state_diff = compute_state_diff(obs,
+                         terminals=terminals,
                          use_object_only=True)              # (N, 42)
 
         # StandardScaler로 각각 정규화 후 concat
@@ -507,7 +539,8 @@ def run_extract_pipeline(
     else:
         print(f"Computing Δs_t "
               f"({'object states [18:60]' if cfg.use_object_only else 'full 60-dim'}) ...")
-        diff = compute_state_diff(obs, use_object_only=cfg.use_object_only)
+        diff = compute_state_diff(obs, terminals=terminals,
+                              use_object_only=cfg.use_object_only)
 
     km, raw_labels, logprobs = run_kmeans(
         diff, cfg.K, cfg.kmeans_n_init, cfg.kmeans_seed)
