@@ -43,7 +43,7 @@ ENV_CONFIGS = {
         'koopman_dim':  128,     # d_o: larger for high-dim x_t
         'gru_hidden':   256,     # d_h
         'action_latent': 64,     # d_u
-        'num_skills':   8,       # K (EXTRACT)
+        'num_skills':   7,       # K (EXTRACT)
         'mlp_hidden':   512,     # wider for 2108-dim input
         'enc_layers':   4,
         'dec_layers':   4,
@@ -71,7 +71,7 @@ ENV_CONFIGS = {
         'koopman_dim':  128,
         'gru_hidden':   256,
         'action_latent': 64,
-        'num_skills':   8,
+        'num_skills':   7,
         'mlp_hidden':   512,
         'enc_layers':   4,
         'dec_layers':   4,
@@ -95,7 +95,7 @@ ENV_CONFIGS = {
         'koopman_dim':  128,
         'gru_hidden':   256,
         'action_latent': 64,
-        'num_skills':   8,
+        'num_skills':   7,
         'mlp_hidden':   512,
         'enc_layers':   4,
         'dec_layers':   4,

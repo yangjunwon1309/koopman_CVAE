@@ -88,7 +88,7 @@ class KoopmanCVAEConfig:
     koopman_dim:  int   = 128    # d_o: lifted state dimension
     gru_hidden:   int   = 256    # d_h: GRU hidden state
     action_latent: int  = 64     # d_u: encoded action dimension
-    num_skills:   int   = 8      # K: number of skill components
+    num_skills:   int   = 7      # K: number of skill components
 
     # ── Architecture ──────────────────────────────────────────────────────────
     mlp_hidden:   int   = 256

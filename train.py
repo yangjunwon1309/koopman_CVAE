@@ -239,7 +239,7 @@ def parse_args():
     p.add_argument('--koopman_dim',   type=int,   default=None)
     p.add_argument('--gru_hidden',    type=int,   default=None)
     p.add_argument('--action_latent', type=int,   default=None)
-    p.add_argument('--num_skills',    type=int,   default=None)
+    p.add_argument('--num_skills',    type=int,   default=7)
     p.add_argument('--mlp_hidden',    type=int,   default=None)
     p.add_argument('--enc_layers',    type=int,   default=None)
     p.add_argument('--dec_layers',    type=int,   default=None)
