@@ -240,7 +240,8 @@ def plot_rollout_quality(model: KoopmanCVAE, samples: list, out_path: str,
     """
     from models.koopman_cvae import KoopmanCVAEConfig
     cfg    = model.cfg
-    dp_sl  = slice(cfg.dim_delta_e, cfg.dim_delta_e + cfg.dim_delta_p)
+    dp_sl = slice(cfg.dim_delta_e + cfg.dim_delta_p,
+              cfg.dim_delta_e + cfg.dim_delta_p + cfg.dim_q)
     q_sl   = slice(cfg.dim_delta_e + cfg.dim_delta_p,
                    cfg.dim_delta_e + cfg.dim_delta_p + cfg.dim_q)
 
