@@ -3,12 +3,19 @@ extract_skill_label.py
 =======================
 EXTRACT (CoRL 2024) 방식 skill labeling + KODAQ x_t 입력 구성.
 
-KODAQ §1.1 x_t 구성:
-  x_t = [Δe_t (2048), Δp_t (42), q_t (9), q̇_t (9)] ∈ ℝ^{2108}
+KODAQ §1.1 x_t 구성 (수정):
+  x_t = [Δe_t (2048), Δp_t (42), Δq_t (9), q̇_t (9)] ∈ ℝ^{2108}
   Δe_t = R3M(s_t) - R3M(s_1)   episode-first R3M diff
   Δp_t = p^obj_t - p^obj_1     episode-first object state diff (obs[18:60])
-  q_t  = obs[:, 0:9]            robot qpos
-  q̇_t  = obs[:, 9:18]           robot qvel
+  Δq_t = q_t - q_0             episode-first qpos diff (obs[0:9]) ← 변경
+  q̇_t  = obs[:, 9:18]          robot joint velocity (그대로)
+
+변경 이유:
+  - q_t 절대값은 에피소드마다 초기 구성이 달라 Koopman 학습 어려움
+  - Δq_t는 Δe_t, Δp_t와 동일한 episode-first 철학으로 일관성 확보
+  - gripper dim [7:9]은 translation (m) 단위 → 나머지 rad와 혼재하지만
+    Δ 처리로 스케일이 작아져 상대적으로 안정
+  - q̇_t는 그대로 유지 (velocity 정보 보존, alpha_qdot으로 weight 조절)
 
 EXTRACT pipeline:
   1. render_and_embed_r3m()  → R3M embeddings 캐시 (npz)
@@ -280,14 +287,43 @@ def compute_state_diff(
 # KODAQ x_t 구성  (§1.1 핵심)
 # ──────────────────────────────────────────────────────────────────────────────
 
+def compute_qpos_diff(
+    obs:       np.ndarray,   # (N, 60)
+    terminals: np.ndarray,   # (N,) bool
+) -> np.ndarray:
+    """
+    Δq_t = q_t - q_0   (episode-first qpos diff)
+
+    Δe_t, Δp_t와 동일한 episode-first 처리:
+    - 에피소드마다 초기 관절 구성(q_0)이 다른 bias 제거
+    - Koopman이 "초기 대비 변화량"을 선형 예측 → 절대값보다 훨씬 쉬움
+    - 스케일: max joint range ~2π rad → Δ는 보통 ±0.5 rad 이내
+
+    obs[0:7] : panda joint angle (rad)
+    obs[7:9] : gripper finger translation (m)  ← 단위 다르나 Δ처리로 스케일 완화
+    Returns (N, 9) float32
+    """
+    q   = obs[:, KITCHEN_QPOS_SLICE].astype(np.float32)   # (N, 9)
+    out = np.zeros_like(q)
+    ep_ends   = list(np.where(terminals)[0])
+    ep_starts = [0] + [e + 1 for e in ep_ends[:-1]]
+    for ep_s, ep_e in zip(ep_starts, ep_ends):
+        q0 = q[ep_s]
+        out[ep_s:ep_e+1] = q[ep_s:ep_e+1] - q0
+    norm = np.linalg.norm(out, axis=1).mean()
+    print(f"Δq_t (qpos diff): {out.shape}  mean_norm={norm:.4f}")
+    return out
+
+
 def build_x_sequence(
     obs:        np.ndarray,    # (N, 60)
     terminals:  np.ndarray,    # (N,) bool
     embeddings: Optional[np.ndarray] = None,  # (N, 2048) or None
 ) -> np.ndarray:
     """
-    x_t = [Δe_t (2048), Δp_t (42), q_t (9), q̇_t (9)] ∈ ℝ^{2108}
+    x_t = [Δe_t (2048), Δp_t (42), Δq_t (9), q̇_t (9)] ∈ ℝ^{2108}
 
+    Δq_t = q_t - q_0  (episode-first, 절대값 q_t 대신 사용)
     embeddings=None: Δe_t를 0으로 채움 (state-only 실험용)
     Returns: x_seq (N, 2108) float32
     """
@@ -295,23 +331,25 @@ def build_x_sequence(
 
     # Δe_t
     if embeddings is not None:
-        delta_e = compute_r3m_diff(embeddings, terminals)   # (N, 2048)
+        delta_e = compute_r3m_diff(embeddings, terminals)       # (N, 2048)
     else:
         print("embeddings=None → Δe_t set to zeros (state-only mode)")
         delta_e = np.zeros((N, DIM_DELTA_E), dtype=np.float32)
 
-    # Δp_t
+    # Δp_t: object state episode-first diff
     delta_p = compute_state_diff(obs, terminals, use_object_only=True)  # (N, 42)
 
-    # q_t, q̇_t
-    q_t    = obs[:, KITCHEN_QPOS_SLICE].astype(np.float32)   # (N, 9)
-    qdot_t = obs[:, KITCHEN_QVEL_SLICE].astype(np.float32)   # (N, 9)
+    # Δq_t: qpos episode-first diff  ← 변경 (절대값 q_t → Δq_t)
+    delta_q = compute_qpos_diff(obs, terminals)                 # (N, 9)
+
+    # q̇_t: joint velocity (그대로)
+    qdot_t  = obs[:, KITCHEN_QVEL_SLICE].astype(np.float32)    # (N, 9)
 
     # Concatenate → (N, 2108)
-    x_seq = np.concatenate([delta_e, delta_p, q_t, qdot_t], axis=1)
+    x_seq = np.concatenate([delta_e, delta_p, delta_q, qdot_t], axis=1)
     assert x_seq.shape[1] == X_DIM, f"x_dim mismatch: {x_seq.shape[1]} vs {X_DIM}"
     print(f"x_t built: {x_seq.shape}  (Δe={DIM_DELTA_E}, Δp={DIM_DELTA_P}, "
-          f"q={DIM_Q}, q̇={DIM_QDOT})")
+          f"Δq={DIM_Q}, q̇={DIM_QDOT})")
     return x_seq
 
 

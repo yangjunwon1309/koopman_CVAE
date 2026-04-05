@@ -16,5 +16,6 @@ from data.extract_skill_label import (
     save_cluster_data,
     compute_r3m_diff,
     compute_state_diff,
+    compute_qpos_diff,
     X_DIM, DIM_DELTA_E, DIM_DELTA_P, DIM_Q, DIM_QDOT,
 )

@@ -54,10 +54,12 @@ ENV_CONFIGS = {
         'lambda3':      0.1,     # L_reg
         'lambda4':      0.01,    # L_stab
         # Reconstruction head weights α_j
+        # Δq_t는 episode-first diff → 스케일 작고 안정 → weight 높여도 됨
+        # q̇_t는 velocity라 noisy → weight 낮춤
         'alpha_delta_e': 1.0,
         'alpha_delta_p': 2.0,
-        'alpha_q':       1.0,
-        'alpha_qdot':    0.5,
+        'alpha_q':       2.0,   # 절대값 q_t(1.0) → Δq_t는 더 신뢰 가능
+        'alpha_qdot':    0.2,   # velocity noisy → 0.5 → 0.2로 낮춤
     },
     'kitchen_partial': {
         'dim_delta_e':  DIM_DELTA_E,
@@ -80,8 +82,8 @@ ENV_CONFIGS = {
         'lambda4':      0.01,
         'alpha_delta_e': 1.0,
         'alpha_delta_p': 2.0,
-        'alpha_q':       1.0,
-        'alpha_qdot':    0.5,
+        'alpha_q':       2.0,
+        'alpha_qdot':    0.2,
     },
     'kitchen_mixed': {
         'dim_delta_e':  DIM_DELTA_E,
@@ -104,8 +106,8 @@ ENV_CONFIGS = {
         'lambda4':      0.01,
         'alpha_delta_e': 1.0,
         'alpha_delta_p': 2.0,
-        'alpha_q':       1.0,
-        'alpha_qdot':    0.5,
+        'alpha_q':       2.0,
+        'alpha_qdot':    0.2,
     },
 
     # ── Adroit (state-only mode: Δe_t = 0, x_dim = 2108 with zero R3M block) ─
