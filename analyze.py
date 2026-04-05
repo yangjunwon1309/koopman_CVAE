@@ -26,6 +26,8 @@ from pathlib import Path
 
 from models.koopman_cvae import KoopmanCVAE, KoopmanCVAEConfig
 from data.extract_skill_label import load_x_sequences, load_cluster_data
+from models.losses import symexp
+
 
 PAL = ['#E53935','#1E88E5','#43A047','#FB8C00',
        '#8E24AA','#00ACC1','#FFB300','#6D4C41','#546E7A','#D81B60']
@@ -236,20 +238,23 @@ def plot_rollout_quality(model: KoopmanCVAE, samples: list, out_path: str,
     각 에피소드에서:
       - 처음 cond_len 스텝으로 conditioning
       - 이후 horizon 스텝 rollout
-      - predicted vs true: Δp_t (42-dim → PCA 1D), q_t (9-dim → mean)
+      - predicted vs true:
+          left  : Δq_t (9-dim qpos diff, mean across joints)
+          right  : q̇_t  (9-dim joint velocity, mean across joints)
+    x_t layout: [Δe(2048) | Δp(42) | Δq(9) | q̇(9)]
     """
-    from models.koopman_cvae import KoopmanCVAEConfig
-    cfg    = model.cfg
-    dp_sl = slice(cfg.dim_delta_e + cfg.dim_delta_p,
-              cfg.dim_delta_e + cfg.dim_delta_p + cfg.dim_q)
-    q_sl   = slice(cfg.dim_delta_e + cfg.dim_delta_p,
-                   cfg.dim_delta_e + cfg.dim_delta_p + cfg.dim_q)
+    cfg = model.cfg
+    # x_t 슬롯 정의
+    dq_sl  = slice(cfg.dim_delta_e + cfg.dim_delta_p,
+                   cfg.dim_delta_e + cfg.dim_delta_p + cfg.dim_q)        # Δq_t (9)
+    qd_sl  = slice(cfg.dim_delta_e + cfg.dim_delta_p + cfg.dim_q,
+                   cfg.dim_delta_e + cfg.dim_delta_p + cfg.dim_q + cfg.dim_qdot)  # q̇_t (9)
 
     n   = len(samples)
     fig, axes = plt.subplots(n, 2, figsize=(14, 3 * n))
     if n == 1: axes = axes.reshape(1, 2)
 
-    rmse_dp_list, rmse_q_list = [], []
+    rmse_dq_list, rmse_qd_list = [], []
 
     for i, samp in enumerate(samples):
         x, a = samp['x'], samp['a']
@@ -266,45 +271,43 @@ def plot_rollout_quality(model: KoopmanCVAE, samples: list, out_path: str,
         # Rollout
         pred = model.rollout(x_cond, a_cond, a_plan)
 
-        # Δp_t: mean across 42 dims
-        dp_pred = pred['delta_p'][0].cpu().numpy()     # (H, 42)
-        dp_true = x_true[:, dp_sl]                     # (H, 42)
-        dp_pred_m = dp_pred.mean(axis=1)
-        dp_true_m = dp_true.mean(axis=1)
+        # Δq_t: predicted vs true  (9-dim → mean across joints)
+        dq_pred   = pred['q'][0].cpu().numpy()      # (H, 9)  decoder 'q' head = Δq
+        dq_true   = x_true[:, dq_sl]               # (H, 9)
+        dq_pred_m = dq_pred.mean(axis=1)
+        dq_true_m = dq_true.mean(axis=1)
 
-        # q_t: mean across 9 dims
-        q_pred  = pred['q'][0].cpu().numpy()           # (H, 9)
-        q_true  = x_true[:, q_sl]                      # (H, 9)
-        q_pred_m = q_pred.mean(axis=1)
-        q_true_m = q_true.mean(axis=1)
+        # q̇_t: predicted vs true  (9-dim → mean across joints)
+        qd_pred   = pred['qdot'][0].cpu().numpy()   # (H, 9)
+        qd_true   = x_true[:, qd_sl]               # (H, 9)
+        qd_pred_m = qd_pred.mean(axis=1)
+        qd_true_m = qd_true.mean(axis=1)
 
-        rmse_dp = np.sqrt(((dp_pred - dp_true)**2).mean())
-        rmse_q  = np.sqrt(((q_pred  - q_true)**2).mean())
-        rmse_dp_list.append(rmse_dp)
-        rmse_q_list.append(rmse_q)
+        rmse_dq = np.sqrt(((dq_pred - dq_true)**2).mean())
+        rmse_qd = np.sqrt(((qd_pred - qd_true)**2).mean())
+        rmse_dq_list.append(rmse_dq)
+        rmse_qd_list.append(rmse_qd)
 
         ts = np.arange(horizon)
 
-        # Δp
+        # Δq_t plot
         ax = axes[i, 0]
-        ax.plot(ts, dp_true_m, 'k-',  lw=1.5, label='true')
-        ax.plot(ts, dp_pred_m, '--',  lw=1.5, color=PAL[i % len(PAL)], label='pred')
+        ax.plot(ts, dq_true_m, 'k-', lw=1.5, label='true')
+        ax.plot(ts, dq_pred_m, '--', lw=1.5, color=PAL[i % len(PAL)], label='pred')
         ax.axvline(0, color='gray', lw=0.8, linestyle=':')
-        ax.set_title(f'Ep {i}  Δp_t (obj state mean)  RMSE={rmse_dp:.4f}',
-                     fontsize=8)
+        ax.set_title(f'Ep {i}  Δq_t (qpos diff mean)  RMSE={rmse_dq:.4f}', fontsize=8)
         ax.set_xlabel('rollout step', fontsize=8)
         if i == 0: ax.legend(fontsize=7)
-        ax.spines[['top','right']].set_visible(False)
+        ax.spines[['top', 'right']].set_visible(False)
 
-        # q_t
+        # q̇_t plot
         ax = axes[i, 1]
-        ax.plot(ts, q_true_m, 'k-',  lw=1.5, label='true')
-        ax.plot(ts, q_pred_m, '--',  lw=1.5, color=PAL[i % len(PAL)], label='pred')
-        ax.set_title(f'Ep {i}  q_t (qpos mean)  RMSE={rmse_q:.4f}',
-                     fontsize=8)
+        ax.plot(ts, qd_true_m, 'k-', lw=1.5, label='true')
+        ax.plot(ts, qd_pred_m, '--', lw=1.5, color=PAL[i % len(PAL)], label='pred')
+        ax.set_title(f'Ep {i}  q̇_t (joint vel mean)  RMSE={rmse_qd:.4f}', fontsize=8)
         ax.set_xlabel('rollout step', fontsize=8)
         if i == 0: ax.legend(fontsize=7)
-        ax.spines[['top','right']].set_visible(False)
+        ax.spines[['top', 'right']].set_visible(False)
 
     fig.suptitle(f'Rollout Quality  (cond={cond_len} steps → pred {horizon} steps)',
                  fontsize=11, fontweight='bold')
@@ -314,8 +317,8 @@ def plot_rollout_quality(model: KoopmanCVAE, samples: list, out_path: str,
     print(f"Saved: {out_path}")
 
     print(f"\n=== Rollout RMSE (horizon={horizon}) ===")
-    print(f"  Δp_t: {np.mean(rmse_dp_list):.4f} ± {np.std(rmse_dp_list):.4f}")
-    print(f"  q_t:  {np.mean(rmse_q_list):.4f} ± {np.std(rmse_q_list):.4f}")
+    print(f"  Δq_t: {np.mean(rmse_dq_list):.4f} ± {np.std(rmse_dq_list):.4f}")
+    print(f"  q̇_t:  {np.mean(rmse_qd_list):.4f} ± {np.std(rmse_qd_list):.4f}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
