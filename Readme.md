@@ -111,12 +111,12 @@ Given a goal observation $x_\text{goal}$, KODAQ plans an optimal latent trajecto
 ### Optimal Control Derivation
 
 The LQR cost over the Koopman dynamics is:
-
-$$J = \sum_{t=0}^{H} \left[(z_t - z^{*})^{\top} Q (z_t - z^{*}) + u_t^{\top} R\, u_t\right]$$
-
-Solving the Bellman equation without assuming z* is an equilibrium point yields:
-
-$$u_t^{*} = \underbrace{(R + \bar{B}^{\top} P \bar{B})^{-1} \bar{B}^{\top} P}_{M}\, z^{*} - \underbrace{(R + \bar{B}^{\top} P \bar{B})^{-1} \bar{B}^{\top} P \bar{A}}_{L}\, z_t = M z^{*} - L z_t$$
+ 
+$$J = \sum_{t=0}^{H} \left[(z_t - z^*)^\top Q (z_t - z^*) + u_t^\top R\, u_t\right]$$
+ 
+Solving the Bellman equation without assuming $z^*$ is an equilibrium point yields:
+ 
+$$u_t^* = \underbrace{(R + \bar{B}^\top P \bar{B})^{-1} \bar{B}^\top P}_{M}\, z^* - \underbrace{(R + \bar{B}^\top P \bar{B})^{-1} \bar{B}^\top P \bar{A}}_{L}\, z_t = M z^* - L z_t$$
 
 where $P$ satisfies the DARE:
 
