@@ -290,8 +290,7 @@ class KODAQLQRPlanner:
 
         for t in range(horizon):
             u_t    = self._lqr_u(o_cur, o_star, L_cur, M_cur)
-            with torch.enable_grad():
-                a_t    = self._decode_action(u_t)
+            a_t    = self._decode_action(u_t)
             o_next = self._step(o_cur, u_t, A_cur, B_cur)
             h_next = model.recurrent(h_cur, o_cur, a_t)
             w_next = model.skill_prior.soft_weights(h_next)
@@ -536,128 +535,228 @@ def run_lqr_on_episodes(
     unc_real_len: int = 8,
     device:       str = 'cuda',
 ) -> List[Dict]:
+    """
+    각 에피소드를 reward jump 기준으로 단계별 LQR로 실행.
+
+    단계 구조:
+      stage 0: t=0        → t=jump_0   (sub-goal: obs[jump_0])
+      stage 1: t=jump_0   → t=jump_1   (sub-goal: obs[jump_1])
+      ...
+      stage N: t=jump_{N-1} → ep_end   (sub-goal: obs[ep_end])
+
+    각 단계:
+      - conditioning: 해당 단계 시작 시점 앞 cond_len 스텝
+      - goal: 해당 단계의 reward jump 시점 obs
+      - horizon: 해당 단계 길이 (min(jump_t - start_t, horizon)로 clamp)
+      - uncertainty: 해당 구간의 실제 action으로 계산
+    """
     dev     = torch.device(device)
     results = []
 
     for ep_idx, ep in enumerate(episodes):
         L, obs_ep, acts_ep = ep['length'], ep['obs'], ep['actions']
         gi    = ep['goal_info']
-        tasks = ep['tasks']   # 실제 완료된 task만
+        tasks = ep['tasks']
         s, e  = ep['start_t'], ep['end_t']
-        x_ep  = x_seq_full[s:e+1]
+        x_ep  = x_seq_full[s:e+1]   # (L, 2108)
 
-        if L < cond_len + horizon + 4:
+        if L < cond_len + 4:
             continue
 
-        # task 미완료 에피소드 스킵
         if not tasks:
-            print(f"Ep {ep_idx}  len={L}  tasks=[]  → skip (no completed tasks)")
+            print(f"Ep {ep_idx}  len={L}  → skip (no completed tasks)")
             continue
 
-        print(f"\nEp {ep_idx}  len={L}  "
-              f"completed_tasks={tasks}  "
-              f"reward_total={gi['reward_total']:.0f}  "
-              f"n_completed={gi['n_completed']}")
-        print(f"  Completions: { {t: v for t, v in gi['completions'].items()} }")
+        # ── Sub-goal 시퀀스 구성 ────────────────────────────────────────────
+        # reward jump 시점을 순서대로 정렬 → 각 단계의 goal timestep
+        jump_timesteps = sorted(gi['completions'].values())   # [t1, t2, ...]
+        # 마지막 단계는 에피소드 끝
+        stage_ends = jump_timesteps + [L - 1]
 
-        # Goal 목록 구성
-        goals = []
+        print(f"\nEp {ep_idx}  len={L}  tasks={tasks}  "
+              f"reward={gi['reward_total']:.0f}  stages={len(stage_ends)}")
+        print(f"  Sub-goal timesteps: {stage_ends}")
 
-        # 1. Final goal: 에피소드 마지막 obs (모든 완료 task 반영)
-        goals.append(('final', obs_to_x_goal(gi['final_goal'], obs_ep[0]),
-                      gi['final_goal']))
+        ep_result = {
+            'ep_idx':       ep_idx,
+            'tasks':        tasks,
+            'reward_total': gi['reward_total'],
+            'stages':       [],              # per-stage plan results
+            'full_o_traj':  [],              # concatenated Koopman trajectory
+            'full_a_traj':  [],              # concatenated decoded actions
+            'full_x_traj':  [],              # concatenated decoded x_t
+            'full_costs':   [],
+            'full_sigma2':  [],
+            'full_true_x':  [],
+        }
 
-        # 2. 각 subtask goal: 완료 순서대로 (cond_len 이후 완료된 것만)
-        completed_after_cond = sorted(
-            [(t, ti['timestep']) for t, ti in gi['subtask_goals'].items()
-             if ti['completed'] and ti['timestep'] > cond_len],
-            key=lambda x: x[1]
-        )
-        for task_name, comp_t in completed_after_cond[:1]:  # 첫 subtask만
-            sub_obs = gi['subtask_goals'][task_name]['obs']
-            goals.append((f'{task_name}@t={comp_t}',
-                          obs_to_x_goal(sub_obs, obs_ep[0]),
-                          sub_obs))
+        stage_start = 0   # 현재 단계 시작 (에피소드 내 상대 인덱스)
 
-        for goal_name, x_goal_np, _ in goals:
-            x_cond   = torch.FloatTensor(x_ep[:cond_len]).unsqueeze(0).to(dev)
-            a_cond   = torch.FloatTensor(acts_ep[:cond_len]).unsqueeze(0).to(dev)
+        for stage_idx, stage_end_t in enumerate(stage_ends):
+            # ── Conditioning 구간 ──────────────────────────────────────────
+            # cond 시작: stage_start에서 cond_len만큼 앞으로, 음수 방지
+            cond_start = max(0, stage_start - cond_len)
+            cond_end   = stage_start   # 마지막 conditioning step (exclusive)
+
+            # cond가 너무 짧으면 시작점부터
+            actual_cond = cond_end - cond_start
+            if actual_cond < 1:
+                cond_start = 0
+                cond_end   = min(cond_len, stage_end_t)
+
+            # ── Stage horizon ──────────────────────────────────────────────
+            stage_len    = stage_end_t - max(stage_start, cond_end)
+            stage_horizon = max(1, min(stage_len, horizon))
+
+            if stage_horizon < 2:
+                stage_start = stage_end_t + 1
+                continue
+
+            # ── Goal obs: 해당 단계 완료 시점의 obs ──────────────────────
+            goal_obs   = obs_ep[stage_end_t]
+            ref_obs    = obs_ep[0]                 # episode-first 기준
+            x_goal_np  = obs_to_x_goal(goal_obs, ref_obs)
+            goal_label = (tasks[stage_idx] if stage_idx < len(tasks)
+                          else f'stage{stage_idx}')
+
+            # ── Tensors ────────────────────────────────────────────────────
+            cond_slice = slice(cond_start, cond_end) if cond_end > cond_start \
+                         else slice(0, min(cond_len, stage_end_t))
+            x_cond = torch.FloatTensor(
+                x_ep[cond_slice]).unsqueeze(0).to(dev)
+            a_cond = torch.FloatTensor(
+                acts_ep[cond_slice]).unsqueeze(0).to(dev)
             x_goal_t = torch.FloatTensor(x_goal_np).unsqueeze(0).to(dev)
-            real_a   = torch.FloatTensor(
-                acts_ep[cond_len:min(cond_len + unc_real_len, L)]).to(dev)
 
-            plan = planner.plan(x_cond, a_cond, x_goal_t, horizon=horizon,
-                                real_actions=real_a, compute_uncertainty=True)
+            # uncertainty용 real actions: stage 구간의 실제 action
+            real_start = max(stage_start, cond_end)
+            real_end   = min(real_start + unc_real_len, stage_end_t + 1)
+            real_a     = torch.FloatTensor(
+                acts_ep[real_start:real_end]).to(dev)
 
-            true_x  = x_ep[cond_len:min(cond_len + horizon, L)]
-            H_c     = min(plan['x_traj'].shape[0], len(true_x))
-            pred_dq = plan['x_traj'][:H_c, X_DQ_START:X_DQ_END].cpu().numpy()
-            true_dq = true_x[:H_c, X_DQ_START:X_DQ_END]
-            rmse    = float(np.sqrt(((pred_dq - true_dq)**2).mean()))
+            # ── LQR plan ──────────────────────────────────────────────────
+            plan = planner.plan(
+                x_cond, a_cond, x_goal_t,
+                horizon=stage_horizon,
+                real_actions=real_a if len(real_a) > 0 else None,
+                compute_uncertainty=len(real_a) > 0,
+            )
 
-            print(f"  [{goal_name}] cost={plan['total_cost']:.4f}  "
-                  f"unc={plan['uncertainty']:.6f}  "
-                  f"pen={plan['penalized_cost']:.4f}  "
-                  f"RMSE_Δq={rmse:.4f}")
+            # ── True trajectory for this stage ────────────────────────────
+            true_start = max(stage_start, cond_end)
+            true_end   = min(true_start + stage_horizon, L)
+            true_x     = x_ep[true_start:true_end]
+            H_c        = min(plan['x_traj'].shape[0], len(true_x))
+            pred_dq    = plan['x_traj'][:H_c, X_DQ_START:X_DQ_END].cpu().numpy()
+            true_dq    = true_x[:H_c, X_DQ_START:X_DQ_END]
+            rmse       = float(np.sqrt(((pred_dq - true_dq)**2).mean()))
 
-            results.append({
-                'ep_idx':      ep_idx,
-                'goal_name':   goal_name,
+            unc = plan.get('uncertainty', 0.0)
+            pen = plan.get('penalized_cost', plan['total_cost'])
+            print(f"  Stage {stage_idx} [{goal_label}@t={stage_end_t}]  "
+                  f"horizon={stage_horizon}  "
+                  f"cost={plan['total_cost']:.3f}  "
+                  f"unc={unc:.5f}  pen={pen:.3f}  RMSE_Δq={rmse:.4f}")
+
+            stage_res = {
+                'stage_idx':   stage_idx,
+                'goal_label':  goal_label,
+                'goal_t':      stage_end_t,
+                'horizon':     stage_horizon,
                 'plan':        plan,
                 'true_x':      true_x,
                 'rmse_dq':     rmse,
-                'tasks':       tasks,
-                'completions': gi['completions'],
-                'reward_total': gi['reward_total'],
-            })
+            }
+            ep_result['stages'].append(stage_res)
+
+            # Full trajectory 누적
+            ep_result['full_o_traj'].append(plan['o_traj'].cpu())
+            ep_result['full_a_traj'].append(plan['a_traj'].cpu())
+            ep_result['full_x_traj'].append(plan['x_traj'].cpu())
+            ep_result['full_costs'].extend(plan['costs'].tolist())
+            ep_result['full_true_x'].append(torch.FloatTensor(true_x))
+            if plan.get('sigma2_t') is not None:
+                ep_result['full_sigma2'].extend(plan['sigma2_t'].tolist())
+
+            stage_start = stage_end_t + 1
+
+        # Concatenate full trajectory
+        if ep_result['full_o_traj']:
+            ep_result['full_o_traj'] = torch.cat(ep_result['full_o_traj'], 0)
+            ep_result['full_a_traj'] = torch.cat(ep_result['full_a_traj'], 0)
+            ep_result['full_x_traj'] = torch.cat(ep_result['full_x_traj'], 0)
+            ep_result['full_true_x'] = torch.cat(ep_result['full_true_x'], 0)
+            ep_result['full_costs']  = np.array(ep_result['full_costs'])
+            ep_result['full_sigma2'] = np.array(ep_result['full_sigma2']) \
+                                       if ep_result['full_sigma2'] else None
+
+            total_cost = float(ep_result['full_costs'].sum())
+            all_rmse   = [st['rmse_dq'] for st in ep_result['stages']]
+            print(f"  → Episode total_cost={total_cost:.3f}  "
+                  f"mean_RMSE={np.mean(all_rmse):.4f}")
+
+        results.append(ep_result)
+
     return results
 
 
-def visualize_lqr_results(results: List[Dict], out_dir: str = 'checkpoints/kodaq/lqr'):
+def visualize_lqr_results(results, out_dir='checkpoints/kodaq/lqr'):
     import matplotlib; matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     PAL = ['#E53935','#1E88E5','#43A047','#FB8C00','#8E24AA','#00ACC1','#FFB300']
     Path(out_dir).mkdir(parents=True, exist_ok=True)
 
-    for i, res in enumerate(results):
-        plan    = res['plan']
-        true_x  = res['true_x']
-        x_traj  = plan['x_traj'].cpu().numpy()
-        sig2    = plan.get('sigma2_t', None)
-        H       = x_traj.shape[0] - 1
+    for res in results:
+        ep_idx = res['ep_idx']
+        stages = res['stages']
+        if not stages:
+            continue
+        n = len(stages)
+        fig, axes = plt.subplots(n, 3, figsize=(16, 3.5 * max(n, 1)), squeeze=False)
 
-        fig, axes = plt.subplots(1, 3, figsize=(16, 4))
+        for si, stage in enumerate(stages):
+            plan   = stage['plan']
+            true_x = stage['true_x']
+            x_traj = plan['x_traj'].cpu().numpy()
+            sig2   = plan.get('sigma2_t', None)
+            H      = x_traj.shape[0] - 1
+            col    = PAL[si % len(PAL)]
 
-        axes[0].plot(plan['costs'], color=PAL[i % len(PAL)], lw=1.5)
-        axes[0].set_title(f"LQR Cost  total={plan['total_cost']:.3f}", fontsize=9)
-        axes[0].set_xlabel('step')
-        axes[0].spines[['top','right']].set_visible(False)
+            ax = axes[si, 0]
+            ax.plot(plan['costs'], color=col, lw=1.5)
+            ax.set_title(
+                f"Stage {si} [{stage['goal_label']}@t={stage['goal_t']}]"
+                f"\ncost={plan['total_cost']:.3f}", fontsize=8)
+            ax.set_xlabel('step')
+            ax.spines[['top','right']].set_visible(False)
 
-        dq_pred = x_traj[:, X_DQ_START:X_DQ_END].mean(1)
-        H_c     = min(H+1, len(true_x))
-        dq_true = true_x[:H_c, X_DQ_START:X_DQ_END].mean(1)
-        axes[1].plot(dq_pred, '--', color=PAL[i%len(PAL)], lw=1.5, label='pred')
-        axes[1].plot(np.arange(H_c), dq_true, 'k-', lw=1.5, label='true')
-        axes[1].set_title(f"Δq_t mean  RMSE={res['rmse_dq']:.4f}", fontsize=9)
-        axes[1].legend(fontsize=7)
-        axes[1].spines[['top','right']].set_visible(False)
+            ax = axes[si, 1]
+            dq_p = x_traj[:, X_DQ_START:X_DQ_END].mean(1)
+            Hc   = min(H + 1, len(true_x))
+            dq_t = true_x[:Hc, X_DQ_START:X_DQ_END].mean(1)
+            ax.plot(dq_p, '--', color=col, lw=1.5, label='pred')
+            ax.plot(np.arange(Hc), dq_t, 'k-', lw=1.5, label='true')
+            ax.set_title(f"Dq_t mean  RMSE={stage['rmse_dq']:.4f}", fontsize=8)
+            ax.legend(fontsize=7)
+            ax.spines[['top','right']].set_visible(False)
 
-        if sig2 is not None:
-            axes[2].fill_between(np.arange(len(sig2)), 0, sig2,
-                                 alpha=0.4, color=PAL[i%len(PAL)])
-            axes[2].plot(sig2, color=PAL[i%len(PAL)], lw=1.5)
-            axes[2].set_title(f"σ²_t  U={plan['uncertainty']:.5f}", fontsize=9)
-        axes[2].spines[['top','right']].set_visible(False)
+            ax = axes[si, 2]
+            if sig2 is not None:
+                ax.fill_between(np.arange(len(sig2)), 0, sig2, alpha=0.4, color=col)
+                ax.plot(sig2, color=col, lw=1.5)
+                ax.set_title(f"sigma2_t  U={plan.get('uncertainty', 0.0):.5f}", fontsize=8)
+            else:
+                ax.set_title("Uncertainty N/A", fontsize=8)
+            ax.spines[['top','right']].set_visible(False)
 
-        gname = res['goal_name'].replace('/','_').replace(' ','_').replace('@','_')
+        tc = float(res['full_costs'].sum()) if isinstance(res['full_costs'], np.ndarray)              else sum(st['plan']['total_cost'] for st in stages)
+        mr = np.mean([st['rmse_dq'] for st in stages])
         fig.suptitle(
-            f"Ep{res['ep_idx']}  Goal: {res['goal_name']}\n"
-            f"Completed:{res['tasks']}  reward={res.get('reward_total',0):.0f}"
-            f"  Pen:{plan['penalized_cost']:.4f}",
-            fontsize=8, fontweight='bold'
-        )
+            f"Ep {ep_idx}  Tasks:{res['tasks']}  reward={res['reward_total']:.0f}\n"
+            f"TotalCost={tc:.3f}  MeanRMSE={mr:.4f}",
+            fontsize=9, fontweight='bold')
         plt.tight_layout()
-        out = f"{out_dir}/ep{res['ep_idx']}_{gname}.png"
+        out = f"{out_dir}/ep{ep_idx}_sequential.png"
         plt.savefig(out, dpi=130, bbox_inches='tight')
         plt.close()
         print(f"Saved: {out}")
@@ -672,14 +771,13 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument('--ckpt',       default='checkpoints/kodaq_v3/final.pt')
     p.add_argument('--x_cache',    default='checkpoints/skill_pretrain/x_sequences.npz')
-    p.add_argument('--quality',    default='mixed',
-                   choices=['mixed','partial','complete'])
+    p.add_argument('--quality',    default='mixed', choices=['mixed','partial','complete'])
     p.add_argument('--n_ep',       type=int,   default=5)
     p.add_argument('--cond_len',   type=int,   default=16)
     p.add_argument('--horizon',    type=int,   default=32)
     p.add_argument('--unc_len',    type=int,   default=8)
     p.add_argument('--Q_scale',    type=float, default=1.0)
-    p.add_argument('--R_scale',    type=float, default=0.1)
+    p.add_argument('--R_scale',    type=float, default=10.0)
     p.add_argument('--lambda_unc', type=float, default=0.1)
     p.add_argument('--out_dir',    default='checkpoints/kodaq/lqr')
     p.add_argument('--device',     default='cuda' if torch.cuda.is_available() else 'cpu')
@@ -699,7 +797,7 @@ def main():
     print(f"x_seq: {x_seq_full.shape}")
 
     episodes, _ = load_kitchen_episodes(quality=args.quality,
-                                        min_len=args.cond_len + args.horizon + 4)
+                                        min_len=args.cond_len + 8)
     episodes = episodes[:args.n_ep]
 
     results = run_lqr_on_episodes(
@@ -707,19 +805,15 @@ def main():
         cond_len=args.cond_len, horizon=args.horizon,
         unc_real_len=args.unc_len, device=args.device)
 
-    if results:
-        costs = [r['plan']['total_cost']     for r in results]
-        uncs  = [r['plan']['uncertainty']    for r in results]
-        pens  = [r['plan']['penalized_cost'] for r in results]
-        rmses = [r['rmse_dq']               for r in results]
-        print(f"\n=== Summary ({len(results)} plans) ===")
-        print(f"  cost:      {np.mean(costs):.4f} ± {np.std(costs):.4f}")
-        print(f"  unc:       {np.mean(uncs):.6f} ± {np.std(uncs):.6f}")
-        print(f"  penalized: {np.mean(pens):.4f} ± {np.std(pens):.4f}")
-        print(f"  RMSE_Δq:   {np.mean(rmses):.4f} ± {np.std(rmses):.4f}")
+    all_costs = [st['plan']['total_cost'] for r in results for st in r['stages']]
+    all_rmse  = [st['rmse_dq']           for r in results for st in r['stages']]
+    if all_costs:
+        print(f"\n=== Summary ({len(results)} eps, {len(all_costs)} stages) ===")
+        print(f"  stage cost: {np.mean(all_costs):.4f} +/- {np.std(all_costs):.4f}")
+        print(f"  RMSE_Dq:    {np.mean(all_rmse):.4f} +/- {np.std(all_rmse):.4f}")
 
     visualize_lqr_results(results, args.out_dir)
-    print(f"\nDone. → {args.out_dir}/")
+    print(f"\nDone. -> {args.out_dir}/")
 
 
 if __name__ == '__main__':
