@@ -161,7 +161,7 @@ results = run_lqr_on_episodes(planner, episodes, x_seq_full,
 
 ## Rollout Uncertainty Estimation
 
-To assess the reliability of model-based trajectories for offline RL, KODAQ computes a **variance-based uncertainty penalty** over a family of mixed real?“model trajectories.
+To assess the reliability of model-based trajectories for offline RL, KODAQ computes a **variance-based uncertainty penalty** over a family of mixed real?ï¿½model trajectories.
 
 ### Construction
 
@@ -230,16 +230,16 @@ pip install h5py scipy scikit-learn matplotlib
 
 ```
 koopman_CVAE/
-?œâ??€ models/
-??  ?œâ??€ koopman_cvae.py     # KODAQ RSSM-Koopman model
-??  ?”â??€ losses.py           # All loss functions (pure functions)
-?œâ??€ data/
-??  ?œâ??€ extract_skill_label.py   # EXTRACT pipeline + x_t construction
-??  ?”â??€ dataset_utils.py         # KODAQWindowDataset
-?œâ??€ envs/
-??  ?”â??€ env_configs.py      # Environment-specific hyperparameters
-?œâ??€ train.py                # KODAQ training script
-?”â??€ lqr_planner.py          # LQR planning + uncertainty estimation
+?ï¿½ï¿½??ï¿½ models/
+??  ?ï¿½ï¿½??ï¿½ koopman_cvae.py     # KODAQ RSSM-Koopman model
+??  ?ï¿½ï¿½??ï¿½ losses.py           # All loss functions (pure functions)
+?ï¿½ï¿½??ï¿½ data/
+??  ?ï¿½ï¿½??ï¿½ extract_skill_label.py   # EXTRACT pipeline + x_t construction
+??  ?ï¿½ï¿½??ï¿½ dataset_utils.py         # KODAQWindowDataset
+?ï¿½ï¿½??ï¿½ envs/
+??  ?ï¿½ï¿½??ï¿½ env_configs.py      # Environment-specific hyperparameters
+?ï¿½ï¿½??ï¿½ train.py                # KODAQ training script
+?ï¿½ï¿½??ï¿½ lqr_planner.py          # LQR planning + uncertainty estimation
 ```
 
 ### Step 1: Skill Labeling
@@ -304,3 +304,5 @@ python lqr_planner.py \
 - R3M: A Universal Visual Representation for Robot Manipulation, CoRL 2022
 - COMBO: Conservative Offline Model-Based Policy Optimization, NeurIPS 2021
 - Koopman Q-Learning: Offline Reinforcement Learning via Symmetries of Dynamics, ICML 2022
+
+
