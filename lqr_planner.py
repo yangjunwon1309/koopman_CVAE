@@ -290,7 +290,8 @@ class KODAQLQRPlanner:
 
         for t in range(horizon):
             u_t    = self._lqr_u(o_cur, o_star, L_cur, M_cur)
-            a_t    = self._decode_action(u_t)
+            with torch.enable_grad():
+                a_t    = self._decode_action(u_t)
             o_next = self._step(o_cur, u_t, A_cur, B_cur)
             h_next = model.recurrent(h_cur, o_cur, a_t)
             w_next = model.skill_prior.soft_weights(h_next)
