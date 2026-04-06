@@ -24,12 +24,12 @@ where all differences are **episode-first** ($\Delta(\cdot)_t = (\cdot)_t - (\cd
 
 | Module | Role |
 |---|---|
-| **Posterior Encoder** $\mu_\phi(x_t, h_t)$ | Maps $(x_t, h_t)$ → latent state $z_t \in \mathbb{R}^{d_o}$ |
-| **GRU Recurrence** $f_\theta$ | $h_{t+1} = \text{GRU}(h_t, z_t, a_t)$ — encodes temporal history |
-| **Skill Prior MLP** | $p_\theta(c_t \mid h_t) = \text{Cat}(\text{softmax}(W_c h_t))$ — discrete skill weights $w_k$ |
-| **Action Encoder** $\psi_\theta$ | $u_t = \psi_\theta(a_t) \in \mathbb{R}^{d_u}$ — nonlinear action encoding |
+| **Posterior Encoder** $\mu_\phi(x_t, h_t)$ | Maps $(x_t, h_t)$ ??latent state $z_t \in \mathbb{R}^{d_o}$ |
+| **GRU Recurrence** $f_\theta$ | $h_{t+1} = \text{GRU}(h_t, z_t, a_t)$ ??encodes temporal history |
+| **Skill Prior MLP** | $p_\theta(c_t \mid h_t) = \text{Cat}(\text{softmax}(W_c h_t))$ ??discrete skill weights $w_k$ |
+| **Action Encoder** $\psi_\theta$ | $u_t = \psi_\theta(a_t) \in \mathbb{R}^{d_u}$ ??nonlinear action encoding |
 | **Skill-Koopman Operator** | $\hat{z}_{t+1} = \bar{A}(w)\, z_t + \bar{B}(w)\, u_t$ |
-| **State Decoder** | $\hat{x}_t = D_{\theta(z_t)}$ — 4 independent MLP heads |
+| **State Decoder** | $\hat{x}_t = D_{\theta(z_t)}$ ??4 independent MLP heads |
 
 ### 3. Skill-Conditioned Koopman Dynamics
 
@@ -39,7 +39,7 @@ $$\bar{\Lambda}(w) = \exp\!\left(\sum_k w_k \log \Lambda_k\right), \qquad \bar{A
 $$\bar{B}(w) = U\!\left(\sum_k w_k G_k\right)$$
 
 - $U \in \mathbb{R}^{m \times m}$: **shared kinematic basis** across all skills (Assumption 2)
-- $\Lambda_k = \text{diag}(\tanh(r_k^{(i)}) \cdot e^{i\theta_k^{(i)}})$: skill-specific eigenvalues — $|\lambda_k^{(i)}| \leq 1$ guaranteed (stability)
+- $\Lambda_k = \text{diag}(\tanh(r_k^{(i)}) \cdot e^{i\theta_k^{(i)}})$: skill-specific eigenvalues ??$|\lambda_k^{(i)}| \leq 1$ guaranteed (stability)
 - $G_k \in \mathbb{R}^{m \times d_u}$: skill-specific input coupling
 
 Log-space interpolation guarantees $|\bar{\lambda}_i| \leq 1$ whenever all $|\lambda_k^{(i)}| \leq 1$, ensuring a **stable world model** by construction.
@@ -50,8 +50,8 @@ $$\mathcal{L} = \mathcal{L}_\text{rec} + \lambda_1 \mathcal{L}_\text{dyn} + \lam
 
 | Loss | Formula | Purpose |
 |---|---|---|
-| $\mathcal{L}_\text{rec}$ | $\sum_j \alpha_j \|\hat{x}^{(j)}_t - x^{(j)}_t\|^2$ | 4-head reconstruction (Δe, Δp, Δq, q̇) |
-| $\mathcal{L}_\text{dyn}$ | $\|\mu_\phi(x_{t+1}, h_{t+1}) - (\bar{A}z_t + \bar{B}u_t)\|^2$ | Koopman consistency — L2, not KL (avoids posterior collapse) |
+| $\mathcal{L}_\text{rec}$ | $\sum_j \alpha_j \|\hat{x}^{(j)}_t - x^{(j)}_t\|^2$ | 4-head reconstruction (?e, ?p, ?q, q?) |
+| $\mathcal{L}_\text{dyn}$ | $\|\mu_\phi(x_{t+1}, h_{t+1}) - (\bar{A}z_t + \bar{B}u_t)\|^2$ | Koopman consistency ??L2, not KL (avoids posterior collapse) |
 | $\mathcal{L}_\text{skill}$ | $-\log p_\theta(c_t = \hat{c}_t \mid h_t)$ | Cross-entropy vs. EXTRACT labels |
 | $\mathcal{L}_\text{reg}$ | $\|\mu_\phi(x_t, h_t) - \text{sg}(\bar{A}z_{t-1} + \bar{B}u_{t-1})\|^2$ | Posterior-prior alignment (stop-gradient) |
 
@@ -59,9 +59,9 @@ $$\mathcal{L} = \mathcal{L}_\text{rec} + \lambda_1 \mathcal{L}_\text{dyn} + \lam
 
 | Phase | Active Losses | Epochs | Purpose |
 |---|---|---|---|
-| 1 — Warm-up | $\mathcal{L}_\text{rec}$ | 1–29 | Encoder/decoder convergence |
-| 2 — Koopman | $+ \mathcal{L}_\text{dyn} + \mathcal{L}_\text{skill}$ | 30–79 | Linear dynamics structure |
-| 3 — Full | $+ \mathcal{L}_\text{reg}$ | 80–200 | Posterior-prior alignment |
+| 1 ??Warm-up | $\mathcal{L}_\text{rec}$ | 1??9 | Encoder/decoder convergence |
+| 2 ??Koopman | $+ \mathcal{L}_\text{dyn} + \mathcal{L}_\text{skill}$ | 30??9 | Linear dynamics structure |
+| 3 ??Full | $+ \mathcal{L}_\text{reg}$ | 80??00 | Posterior-prior alignment |
 
 ---
 
@@ -71,11 +71,11 @@ $$\mathcal{L} = \mathcal{L}_\text{rec} + \lambda_1 \mathcal{L}_\text{dyn} + \lam
 
 Skill labels $\hat{c}_t$ are extracted from offline demonstrations via an EXTRACT-compatible pipeline:
 
-1. **R3M Rendering**: `MUJOCO_GL=egl` action replay → `render_frame()` → ResNet50 (R3M) → 2048-dim embeddings, cached as `r3m_embeddings.npz`
+1. **R3M Rendering**: `MUJOCO_GL=egl` action replay ??`render_frame()` ??ResNet50 (R3M) ??2048-dim embeddings, cached as `r3m_embeddings.npz`
 2. **Episode-first differencing**: $\Delta e_t = \text{R3M}(s_t) - \text{R3M}(s_0)$
 3. **PCA + K-means** ($K=7$, `pca_dim=128`): clusters in R3M diff space
 4. **Median filter** (window=7): smoothing per episode
-5. **Segment splitting**: EXTRACT `SkillClusterD4RLSequenceSplitDataset` logic — split at terminal OR skill-label change
+5. **Segment splitting**: EXTRACT `SkillClusterD4RLSequenceSplitDataset` logic ??split at terminal OR skill-label change
 
 ```bash
 python data/extract_skill_label.py \
@@ -112,37 +112,37 @@ Given a goal observation $x_\text{goal}$, KODAQ plans an optimal latent trajecto
 
 The LQR cost over the Koopman dynamics is:
 
-$$J = \sum_{t=0}^{H} \left[(z_t - z^*)^\top Q (z_t - z^*) + u_t^\top R\, u_t\right]$$
+$$J = \sum_{t=0}^{H} \left[(z_t - z^{*})^{\top} Q (z_t - z^{*}) + u_t^{\top} R\, u_t\right]$$
 
 Solving the Bellman equation without assuming z* is an equilibrium point yields:
 
-$$u_t^* = \underbrace{(R + \bar{B}^\top P \bar{B})^{-1} \bar{B}^\top P}_{M}\, z^* - \underbrace{(R + \bar{B}^\top P \bar{B})^{-1} \bar{B}^\top P \bar{A}}_{L}\, z_t = M z^* - L z_t$$
+$$u_t^{*} = \underbrace{(R + \bar{B}^{\top} P \bar{B})^{-1} \bar{B}^{\top} P}_{M}\, z^{*} - \underbrace{(R + \bar{B}^{\top} P \bar{B})^{-1} \bar{B}^{\top} P \bar{A}}_{L}\, z_t = M z^{*} - L z_t$$
 
 where $P$ satisfies the DARE:
 
-$$P = \bar{A}^\top P \bar{A} - \bar{A}^\top P \bar{B}(R + \bar{B}^\top P \bar{B})^{-1} \bar{B}^\top P \bar{A} + Q$$
+$$P = \bar{A}^{\top} P \bar{A} - \bar{A}^{\top} P \bar{B}(R + \bar{B}^{\top} P \bar{B})^{-1} \bar{B}^{\top} P \bar{A} + Q$$
 
-Note that $L = M\bar{A}$: the feedforward gain $M$ and feedback gain $L$ differ exactly by one application of $\bar{A}$. This form is more general than $u_t^* = -L(z_t - z^*)$, which only holds when $z^*$ is a true equilibrium ($\bar{A}z^* = z^*$). Since the Koopman latent $z^*$ of a manipulation goal is not guaranteed to be an equilibrium, the $Mz^* - Lz_t$ form is used throughout.
+Note that $L = M\bar{A}$: the feedforward gain $M$ and feedback gain $L$ differ exactly by one application of $\bar{A}$. This form is more general than $u_t^{*} = -L(z_t - z^{*})$, which only holds when $z^{*}$ is a true equilibrium ($\bar{A}z^{*} = z^{*}$). Since the Koopman latent $z^{*}$ of a manipulation goal is not guaranteed to be an equilibrium, the $Mz^{*} - Lz_t$ form is used throughout.
 
 ### Hybrid Skill-Adaptive Planning
 
-At each step, $\bar{A}(w_t)$ and $\bar{B}(w_t)$ are blended from the current skill weights $w_t = \text{softmax}(W_c h_t)$. DARE is solved once on the **blended** $(\bar{A}, \bar{B})$ — not on per-skill $(A_k, B_k)$ separately — ensuring gain-dynamics consistency.
+At each step, $\bar{A}(w_t)$ and $\bar{B}(w_t)$ are blended from the current skill weights $w_t = \text{softmax}(W_c h_t)$. DARE is solved once on the **blended** $(\bar{A}, \bar{B})$ ??not on per-skill $(A_k, B_k)$ separately ??ensuring gain-dynamics consistency.
 
 **Hybrid replan rule:**
 
 $$\text{replan if } \|\bar{A}(w_{t+1}) - \bar{A}(w_t)\|_F > \varepsilon_A \quad \text{or} \quad t \bmod T_\text{replan} = 0$$
 
-Goal $z^* = \mu_\phi(x_\text{goal}, h_t)$ is also re-encoded at each replan step (Option C), so the goal representation adapts to the evolving hidden state.
+Goal $z^{*} = \mu_\phi(x_\text{goal}, h_t)$ is also re-encoded at each replan step (Option C), so the goal representation adapts to the evolving hidden state.
 
 ### Sequential Sub-Goal Planning
 
 Task completion points are identified from **reward jump timesteps** in the offline dataset: $\text{rew}[t] > \text{rew}[t-1]$ signals task completion at $t$. Each reward jump defines a sub-goal:
 
 ```
-Stage 0:  t=0     → t_jump[0]    goal = obs[t_jump[0]]
-Stage 1:  t_jump[0] → t_jump[1]  goal = obs[t_jump[1]]
+Stage 0:  t=0     ??t_jump[0]    goal = obs[t_jump[0]]
+Stage 1:  t_jump[0] ??t_jump[1]  goal = obs[t_jump[1]]
 ...
-Stage N:  t_jump[-1] → t_ep_end  goal = obs[t_ep_end]
+Stage N:  t_jump[-1] ??t_ep_end  goal = obs[t_ep_end]
 ```
 
 Each stage runs an independent LQR plan with **dynamic horizon** equal to the actual stage length (minimum 16 steps), and results are concatenated into a full episode trajectory.
@@ -161,7 +161,7 @@ results = run_lqr_on_episodes(planner, episodes, x_seq_full,
 
 ## Rollout Uncertainty Estimation
 
-To assess the reliability of model-based trajectories for offline RL, KODAQ computes a **variance-based uncertainty penalty** over a family of mixed real–model trajectories.
+To assess the reliability of model-based trajectories for offline RL, KODAQ computes a **variance-based uncertainty penalty** over a family of mixed real?�model trajectories.
 
 ### Construction
 
@@ -177,9 +177,9 @@ $$\mathcal{U} = \frac{1}{H}\sum_t \sigma^2_t$$
 
 ### Intuition
 
-- **$d=0$**: pure LQR — purely model-based, highest uncertainty in novel regions
-- **$d=K$**: $K$ real steps + LQR suffix — grounded in real data, lower uncertainty near demonstrated states
-- **High $\sigma^2_t$**: trajectories diverge → model is extrapolating beyond the data distribution → penalize
+- **$d=0$**: pure LQR ??purely model-based, highest uncertainty in novel regions
+- **$d=K$**: $K$ real steps + LQR suffix ??grounded in real data, lower uncertainty near demonstrated states
+- **High $\sigma^2_t$**: trajectories diverge ??model is extrapolating beyond the data distribution ??penalize
 
 This uncertainty is used to construct a **penalized reward** for offline Q-learning:
 
@@ -196,7 +196,7 @@ The LQR trajectories and uncertainty estimates from KODAQ feed directly into an 
 For each offline episode, KODAQ generates:
 - **Model-based trajectories** $\{(z_t, u_t, \hat{z}_{t+1}, r_t)\}$ in Koopman space via sequential LQR
 - **Uncertainty-penalized rewards** $r_\text{penalized} = r - \lambda \mathcal{U}$
-- **Decoded robot actions** $\hat{a}_t = \psi_\theta^{-1}(u_t^*)$ via gradient-based inversion of the action encoder
+- **Decoded robot actions** $\hat{a}_t = \psi_\theta^{-1}(u_t^{*})$ via gradient-based inversion of the action encoder
 
 These augmented transitions are mixed with the original offline dataset to expand state-action coverage while penalizing out-of-distribution regions.
 
@@ -230,16 +230,16 @@ pip install h5py scipy scikit-learn matplotlib
 
 ```
 koopman_CVAE/
-├── models/
-│   ├── koopman_cvae.py     # KODAQ RSSM-Koopman model
-│   └── losses.py           # All loss functions (pure functions)
-├── data/
-│   ├── extract_skill_label.py   # EXTRACT pipeline + x_t construction
-│   └── dataset_utils.py         # KODAQWindowDataset
-├── envs/
-│   └── env_configs.py      # Environment-specific hyperparameters
-├── train.py                # KODAQ training script
-└── lqr_planner.py          # LQR planning + uncertainty estimation
+?��??� models/
+??  ?��??� koopman_cvae.py     # KODAQ RSSM-Koopman model
+??  ?��??� losses.py           # All loss functions (pure functions)
+?��??� data/
+??  ?��??� extract_skill_label.py   # EXTRACT pipeline + x_t construction
+??  ?��??� dataset_utils.py         # KODAQWindowDataset
+?��??� envs/
+??  ?��??� env_configs.py      # Environment-specific hyperparameters
+?��??� train.py                # KODAQ training script
+?��??� lqr_planner.py          # LQR planning + uncertainty estimation
 ```
 
 ### Step 1: Skill Labeling
@@ -281,7 +281,7 @@ python lqr_planner.py \
 
 ### Step 4: Offline RL (Q-learning with Augmented Data)
 
-*Coming soon — IQL/COMBO integration using KODAQ-augmented transitions.*
+*Coming soon ??IQL/COMBO integration using KODAQ-augmented transitions.*
 
 ---
 
