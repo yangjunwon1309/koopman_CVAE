@@ -290,8 +290,7 @@ class KODAQLQRPlanner:
 
         for t in range(horizon):
             u_t    = self._lqr_u(o_cur, o_star, L_cur, M_cur)
-            with torch.enable_grad():
-                a_t    = self._decode_action(u_t)
+            a_t    = self._decode_action(u_t)
             o_next = self._step(o_cur, u_t, A_cur, B_cur)
             h_next = model.recurrent(h_cur, o_cur, a_t)
             w_next = model.skill_prior.soft_weights(h_next)
@@ -393,18 +392,68 @@ class KODAQLQRPlanner:
 # Real dataset loader
 # ─────────────────────────────────────────────────────────────────────────────
 
+def detect_completed_tasks_by_reward(
+    obs_ep:   np.ndarray,   # (L, 60)
+    rew_ep:   np.ndarray,   # (L,)
+) -> Dict[str, int]:
+    """
+    reward jump 시점 + OBS_ELEMENT_GOALS 거리로 실제 완료 task 식별.
+
+    D4RL kitchen reward:
+      - task 하나 완료 시 +1 스파스 보상
+      - reward[t] > reward[t-1] → 해당 시점에 task 완료
+
+    각 jump 시점에서 OBS_ELEMENT_GOALS와 가장 가까운 task를 할당.
+    Returns: {task_name: completion_timestep}  (완료된 task만 포함)
+    """
+    # reward jump 시점 찾기
+    jump_steps = []
+    for t in range(1, len(rew_ep)):
+        if rew_ep[t] > rew_ep[t - 1]:
+            jump_steps.append(t)
+
+    if not jump_steps:
+        return {}
+
+    completed = {}
+    used_tasks = set()
+
+    for t in jump_steps:
+        # 이 시점에서 각 task의 OBS_ELEMENT_GOALS 거리 계산
+        best_task, best_dist = None, float('inf')
+        for task in ALL_TASKS:
+            if task in used_tasks:
+                continue
+            idx  = OBS_ELEMENT_INDICES[task]
+            goal = OBS_ELEMENT_GOALS[task]
+            dist = np.linalg.norm(obs_ep[t, idx] - goal)
+            if dist < best_dist:
+                best_dist = dist
+                best_task = task
+
+        if best_task is not None and best_dist < BONUS_THRESH * 2:
+            completed[best_task] = t
+            used_tasks.add(best_task)
+
+    return completed
+
+
 def load_kitchen_episodes(
     quality: str = 'mixed',
     min_len: int = 64,
 ) -> Tuple[List[Dict], np.ndarray]:
     """
-    D4RL Kitchen 로드 + 에피소드 분리 + task completion 탐지.
-    infos/tasks_to_complete 키가 있으면 tasks_to_complete로 task 식별,
-    없으면 OBS_ELEMENT_GOALS 기반 직접 탐지 사용.
+    D4RL Kitchen 로드 + 에피소드 분리.
+
+    Task 식별 전략 (우선순위):
+      1. reward jump + OBS_ELEMENT_GOALS 거리  ← mixed/partial에 유효
+      2. OBS_ELEMENT_GOALS 직접 threshold 탐지 ← fallback
+
+    각 에피소드에 실제 완료된 task만 포함, 완료 timestep 기록.
     """
     import d4rl, gym
-    name_map = {'mixed': 'kitchen-mixed-v0',
-                'partial': 'kitchen-partial-v0',
+    name_map = {'mixed':    'kitchen-mixed-v0',
+                'partial':  'kitchen-partial-v0',
                 'complete': 'kitchen-complete-v0'}
     d4rl_name = name_map[quality]
     print(f"Loading {d4rl_name} ...")
@@ -413,55 +462,74 @@ def load_kitchen_episodes(
 
     obs       = dataset['observations']
     actions   = dataset['actions']
+    rewards   = dataset.get('rewards', np.zeros(len(obs)))
     terminals = dataset['terminals'].astype(bool)
-    N         = len(obs)
-
-    # infos 키 탐지
-    task_info = None
-    for key in ['infos/tasks_to_complete', 'infos/task_completions']:
-        if key in dataset:
-            task_info = dataset[key]
-            print(f"  Found '{key}': shape={np.array(task_info).shape}")
-            break
-    if task_info is None:
-        print("  No task_info key → using OBS_ELEMENT_GOALS-based detection")
 
     ep_ends   = list(np.where(terminals)[0])
     ep_starts = [0] + [e + 1 for e in ep_ends[:-1]]
     episodes  = []
+    n_with_tasks = 0
 
     for ep_s, ep_e in zip(ep_starts, ep_ends):
         L = ep_e - ep_s + 1
-        if L < min_len: continue
+        if L < min_len:
+            continue
 
         obs_ep  = obs[ep_s:ep_e+1]
         acts_ep = actions[ep_s:ep_e+1]
+        rew_ep  = rewards[ep_s:ep_e+1]
 
-        # task 목록 결정
-        if task_info is not None:
-            try:
-                row = task_info[ep_s]
-                tasks = [t for t in row if t and str(t) not in ('', 'None', 'b\'\'')]
-            except Exception:
-                tasks = ALL_TASKS[:4]
-        else:
-            tasks = ALL_TASKS
+        # 1. reward jump 기반 task 식별
+        completed = detect_completed_tasks_by_reward(obs_ep, rew_ep)
 
-        gi = identify_episode_goals(obs_ep, tasks)
+        # 2. reward 없는 경우 OBS_ELEMENT_GOALS threshold fallback
+        if not completed:
+            completed = detect_task_completions(obs_ep, ALL_TASKS)
+            completed = {k: v for k, v in completed.items() if v >= 0}
+
+        actual_tasks = list(completed.keys())
+        if actual_tasks:
+            n_with_tasks += 1
+
+        # Goal 구성
+        subtask_goals = {}
+        for task, t in completed.items():
+            subtask_goals[task] = {
+                'obs':       obs_ep[t],
+                'timestep':  t,
+                'completed': True,
+            }
+
+        goal_info = {
+            'final_goal':    obs_ep[-1],
+            'midpoint_goal': obs_ep[L // 2],
+            'subtask_goals': subtask_goals,
+            'completions':   completed,
+            'episode_len':   L,
+            'n_completed':   len(completed),
+            'reward_total':  float(rew_ep.sum()),
+        }
+
         episodes.append({
-            'obs': obs_ep, 'actions': acts_ep,
-            'start_t': ep_s, 'end_t': ep_e, 'length': L,
-            'tasks': tasks, 'goal_info': gi,
+            'obs':      obs_ep,
+            'actions':  acts_ep,
+            'rewards':  rew_ep,
+            'start_t':  ep_s,
+            'end_t':    ep_e,
+            'length':   L,
+            'tasks':    actual_tasks,   # 실제 완료된 task만
+            'goal_info': goal_info,
         })
 
-    print(f"Episodes: {len(episodes)} (min_len={min_len})")
+    print(f"Episodes: {len(episodes)}  (min_len={min_len}  "
+          f"with_tasks={n_with_tasks}/{len(episodes)})")
     return episodes, obs
 
 
 def run_lqr_on_episodes(
     planner:      KODAQLQRPlanner,
     episodes:     List[Dict],
-    x_seq_full:   np.ndarray,      # (N, 2108) cached x_t
+    x_seq_full:   np.ndarray,
     cond_len:     int = 16,
     horizon:      int = 32,
     unc_real_len: int = 8,
@@ -472,25 +540,43 @@ def run_lqr_on_episodes(
 
     for ep_idx, ep in enumerate(episodes):
         L, obs_ep, acts_ep = ep['length'], ep['obs'], ep['actions']
-        gi, tasks           = ep['goal_info'], ep['tasks']
-        s, e                = ep['start_t'], ep['end_t']
-        x_ep                = x_seq_full[s:e+1]   # (L, 2108)
+        gi    = ep['goal_info']
+        tasks = ep['tasks']   # 실제 완료된 task만
+        s, e  = ep['start_t'], ep['end_t']
+        x_ep  = x_seq_full[s:e+1]
 
         if L < cond_len + horizon + 4:
             continue
 
-        print(f"\nEp {ep_idx}  len={L}  tasks={tasks}")
-        print(f"  Completions: {gi['completions']}")
+        # task 미완료 에피소드 스킵
+        if not tasks:
+            print(f"Ep {ep_idx}  len={L}  tasks=[]  → skip (no completed tasks)")
+            continue
 
-        # Goal 목록: final + 첫 완료 subtask
-        goals = [('final', obs_to_x_goal(gi['final_goal'], obs_ep[0]), gi['final_goal'])]
-        completed = [(t, ti['timestep']) for t, ti in gi['subtask_goals'].items()
-                     if ti['completed'] and ti['timestep'] > cond_len]
-        if completed:
-            ft, f_t = min(completed, key=lambda x: x[1])
-            goals.append((f'sub_{ft}@{f_t}',
-                          obs_to_x_goal(gi['subtask_goals'][ft]['obs'], obs_ep[0]),
-                          gi['subtask_goals'][ft]['obs']))
+        print(f"\nEp {ep_idx}  len={L}  "
+              f"completed_tasks={tasks}  "
+              f"reward_total={gi['reward_total']:.0f}  "
+              f"n_completed={gi['n_completed']}")
+        print(f"  Completions: { {t: v for t, v in gi['completions'].items()} }")
+
+        # Goal 목록 구성
+        goals = []
+
+        # 1. Final goal: 에피소드 마지막 obs (모든 완료 task 반영)
+        goals.append(('final', obs_to_x_goal(gi['final_goal'], obs_ep[0]),
+                      gi['final_goal']))
+
+        # 2. 각 subtask goal: 완료 순서대로 (cond_len 이후 완료된 것만)
+        completed_after_cond = sorted(
+            [(t, ti['timestep']) for t, ti in gi['subtask_goals'].items()
+             if ti['completed'] and ti['timestep'] > cond_len],
+            key=lambda x: x[1]
+        )
+        for task_name, comp_t in completed_after_cond[:1]:  # 첫 subtask만
+            sub_obs = gi['subtask_goals'][task_name]['obs']
+            goals.append((f'{task_name}@t={comp_t}',
+                          obs_to_x_goal(sub_obs, obs_ep[0]),
+                          sub_obs))
 
         for goal_name, x_goal_np, _ in goals:
             x_cond   = torch.FloatTensor(x_ep[:cond_len]).unsqueeze(0).to(dev)
@@ -502,8 +588,7 @@ def run_lqr_on_episodes(
             plan = planner.plan(x_cond, a_cond, x_goal_t, horizon=horizon,
                                 real_actions=real_a, compute_uncertainty=True)
 
-            # RMSE Δq_t
-            true_x  = x_ep[cond_len:min(cond_len+horizon, L)]
+            true_x  = x_ep[cond_len:min(cond_len + horizon, L)]
             H_c     = min(plan['x_traj'].shape[0], len(true_x))
             pred_dq = plan['x_traj'][:H_c, X_DQ_START:X_DQ_END].cpu().numpy()
             true_dq = true_x[:H_c, X_DQ_START:X_DQ_END]
@@ -514,10 +599,16 @@ def run_lqr_on_episodes(
                   f"pen={plan['penalized_cost']:.4f}  "
                   f"RMSE_Δq={rmse:.4f}")
 
-            results.append({'ep_idx': ep_idx, 'goal_name': goal_name,
-                            'plan': plan, 'true_x': true_x,
-                            'rmse_dq': rmse, 'tasks': tasks,
-                            'completions': gi['completions']})
+            results.append({
+                'ep_idx':      ep_idx,
+                'goal_name':   goal_name,
+                'plan':        plan,
+                'true_x':      true_x,
+                'rmse_dq':     rmse,
+                'tasks':       tasks,
+                'completions': gi['completions'],
+                'reward_total': gi['reward_total'],
+            })
     return results
 
 
@@ -558,9 +649,12 @@ def visualize_lqr_results(results: List[Dict], out_dir: str = 'checkpoints/kodaq
         axes[2].spines[['top','right']].set_visible(False)
 
         gname = res['goal_name'].replace('/','_').replace(' ','_').replace('@','_')
-        fig.suptitle(f"Ep{res['ep_idx']}  {res['goal_name']}\n"
-                     f"Tasks:{res['tasks']}  Pen:{plan['penalized_cost']:.4f}",
-                     fontsize=8, fontweight='bold')
+        fig.suptitle(
+            f"Ep{res['ep_idx']}  Goal: {res['goal_name']}\n"
+            f"Completed:{res['tasks']}  reward={res.get('reward_total',0):.0f}"
+            f"  Pen:{plan['penalized_cost']:.4f}",
+            fontsize=8, fontweight='bold'
+        )
         plt.tight_layout()
         out = f"{out_dir}/ep{res['ep_idx']}_{gname}.png"
         plt.savefig(out, dpi=130, bbox_inches='tight')
