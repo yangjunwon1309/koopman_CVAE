@@ -24,12 +24,12 @@ where all differences are **episode-first** ($\Delta(\cdot)_t = (\cdot)_t - (\cd
 
 | Module | Role |
 |---|---|
-| **Posterior Encoder** $\mu_\phi(x_t, h_t)$ | Maps $(x_t, h_t)$ ??latent state $z_t \in \mathbb{R}^{d_o}$ |
-| **GRU Recurrence** $f_\theta$ | $h_{t+1} = \text{GRU}(h_t, z_t, a_t)$ ??encodes temporal history |
-| **Skill Prior MLP** | $p_\theta(c_t \mid h_t) = \text{Cat}(\text{softmax}(W_c h_t))$ ??discrete skill weights $w_k$ |
-| **Action Encoder** $\psi_\theta$ | $u_t = \psi_\theta(a_t) \in \mathbb{R}^{d_u}$ ??nonlinear action encoding |
+| **Posterior Encoder** $\mu_\phi(x_t, h_t)$ | Maps $(x_t, h_t)$ latent state $z_t \in \mathbb{R}^{d_o}$ |
+| **GRU Recurrence** $f_\theta$ | $h_{t+1} = \text{GRU}(h_t, z_t, a_t)$ encodes temporal history |
+| **Skill Prior MLP** | $p_\theta(c_t \mid h_t) = \text{Cat}(\text{softmax}(W_c h_t))$ discrete skill weights $w_k$ |
+| **Action Encoder** $\psi_\theta$ | $u_t = \psi_\theta(a_t) \in \mathbb{R}^{d_u}$ nonlinear action encoding |
 | **Skill-Koopman Operator** | $\hat{z}_{t+1} = \bar{A}(w)\, z_t + \bar{B}(w)\, u_t$ |
-| **State Decoder** | $\hat{x}_t = D_{\theta(z_t)}$ ??4 independent MLP heads |
+| **State Decoder** | $\hat{x}_t = D_{\theta(z_t)}$ 4 independent MLP heads |
 
 ### 3. Skill-Conditioned Koopman Dynamics
 
@@ -50,8 +50,8 @@ $$\mathcal{L} = \mathcal{L}_\text{rec} + \lambda_1 \mathcal{L}_\text{dyn} + \lam
 
 | Loss | Formula | Purpose |
 |---|---|---|
-| $\mathcal{L}_\text{rec}$ | $\sum_j \alpha_j \|\hat{x}^{(j)}_t - x^{(j)}_t\|^2$ | 4-head reconstruction (?e, ?p, ?q, q?) |
-| $\mathcal{L}_\text{dyn}$ | $\|\mu_\phi(x_{t+1}, h_{t+1}) - (\bar{A}z_t + \bar{B}u_t)\|^2$ | Koopman consistency ??L2, not KL (avoids posterior collapse) |
+| $\mathcal{L}_\text{rec}$ | $\sum_j \alpha_j \|\hat{x}^{(j)}_t - x^{(j)}_t\|^2$ | 4-head reconstruction |
+| $\mathcal{L}_\text{dyn}$ | $\|\mu_\phi(x_{t+1}, h_{t+1}) - (\bar{A}z_t + \bar{B}u_t)\|^2$ | Koopman consistency L2, not KL (avoids posterior collapse) |
 | $\mathcal{L}_\text{skill}$ | $-\log p_\theta(c_t = \hat{c}_t \mid h_t)$ | Cross-entropy vs. EXTRACT labels |
 | $\mathcal{L}_\text{reg}$ | $\|\mu_\phi(x_t, h_t) - \text{sg}(\bar{A}z_{t-1} + \bar{B}u_{t-1})\|^2$ | Posterior-prior alignment (stop-gradient) |
 
@@ -59,9 +59,9 @@ $$\mathcal{L} = \mathcal{L}_\text{rec} + \lambda_1 \mathcal{L}_\text{dyn} + \lam
 
 | Phase | Active Losses | Epochs | Purpose |
 |---|---|---|---|
-| 1 ??Warm-up | $\mathcal{L}_\text{rec}$ | 1??9 | Encoder/decoder convergence |
-| 2 ??Koopman | $+ \mathcal{L}_\text{dyn} + \mathcal{L}_\text{skill}$ | 30??9 | Linear dynamics structure |
-| 3 ??Full | $+ \mathcal{L}_\text{reg}$ | 80??00 | Posterior-prior alignment |
+| 1. Warm-up | $\mathcal{L}_\text{rec}$ | 1-30 | Encoder/decoder convergence |
+| 2. Koopman | $+ \mathcal{L}_\text{dyn} + \mathcal{L}_\text{skill}$ | 30-80 | Linear dynamics structure |
+| 3. Full | $+ \mathcal{L}_\text{reg}$ | 80-200 | Posterior-prior alignment |
 
 ---
 
@@ -171,19 +171,19 @@ $$\tau_d = \underbrace{z_0, \ldots, z_d}_{\text{real actions } a_{0:d}} \oplus \
 
 The per-timestep uncertainty is the variance across trajectories at the same time index:
 
-$$\sigma^2_t = \text{Var}_d\!\left[z_t^{(\tau_d)}\right] = \frac{1}{|\mathcal{D}_t|}\sum_{d \in \mathcal{D}_t} \|z_t^{(\tau_d)} - \bar{z}_t\|^2, \quad \bar{z}_t = \text{mean}_d[z_t^{(\tau_d)}]$$
+$$\sigma^2_t = \text{Var}_d\left[z_t^{(\tau_d)}\right] = \frac{1}{|\mathcal{D}_t|}\sum_{d \in \mathcal{D}_t} \|z_t^{(\tau_d)} - \bar{z}_t\|^2, \quad \bar{z}_t = \text{mean}_d[z_t^{(\tau_d)}]$$
 
-$$\mathcal{U} = \frac{1}{H}\sum_t \sigma^2_t$$
+$$\mathcal{U}_t = \sigma^t$$
 
 ### Intuition
 
-- **$d=0$**: pure LQR ??purely model-based, highest uncertainty in novel regions
-- **$d=K$**: $K$ real steps + LQR suffix ??grounded in real data, lower uncertainty near demonstrated states
-- **High $\sigma^2_t$**: trajectories diverge ??model is extrapolating beyond the data distribution ??penalize
+- **$d=0$**: pure LQR, purely model-based, highest uncertainty in novel regions
+- **$d=K$**: $K$ real steps + LQR suffix, grounded in real data, lower uncertainty near demonstrated states
+- **High $\sigma^2_t$**: trajectories diverge, model is extrapolating beyond the data distribution -> penalize
 
 This uncertainty is used to construct a **penalized reward** for offline Q-learning:
 
-$$r_\text{penalized}(z_t, u_t) = r(z_t, u_t) - \lambda \cdot \mathcal{U}$$
+$$r_\text{penalized}(z_t, u_t) = r(z_t, u_t) - \lambda \cdot \mathcal{U}_t$$
 
 ---
 
@@ -230,16 +230,16 @@ pip install h5py scipy scikit-learn matplotlib
 
 ```
 koopman_CVAE/
-?��??� models/
-??  ?��??� koopman_cvae.py     # KODAQ RSSM-Koopman model
-??  ?��??� losses.py           # All loss functions (pure functions)
-?��??� data/
-??  ?��??� extract_skill_label.py   # EXTRACT pipeline + x_t construction
-??  ?��??� dataset_utils.py         # KODAQWindowDataset
-?��??� envs/
-??  ?��??� env_configs.py      # Environment-specific hyperparameters
-?��??� train.py                # KODAQ training script
-?��??� lqr_planner.py          # LQR planning + uncertainty estimation
+models/
+    koopman_cvae.py     # KODAQ RSSM-Koopman model
+    losses.py           # All loss functions (pure functions)
+data/
+    extract_skill_label.py   # EXTRACT pipeline + x_t construction
+    dataset_utils.py         # KODAQWindowDataset
+envs/
+    env_configs.py      # Environment-specific hyperparameters
+train.py                # KODAQ training script
+lqr_planner.py          # LQR planning + uncertainty estimation
 ```
 
 ### Step 1: Skill Labeling
