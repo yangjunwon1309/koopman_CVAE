@@ -29,7 +29,7 @@ where all differences are **episode-first** ($\Delta(\cdot)_t = (\cdot)_t - (\cd
 | **Skill Prior MLP** | $p_\theta(c_t \mid h_t) = \text{Cat}(\text{softmax}(W_c h_t))$ — discrete skill weights $w_k$ |
 | **Action Encoder** $\psi_\theta$ | $u_t = \psi_\theta(a_t) \in \mathbb{R}^{d_u}$ — nonlinear action encoding |
 | **Skill-Koopman Operator** | $\hat{z}_{t+1} = \bar{A}(w)\, z_t + \bar{B}(w)\, u_t$ |
-| **State Decoder** | $\hat{x}_t = D_\theta(z_t)$ — 4 independent MLP heads |
+| **State Decoder** | $\hat{x}_t = D_{\theta(z_t)}$ — 4 independent MLP heads |
 
 ### 3. Skill-Conditioned Koopman Dynamics
 
@@ -114,7 +114,7 @@ The LQR cost over the Koopman dynamics is:
 
 $$J = \sum_{t=0}^{H} \left[(z_t - z^*)^\top Q (z_t - z^*) + u_t^\top R\, u_t\right]$$
 
-Solving the Bellman equation without assuming $z^*$ is an equilibrium point yields:
+Solving the Bellman equation without assuming z* is an equilibrium point yields:
 
 $$u_t^* = \underbrace{(R + \bar{B}^\top P \bar{B})^{-1} \bar{B}^\top P}_{M}\, z^* - \underbrace{(R + \bar{B}^\top P \bar{B})^{-1} \bar{B}^\top P \bar{A}}_{L}\, z_t = M z^* - L z_t$$
 

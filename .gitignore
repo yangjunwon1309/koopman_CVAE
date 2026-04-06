@@ -1,7 +1,8 @@
 ﻿# Analysis outputs
 analysis/
 checkpoints/
-*.png
+lqr/
+#*.png
 *.jpg
 
 # Python
