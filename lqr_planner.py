@@ -605,9 +605,12 @@ def run_lqr_on_episodes(
                 cond_start = 0
                 cond_end   = min(cond_len, stage_end_t)
 
-            # ── Stage horizon ──────────────────────────────────────────────
-            stage_len    = stage_end_t - max(stage_start, cond_end)
-            stage_horizon = max(1, min(stage_len, horizon))
+            # ── Stage horizon (동적) ───────────────────────────────────────
+            # stage 실제 길이 전체를 horizon으로 사용
+            # min_horizon=16으로 하한, horizon 파라미터는 더 이상 상한 아님
+            stage_len     = stage_end_t - max(stage_start, cond_end)
+            min_horizon   = 16
+            stage_horizon = max(min_horizon, stage_len)
 
             if stage_horizon < 2:
                 stage_start = stage_end_t + 1
