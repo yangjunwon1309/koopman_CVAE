@@ -230,35 +230,34 @@ def plot_skill_trajectories(model: KoopmanCVAE, samples: list, out_path: str):
 # ──────────────────────────────────────────────────────────────────────────────
 # 3. Rollout 예측 품질
 # ──────────────────────────────────────────────────────────────────────────────
-
 @torch.no_grad()
 def plot_rollout_quality(model: KoopmanCVAE, samples: list, out_path: str,
                          cond_len: int = 16, horizon: int = 32):
     """
-    각 에피소드에서:
-      - 처음 cond_len 스텝으로 conditioning
-      - 이후 horizon 스텝 rollout
-      - predicted vs true:
-          left  : Δq_t (9-dim qpos diff, mean across joints)
-          right  : q̇_t  (9-dim joint velocity, mean across joints)
-    x_t layout: [Δe(2048) | Δp(42) | Δq(9) | q̇(9)]
+    각 에피소드에서 개별 차원별(Joint 1~9, Object top-5) 예측 품질 시각화 및 분석
     """
     cfg = model.cfg
-    # x_t 슬롯 정의
-    dq_sl  = slice(cfg.dim_delta_e + cfg.dim_delta_p,
-                   cfg.dim_delta_e + cfg.dim_delta_p + cfg.dim_q)        # Δq_t (9)
-    qd_sl  = slice(cfg.dim_delta_e + cfg.dim_delta_p + cfg.dim_q,
-                   cfg.dim_delta_e + cfg.dim_delta_p + cfg.dim_q + cfg.dim_qdot)  # q̇_t (9)
+    dp_sl = slice(cfg.dim_delta_e, cfg.dim_delta_e + cfg.dim_delta_p)            # Δp_t (42)
+    dq_sl = slice(cfg.dim_delta_e + cfg.dim_delta_p, 
+                  cfg.dim_delta_e + cfg.dim_delta_p + cfg.dim_q)                 # Δq_t (9)
+    qd_sl = slice(cfg.dim_delta_e + cfg.dim_delta_p + cfg.dim_q, 
+                  cfg.dim_delta_e + cfg.dim_delta_p + cfg.dim_q + cfg.dim_qdot)  # q̇_t (9)
 
-    n   = len(samples)
-    fig, axes = plt.subplots(n, 2, figsize=(14, 3 * n))
-    if n == 1: axes = axes.reshape(1, 2)
+    n = len(samples)
+    fig, axes = plt.subplots(n, 3, figsize=(20, 3 * n))  # 3 columns: Δq, q̇, Δp
+    if n == 1: axes = axes.reshape(1, 3)
 
-    rmse_dq_list, rmse_qd_list = [], []
+    # 전체 차원별 RMSE 누적용
+    rmse_dq_all = []
+    rmse_qd_all = []
+    rmse_dp_all = []
+
+    # 관절별 색상 (9 dims)
+    cmap = plt.get_cmap('tab10')
 
     for i, samp in enumerate(samples):
         x, a = samp['x'], samp['a']
-        L     = samp['length']
+        L    = samp['length']
         if L < cond_len + horizon + 2:
             for ax in axes[i]: ax.set_visible(False)
             continue
@@ -268,57 +267,82 @@ def plot_rollout_quality(model: KoopmanCVAE, samples: list, out_path: str,
         a_plan = a[:, cond_len:cond_len + horizon]
         x_true = x[0, cond_len:cond_len + horizon].cpu().numpy()  # (H, x_dim)
 
-        # Rollout
+        # Rollout (모델이 symlog 스케일로 출력한다고 가정)
         pred = model.rollout(x_cond, a_cond, a_plan)
 
-        # Δq_t: predicted vs true  (9-dim → mean across joints)
-        dq_pred   = pred['q'][0].cpu().numpy()      # (H, 9)  decoder 'q' head = Δq
-        dq_true   = x_true[:, dq_sl]               # (H, 9)
-        dq_pred_m = dq_pred.mean(axis=1)
-        dq_true_m = dq_true.mean(axis=1)
+        # 각 상태별 개별 차원 추출
+        dq_pred = pred['q'][0].cpu().numpy()      # (H, 9)
+        dq_true = x_true[:, dq_sl]
+        
+        qd_pred = pred['qdot'][0].cpu().numpy()   # (H, 9)
+        qd_true = x_true[:, qd_sl]
+        
+        dp_pred = pred['delta_p'][0].cpu().numpy() # (H, 42)
+        dp_true = x_true[:, dp_sl]
 
-        # q̇_t: predicted vs true  (9-dim → mean across joints)
-        qd_pred   = pred['qdot'][0].cpu().numpy()   # (H, 9)
-        qd_true   = x_true[:, qd_sl]               # (H, 9)
-        qd_pred_m = qd_pred.mean(axis=1)
-        qd_true_m = qd_true.mean(axis=1)
-
-        rmse_dq = np.sqrt(((dq_pred - dq_true)**2).mean())
-        rmse_qd = np.sqrt(((qd_pred - qd_true)**2).mean())
-        rmse_dq_list.append(rmse_dq)
-        rmse_qd_list.append(rmse_qd)
+        # Per-dimension RMSE 계산
+        rmse_dq_dim = np.sqrt(((dq_pred - dq_true)**2).mean(axis=0))  # (9,)
+        rmse_qd_dim = np.sqrt(((qd_pred - qd_true)**2).mean(axis=0))  # (9,)
+        rmse_dp_dim = np.sqrt(((dp_pred - dp_true)**2).mean(axis=0))  # (42,)
+        
+        rmse_dq_all.append(rmse_dq_dim)
+        rmse_qd_all.append(rmse_qd_dim)
+        rmse_dp_all.append(rmse_dp_dim)
 
         ts = np.arange(horizon)
 
-        # Δq_t plot
+        # ── 1. Δq_t (9개 관절 각각 플롯) ──
         ax = axes[i, 0]
-        ax.plot(ts, dq_true_m, 'k-', lw=1.5, label='true')
-        ax.plot(ts, dq_pred_m, '--', lw=1.5, color=PAL[i % len(PAL)], label='pred')
+        for d in range(9):
+            ax.plot(ts, dq_true[:, d], '-', color=cmap(d), lw=1.2, alpha=0.8)
+            ax.plot(ts, dq_pred[:, d], '--', color=cmap(d), lw=1.2, alpha=0.8)
         ax.axvline(0, color='gray', lw=0.8, linestyle=':')
-        ax.set_title(f'Ep {i}  Δq_t (qpos diff mean)  RMSE={rmse_dq:.4f}', fontsize=8)
-        ax.set_xlabel('rollout step', fontsize=8)
-        if i == 0: ax.legend(fontsize=7)
+        ax.set_title(f'Ep {i} Δq (9 joints)\nMean RMSE={rmse_dq_dim.mean():.4f}', fontsize=9)
         ax.spines[['top', 'right']].set_visible(False)
 
-        # q̇_t plot
+        # ── 2. q̇_t (9개 관절 속도 각각 플롯) ──
         ax = axes[i, 1]
-        ax.plot(ts, qd_true_m, 'k-', lw=1.5, label='true')
-        ax.plot(ts, qd_pred_m, '--', lw=1.5, color=PAL[i % len(PAL)], label='pred')
-        ax.set_title(f'Ep {i}  q̇_t (joint vel mean)  RMSE={rmse_qd:.4f}', fontsize=8)
-        ax.set_xlabel('rollout step', fontsize=8)
-        if i == 0: ax.legend(fontsize=7)
+        for d in range(9):
+            ax.plot(ts, qd_true[:, d], '-', color=cmap(d), lw=1.2, alpha=0.8)
+            ax.plot(ts, qd_pred[:, d], '--', color=cmap(d), lw=1.2, alpha=0.8)
+        ax.axvline(0, color='gray', lw=0.8, linestyle=':')
+        ax.set_title(f'Ep {i} q̇ (9 vels)\nMean RMSE={rmse_qd_dim.mean():.4f}', fontsize=9)
         ax.spines[['top', 'right']].set_visible(False)
 
-    fig.suptitle(f'Rollout Quality  (cond={cond_len} steps → pred {horizon} steps)',
-                 fontsize=11, fontweight='bold')
+        # ── 3. Δp_t (Object 상태 중 변화량이 가장 큰 Top-5 차원만 플롯) ──
+        ax = axes[i, 2]
+        # 해당 구간에서 분산(변화)이 가장 큰 물체 인덱스 5개 추출
+        top5_idx = np.argsort(dp_true.var(axis=0))[-5:] 
+        for d in top5_idx:
+            ax.plot(ts, dp_true[:, d], '-', lw=1.5, alpha=0.8, label=f'Dim {d}')
+            ax.plot(ts, dp_pred[:, d], '--', lw=1.5, alpha=0.8)
+        ax.axvline(0, color='gray', lw=0.8, linestyle=':')
+        top5_rmse = rmse_dp_dim[top5_idx].mean()
+        ax.set_title(f'Ep {i} Δp (Top 5 active objs)\nTop-5 RMSE={top5_rmse:.4f}', fontsize=9)
+        if i == 0: ax.legend(fontsize=7, loc='upper left')
+        ax.spines[['top', 'right']].set_visible(False)
+
+    fig.suptitle(f'Per-Dimension Rollout Quality (cond={cond_len} → pred {horizon})',
+                 fontsize=12, fontweight='bold')
     plt.tight_layout()
-    plt.savefig(out_path, dpi=130, bbox_inches='tight')
+    plt.savefig(out_path, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"Saved: {out_path}")
 
-    print(f"\n=== Rollout RMSE (horizon={horizon}) ===")
-    print(f"  Δq_t: {np.mean(rmse_dq_list):.4f} ± {np.std(rmse_dq_list):.4f}")
-    print(f"  q̇_t:  {np.mean(rmse_qd_list):.4f} ± {np.std(rmse_qd_list):.4f}")
+    # 콘솔에 상세 분석 결과 출력
+    rmse_dq_avg = np.mean(rmse_dq_all, axis=0) # (9,)
+    rmse_qd_avg = np.mean(rmse_qd_all, axis=0) # (9,)
+    
+    print(f"\n=== Detailed Rollout RMSE (horizon={horizon}) ===")
+    print(" [Δq_t - 9 Joints RMSE]")
+    for d in range(9):
+        print(f"   Joint {d}: {rmse_dq_avg[d]:.4f}")
+    print(f"   -- Average: {rmse_dq_avg.mean():.4f}")
+    
+    print("\n [q̇_t - 9 Joint Vels RMSE]")
+    for d in range(9):
+        print(f"   Vel {d}:   {rmse_qd_avg[d]:.4f}")
+    print(f"   -- Average: {rmse_qd_avg.mean():.4f}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
