@@ -10,7 +10,7 @@ KODAQ is a hierarchical offline reinforcement learning framework that learns a *
 
 ![KODAQ Architecture](assets/kodaq_architecture.png)
 
-KODAQ extends the Recurrent State Space Model (RSSM) with a structured **Koopman dynamic prior** that enforces linear dynamics in a learned latent space, conditioned on discrete skill labels extracted via [EXTRACT](https://arxiv.org/abs/2306.02978).
+KODAQ extends the Recurrent State Space Model (RSSM) with a structured **Koopman dynamic prior** that enforces linear dynamics in a learned latent space, conditioned on discrete skill labels extracted via [EXTRACT](https://arxiv.org/abs/2406.17768).
 
 ### 1. Input Representation
 
