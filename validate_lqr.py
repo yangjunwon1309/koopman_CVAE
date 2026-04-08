@@ -41,7 +41,8 @@ from typing import Dict, List, Tuple, Optional
 
 from models.koopman_cvae import KoopmanCVAE
 from models.losses import symlog, symexp
-from data.extract_skill_label import load_x_sequences, obs_to_x_goal
+from data.extract_skill_label import load_x_sequences
+from lqr_planner import obs_to_x_goal
 from lqr_planner import (
     KODAQLQRPlanner, LQRConfig,
     load_kitchen_episodes, detect_completed_tasks_by_reward,
