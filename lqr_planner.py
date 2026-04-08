@@ -960,9 +960,17 @@ def main():
         print(f"  RMSE_Dq:    {np.mean(all_rmse):.4f} +/- {np.std(all_rmse):.4f}")
 
     visualize_lqr_results(results, args.out_dir)
+
+    # Clip effect analysis
+    try:
+        from analyze_u_bounds import analyze_clip_effect
+        analyze_clip_effect(results,
+                            out_path=args.out_dir + '/clip_analysis.png')
+    except Exception as e:
+        print(f'Clip analysis skipped: {e}')
+
     print(f"\nDone. -> {args.out_dir}/")
-    from analyze_bound import analyze_clip_effect
-    analyze_clip_effect(results, args.out_dir + '/clip_analysis.png')
+
 
 if __name__ == '__main__':
     main()
