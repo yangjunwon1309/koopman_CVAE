@@ -372,6 +372,7 @@ class KODAQLQRPlanner:
         self._clip_post.append(u_np)
         return torch.FloatTensor(u_np).unsqueeze(0).to(self.device)
 
+    @torch.enable_grad()
     def _decode_action(self, u: torch.Tensor) -> torch.Tensor:
         da = self.m_cfg.action_dim
         a  = torch.zeros(1, da, device=self.device, requires_grad=True)
@@ -962,7 +963,6 @@ def main():
     print(f"\nDone. -> {args.out_dir}/")
     from analyze_bound import analyze_clip_effect
     analyze_clip_effect(results, args.out_dir + '/clip_analysis.png')
-
 
 if __name__ == '__main__':
     main()
