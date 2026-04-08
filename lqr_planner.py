@@ -164,6 +164,85 @@ class LQRConfig:
     lambda_unc:    float = 0.1
     u_max:         float = 1.0
     action_inv_steps: int = 30
+    use_u_bounds:  bool  = True   # clip u_t to surveyed ψ(a) range
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Action encoder range survey: u = ψ(a),  a ∈ [-1,1]^da
+# ─────────────────────────────────────────────────────────────────────────────
+
+def survey_action_encoder_range(
+    model,
+    n_random:    int   = 20000,
+    n_pertub:    int   = 5000,
+    eps:         float = 1e-3,
+    device:      str   = 'cuda',
+    save_path:   str   = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    ψ(a) 범위 조사: a ∈ [-1-eps, 1+eps]^da + perturbation
+
+    Returns:
+        u_min: (d_u,)  각 latent 차원 하한
+        u_max: (d_u,)  각 latent 차원 상한
+    """
+    model.eval()
+    da = model.cfg.action_dim
+    dev = torch.device(device if torch.cuda.is_available() else 'cpu')
+
+    samples = []
+
+    # 1. Random uniform in [-1, 1]^da
+    a_rand = torch.FloatTensor(n_random, da).uniform_(-1., 1.)
+    samples.append(a_rand)
+
+    # 2. Extreme corners (2^min(da,8) subset)
+    n_corners = min(da, 8)
+    for i in range(2**n_corners):
+        corner = np.array([((-1)**((i >> j) & 1)) for j in range(n_corners)]
+                          + [0.0] * (da - n_corners), dtype=np.float32)
+        samples.append(torch.FloatTensor(corner).unsqueeze(0))
+
+    # 3. Boundary perturbation: a ∈ {-1, 1}^da + small noise
+    a_boundary = torch.FloatTensor(n_pertub, da).uniform_(-1., 1.)
+    a_boundary = a_boundary.sign() + torch.randn(n_pertub, da) * eps
+    a_boundary = a_boundary.clamp(-1. - eps, 1. + eps)
+    samples.append(a_boundary)
+
+    # 4. Per-axis extremes (each dim at ±1, rest at 0)
+    for d in range(da):
+        for v in [-1., 1.]:
+            a_ax = torch.zeros(1, da)
+            a_ax[0, d] = v
+            samples.append(a_ax)
+
+    a_all = torch.cat(samples, dim=0).to(dev)
+
+    # Batch forward
+    batch_size = 2048
+    u_list = []
+    with torch.no_grad():
+        for i in range(0, len(a_all), batch_size):
+            u_batch = model.action_encoder(a_all[i:i+batch_size])
+            u_list.append(u_batch.cpu())
+    u_all = torch.cat(u_list, dim=0).numpy()   # (N, d_u)
+
+    u_min = u_all.min(axis=0)   # (d_u,)
+    u_max = u_all.max(axis=0)   # (d_u,)
+
+    print(f"\nAction encoder range survey: {len(a_all)} samples  d_u={u_all.shape[1]}")
+    print(f"  u_min: mean={u_min.mean():.4f}  std={u_min.std():.4f}"
+          f"  min={u_min.min():.4f}  max={u_min.max():.4f}")
+    print(f"  u_max: mean={u_max.mean():.4f}  std={u_max.std():.4f}"
+          f"  min={u_max.min():.4f}  max={u_max.max():.4f}")
+    print(f"  range width: mean={( u_max - u_min).mean():.4f}")
+
+    if save_path:
+        np.savez(save_path, u_min=u_min, u_max=u_max)
+        print(f"  Saved: {save_path}")
+
+    return u_min, u_max
 
 
 def solve_dare_safe(A, B, Q, R, max_iter=300, tol=1e-8):
@@ -207,6 +286,10 @@ class KODAQLQRPlanner:
         self.Q  = np.eye(m)   * cfg.Q_scale
         self.R  = np.eye(d_u) * cfg.R_scale
         self._cache: Dict = {}
+        # Per-dim u bounds from survey_action_encoder_range()
+        # None until survey() is called
+        self.u_min: Optional[np.ndarray] = None   # (d_u,)
+        self.u_max: Optional[np.ndarray] = None   # (d_u,)
 
     def _get_gain(self, A: np.ndarray, B: np.ndarray):
         """Cache DARE by (A, B) → (P, L, M)."""
@@ -240,6 +323,32 @@ class KODAQLQRPlanner:
     def _step(self, o, u, A, B):
         return (A @ o.T).T + (B @ u.T).T
 
+    def survey(
+        self,
+        n_random:  int   = 20000,
+        n_pertub:  int   = 5000,
+        eps:       float = 1e-3,
+        save_path: str   = None,
+    ):
+        """
+        ψ(a) 범위 조사 후 u_min, u_max를 내부에 저장.
+        _lqr_u에서 per-dim clip에 사용됨.
+        """
+        self.u_min, self.u_max = survey_action_encoder_range(
+            self.model, n_random=n_random, n_pertub=n_pertub,
+            eps=eps, device=str(self.device), save_path=save_path,
+        )
+        return self.u_min, self.u_max
+
+    def load_u_bounds(self, path: str):
+        """저장된 u_bounds npz 파일 로드."""
+        data = np.load(path)
+        self.u_min = data['u_min']
+        self.u_max = data['u_max']
+        print(f"Loaded u_bounds: {path}  "
+              f"u_min=[{self.u_min.min():.4f}, {self.u_min.max():.4f}]  "
+              f"u_max=[{self.u_max.min():.4f}, {self.u_max.max():.4f}]")
+
     def _lqr_u(self, o, o_star, L, M):
         """
         u_t* = M·z* - L·z_t   (평형점 가정 없는 정확한 형태)
@@ -250,9 +359,12 @@ class KODAQLQRPlanner:
         z_t   = o[0].cpu().numpy()          # (m,)
         z_star = o_star[0].cpu().numpy()    # (m,)
         u_np  = M @ z_star - L @ z_t
-        return torch.FloatTensor(
-            np.clip(u_np, -self.cfg.u_max, self.cfg.u_max)
-        ).unsqueeze(0).to(self.device)
+        # Per-dim clip using surveyed ψ(a) range
+        if self.cfg.use_u_bounds and self.u_min is not None:
+            u_np = np.clip(u_np, self.u_min, self.u_max)
+        else:
+            u_np = np.clip(u_np, -self.cfg.u_max, self.cfg.u_max)
+        return torch.FloatTensor(u_np).unsqueeze(0).to(self.device)
 
     def _decode_action(self, u: torch.Tensor) -> torch.Tensor:
         da = self.m_cfg.action_dim
@@ -290,8 +402,7 @@ class KODAQLQRPlanner:
 
         for t in range(horizon):
             u_t    = self._lqr_u(o_cur, o_star, L_cur, M_cur)
-            with torch.enable_grad():
-                a_t    = self._decode_action(u_t)
+            a_t    = self._decode_action(u_t)
             o_next = self._step(o_cur, u_t, A_cur, B_cur)
             h_next = model.recurrent(h_cur, o_cur, a_t)
             w_next = model.skill_prior.soft_weights(h_next)
@@ -784,6 +895,10 @@ def main():
     p.add_argument('--R_scale',    type=float, default=10.0)
     p.add_argument('--lambda_unc', type=float, default=0.1)
     p.add_argument('--out_dir',    default='checkpoints/kodaq/lqr')
+    p.add_argument('--survey',     action='store_true',
+                   help='Run action encoder range survey before planning')
+    p.add_argument('--u_bounds',   default=None,
+                   help='Path to saved u_bounds.npz (skip survey if provided)')
     p.add_argument('--device',     default='cuda' if torch.cuda.is_available() else 'cpu')
     args = p.parse_args()
 
@@ -796,6 +911,17 @@ def main():
 
     planner = KODAQLQRPlanner(model, LQRConfig(
         Q_scale=args.Q_scale, R_scale=args.R_scale, lambda_unc=args.lambda_unc))
+
+    # ── U-space bounds ──────────────────────────────────────────────────────
+    if args.u_bounds and Path(args.u_bounds).exists():
+        planner.load_u_bounds(args.u_bounds)
+    elif args.survey:
+        save_path = str(Path(args.out_dir) / 'u_bounds.npz')
+        Path(args.out_dir).mkdir(parents=True, exist_ok=True)
+        planner.survey(save_path=save_path)
+    else:
+        print('No u_bounds: using symmetric clip u_max=cfg.u_max  '
+              '(run with --survey to enable per-dim bounds)')
 
     x_seq_full, _, _ = load_x_sequences(args.x_cache)
     print(f"x_seq: {x_seq_full.shape}")
