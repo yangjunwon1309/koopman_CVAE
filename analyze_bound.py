@@ -178,3 +178,136 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Clip analysis: how much does per-dim clip change u_t?
+# ─────────────────────────────────────────────────────────────────────────────
+
+def analyze_clip_effect(results: list, out_path: str = 'clip_analysis.png'):
+    """
+    LQR rollout 결과에서 clip 전후 변형 정도 분석.
+
+    results: run_lqr_on_episodes() 반환값
+    각 stage의 plan['clip_raw'], plan['clip_post'], plan['clip_delta'] 사용.
+
+    플롯:
+      1. Per-dim clip activation rate  (얼마나 자주 clip이 걸리는가)
+      2. Per-dim mean |delta|          (clip으로 인한 평균 변형 크기)
+      3. Per-step clip active rate     (시간에 따른 clip 빈도)
+      4. Raw vs Post scatter           (전체 u 분포 비교)
+    """
+    import matplotlib; matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    # 모든 stage에서 clip_raw, clip_post 수집
+    all_raw   = []
+    all_post  = []
+    all_delta = []
+    all_active_rate = []
+
+    for res in results:
+        for stage in res.get('stages', []):
+            plan = stage['plan']
+            if plan.get('clip_raw') is not None:
+                all_raw.append(plan['clip_raw'])      # (H, d_u)
+                all_post.append(plan['clip_post'])
+                all_delta.append(plan['clip_delta'])
+                all_active_rate.append(plan['clip_active_rate'])
+
+    if not all_raw:
+        print("No clip data found. Run with --u_bounds to enable per-dim clip.")
+        return
+
+    raw   = np.concatenate(all_raw,   axis=0)   # (N_total, d_u)
+    post  = np.concatenate(all_post,  axis=0)
+    delta = np.concatenate(all_delta, axis=0)
+
+    d_u  = raw.shape[1]
+    dims = np.arange(d_u)
+
+    # Per-dim stats
+    clip_rate_per_dim = (delta > 1e-6).mean(axis=0)   # (d_u,) fraction clipped
+    mean_delta_per_dim = delta.mean(axis=0)            # (d_u,) mean |change|
+    max_delta_per_dim  = delta.max(axis=0)             # (d_u,) max |change|
+
+    # Per-step stats (averaged over dims)
+    clip_rate_per_step = (delta > 1e-6).mean(axis=1)   # (N,) 
+
+    overall_rate = float((delta > 1e-6).mean())
+    print(f"\n=== Clip Effect Analysis ===")
+    print(f"  Total u_t vectors: {len(raw)}")
+    print(f"  Overall clip rate: {overall_rate:.4f} ({overall_rate*100:.1f}% of entries)")
+    print(f"  Mean |delta|:  {mean_delta_per_dim.mean():.5f}")
+    print(f"  Max  |delta|:  {max_delta_per_dim.max():.5f}")
+    print(f"  Mean clip_active_rate per rollout: {np.mean(all_active_rate):.5f}")
+
+    # Top clipped dims
+    top_dims = np.argsort(clip_rate_per_dim)[::-1][:10]
+    print(f"\nTop 10 most-clipped dims:")
+    for d in top_dims:
+        print(f"  dim {d:3d}: clip_rate={clip_rate_per_dim[d]:.3f}  "
+              f"mean_|delta|={mean_delta_per_dim[d]:.4f}  "
+              f"max_|delta|={max_delta_per_dim[d]:.4f}")
+
+    # ── Figure ────────────────────────────────────────────────────────────────
+    fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+    BLUE  = '#1E88E5'; RED = '#E53935'; GREEN = '#43A047'; ORG = '#FB8C00'
+
+    # 1. Per-dim clip activation rate
+    ax = axes[0, 0]
+    ax.bar(dims, clip_rate_per_dim * 100, color=RED, alpha=0.7, width=0.8)
+    ax.axhline(overall_rate * 100, color='k', ls='--', lw=1.2,
+               label=f'overall={overall_rate*100:.1f}%')
+    ax.set_xlabel('Latent dim', fontsize=9)
+    ax.set_ylabel('Clip activation rate (%)', fontsize=9)
+    ax.set_title('Per-dim clip activation rate\n(how often clip is active)', fontsize=10, fontweight='bold')
+    ax.legend(fontsize=8)
+    ax.spines[['top','right']].set_visible(False)
+
+    # 2. Per-dim mean |delta|
+    ax = axes[0, 1]
+    ax.bar(dims, mean_delta_per_dim, color=ORG, alpha=0.7, width=0.8, label='mean |delta|')
+    ax.bar(dims, max_delta_per_dim,  color=RED, alpha=0.3, width=0.8, label='max |delta|')
+    ax.set_xlabel('Latent dim', fontsize=9)
+    ax.set_ylabel('|u_raw - u_clipped|', fontsize=9)
+    ax.set_title('Per-dim clip magnitude\n(how much u_t changes)', fontsize=10, fontweight='bold')
+    ax.legend(fontsize=8)
+    ax.spines[['top','right']].set_visible(False)
+
+    # 3. Per-step clip active rate (time series, first 200 steps)
+    ax = axes[1, 0]
+    n_show = min(len(clip_rate_per_step), 200)
+    ax.plot(clip_rate_per_step[:n_show] * 100, color=BLUE, lw=1.2, alpha=0.8)
+    ax.axhline(overall_rate * 100, color='k', ls='--', lw=1.0,
+               label=f'mean={overall_rate*100:.1f}%')
+    ax.set_xlabel('Rollout step (across all episodes)', fontsize=9)
+    ax.set_ylabel('Dims clipped (%)', fontsize=9)
+    ax.set_title('Per-step clip rate over time\n(first 200 steps)', fontsize=10, fontweight='bold')
+    ax.legend(fontsize=8)
+    ax.spines[['top','right']].set_visible(False)
+
+    # 4. Raw vs Post distribution (flattened)
+    ax = axes[1, 1]
+    flat_raw  = raw.flatten()
+    flat_post = post.flatten()
+    bins = 60
+    ax.hist(flat_raw,  bins=bins, color=RED,  alpha=0.5, density=True, label='u_raw (unconstrained)')
+    ax.hist(flat_post, bins=bins, color=BLUE, alpha=0.5, density=True, label='u_post (clipped)')
+    ax.set_xlabel('u value', fontsize=9)
+    ax.set_ylabel('Density', fontsize=9)
+    ax.set_title('u distribution: raw vs clipped\n(all dims, all steps)', fontsize=10, fontweight='bold')
+    ax.legend(fontsize=8)
+    ax.spines[['top','right']].set_visible(False)
+
+    fig.suptitle(
+        f'Clip Effect Analysis  |  {len(raw)} u_t vectors  |  '
+        f'Overall clip rate: {overall_rate*100:.1f}%  |  '
+        f'Mean |delta|: {mean_delta_per_dim.mean():.4f}',
+        fontsize=11, fontweight='bold'
+    )
+    plt.tight_layout()
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved: {out_path}")

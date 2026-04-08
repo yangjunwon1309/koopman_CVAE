@@ -290,6 +290,9 @@ class KODAQLQRPlanner:
         # None until survey() is called
         self.u_min: Optional[np.ndarray] = None   # (d_u,)
         self.u_max: Optional[np.ndarray] = None   # (d_u,)
+        # Clip statistics buffers (reset per rollout)
+        self._clip_raw:  List = []
+        self._clip_post: List = []
 
     def _get_gain(self, A: np.ndarray, B: np.ndarray):
         """Cache DARE by (A, B) → (P, L, M)."""
@@ -358,12 +361,15 @@ class KODAQLQRPlanner:
         """
         z_t   = o[0].cpu().numpy()          # (m,)
         z_star = o_star[0].cpu().numpy()    # (m,)
-        u_np  = M @ z_star - L @ z_t
+        u_raw = M @ z_star - L @ z_t
         # Per-dim clip using surveyed ψ(a) range
         if self.cfg.use_u_bounds and self.u_min is not None:
-            u_np = np.clip(u_np, self.u_min, self.u_max)
+            u_np = np.clip(u_raw, self.u_min, self.u_max)
         else:
-            u_np = np.clip(u_np, -self.cfg.u_max, self.cfg.u_max)
+            u_np = np.clip(u_raw, -self.cfg.u_max, self.cfg.u_max)
+        # Record clip statistics
+        self._clip_raw.append(u_raw)
+        self._clip_post.append(u_np)
         return torch.FloatTensor(u_np).unsqueeze(0).to(self.device)
 
     def _decode_action(self, u: torch.Tensor) -> torch.Tensor:
@@ -391,6 +397,8 @@ class KODAQLQRPlanner:
         u_t* = M(w_t)·z*(h_t) - L(w_t)·z_t  (Option A+C).
         """
         model = self.model
+        self._clip_raw  = []   # reset per rollout
+        self._clip_post = []
         o_list, u_list, a_list, w_list, costs = [o0], [], [], [], []
         o_cur, h_cur = o0, h0
 
@@ -427,14 +435,22 @@ class KODAQLQRPlanner:
             a_list.append(a_t);    w_list.append(w_next)
             o_cur, h_cur, w_cur = o_next, h_next, w_next
 
+        # Clip statistics
+        clip_raw  = np.stack(self._clip_raw,  axis=0) if self._clip_raw  else None  # (H, d_u)
+        clip_post = np.stack(self._clip_post, axis=0) if self._clip_post else None  # (H, d_u)
+        clip_delta = np.abs(clip_raw - clip_post) if (clip_raw is not None) else None
         return {
-            'o_traj':     torch.cat(o_list, 0),
-            'u_traj':     torch.cat(u_list, 0),
-            'a_traj':     torch.cat(a_list, 0),
-            'w_traj':     torch.cat(w_list, 0),
-            'costs':      np.array(costs),
-            'total_cost': float(np.sum(costs)),
-            'o_star':     o_star,   # 마지막 재인코딩된 z*
+            'o_traj':      torch.cat(o_list, 0),
+            'u_traj':      torch.cat(u_list, 0),
+            'a_traj':      torch.cat(a_list, 0),
+            'w_traj':      torch.cat(w_list, 0),
+            'costs':       np.array(costs),
+            'total_cost':  float(np.sum(costs)),
+            'o_star':      o_star,
+            'clip_raw':    clip_raw,    # (H, d_u) unconstrained u
+            'clip_post':   clip_post,   # (H, d_u) clipped u
+            'clip_delta':  clip_delta,  # (H, d_u) |raw - post|
+            'clip_active_rate': float(clip_delta.mean()) if clip_delta is not None else 0.0,
         }
 
     def _decode_x_traj(self, o_traj: torch.Tensor) -> torch.Tensor:
@@ -944,6 +960,8 @@ def main():
 
     visualize_lqr_results(results, args.out_dir)
     print(f"\nDone. -> {args.out_dir}/")
+    from analyze_bound import analyze_clip_effect
+    analyze_clip_effect(results, args.out_dir + '/clip_analysis.png')
 
 
 if __name__ == '__main__':
