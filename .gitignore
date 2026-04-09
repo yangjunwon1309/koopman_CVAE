@@ -4,6 +4,7 @@ checkpoints/
 lqr/
 #*.png
 *.jpg
+*.gif
 
 # Python
 __pycache__/
