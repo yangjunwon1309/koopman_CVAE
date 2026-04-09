@@ -113,12 +113,15 @@ def koopman_step(
 
 def reconstruction_loss(
     preds:   dict,          # {'delta_e': (B,T,2048), 'delta_p': (B,T,42),
-                            #  'q': (B,T,9), 'qdot': (B,T,9)}
+                            #  'q': (B,T,9), 'qdot': (B,T,9), 'reward': (B,T,1)}
     targets: dict,          # same keys, same shapes
-    weights: dict,          # {'delta_e': α_e, 'delta_p': α_p, 'q': α_q, 'qdot': α_qd}
+    weights: dict,          # {'delta_e': α_e, ..., 'reward': α_r}
 ) -> tuple:
     """
-    L_rec = Σ_j α_j · MSE(x̂^(j), x^(j))
+    L_rec = Σ_j α_j · loss_j(x̂^(j), x^(j))
+
+    'reward' key uses BCE loss (sparse 0/1 target).
+    All other keys use MSE in symlog space.
 
     Returns (total_loss, {key: per_head_loss})
     """
@@ -129,7 +132,11 @@ def reconstruction_loss(
         p = preds[key]
         t = targets[key]
         w = weights.get(key, 1.0)
-        loss = F.mse_loss(p, t)
+        if key == 'reward':
+            # BCE for sparse binary reward (0/1)
+            loss = F.binary_cross_entropy_with_logits(p, t.float())
+        else:
+            loss = F.mse_loss(p, t)
         per_head[key] = loss
         total = total + w * loss
 
@@ -227,11 +234,11 @@ def eigenvalue_stability_loss(
 # ──────────────────────────────────────────────────────────────────────────────
 
 def compute_total_loss(
-    loss_rec:   torch.Tensor,
-    loss_dyn:   torch.Tensor,
-    loss_skill: torch.Tensor,
-    loss_reg:   torch.Tensor,
-    loss_stab:  torch.Tensor,
+    loss_rec:    torch.Tensor,
+    loss_dyn:    torch.Tensor,
+    loss_skill:  torch.Tensor,
+    loss_reg:    torch.Tensor,
+    loss_stab:   torch.Tensor,
     lambda1: float,   # Koopman weight
     lambda2: float,   # Skill supervision weight
     lambda3: float,   # Posterior regularization weight
@@ -240,8 +247,9 @@ def compute_total_loss(
 ) -> tuple:
     """
     Phase-gated loss aggregation.
+    L_rec already includes reward head loss (weighted by alpha_reward).
 
-    Phase 1 (warm-up) : L_rec only
+    Phase 1 (warm-up) : L_rec only  (includes reward head)
     Phase 2 (Koopman) : L_rec + λ1·L_dyn + λ2·L_skill
     Phase 3 (full)    : L_rec + λ1·L_dyn + λ2·L_skill + λ3·L_reg
 
@@ -253,7 +261,6 @@ def compute_total_loss(
         total = total + lambda1 * loss_dyn + lambda2 * loss_skill
     if phase >= 3:
         total = total + lambda3 * loss_reg
-    # Stability always active (lightweight)
     total = total + lambda4 * loss_stab
 
     return total, {

@@ -44,6 +44,7 @@ class KODAQWindowDataset(Dataset):
         x_seq:        (T, 2108)  float32
         actions:      (T, 9)     float32
         skill_labels: (T,)       int64
+        rewards:      (T,)       float32  — reward diff (0/1 sparse)
     """
 
     def __init__(
@@ -54,20 +55,29 @@ class KODAQWindowDataset(Dataset):
         terminals:    np.ndarray,   # (N,) bool
         seq_len:      int = 64,
         stride:       int = None,
+        rewards:      np.ndarray = None,  # (N,) float — reward diff
     ):
         self.x_seq        = x_seq.astype(np.float32)
         self.actions      = actions.astype(np.float32)
         self.skill_labels = skill_labels.astype(np.int64)
+        # reward diff: diff of cumulative reward → sparse 0/1
+        if rewards is not None:
+            r = rewards.astype(np.float32)
+            r_diff = np.diff(r, prepend=r[0])
+            r_diff = np.clip(r_diff, 0, 1)   # 0 or 1
+            self.rewards = r_diff
+        else:
+            self.rewards = np.zeros(len(x_seq), dtype=np.float32)
         self.seq_len      = seq_len
         if stride is None:
             stride = seq_len // 2
         self.stride       = stride
 
-        # Build valid windows that don't cross episode boundaries
         self.windows = self._build_windows(terminals)
         print(f"KODAQWindowDataset: {len(self.windows)} windows  "
               f"seq_len={seq_len}  stride={stride}  "
-              f"N={len(x_seq)}  x_dim={x_seq.shape[1]}")
+              f"N={len(x_seq)}  x_dim={x_seq.shape[1]}  "
+              f"reward_rate={self.rewards.mean():.4f}")
 
     def _build_windows(self, terminals: np.ndarray) -> List[int]:
         """
@@ -93,13 +103,14 @@ class KODAQWindowDataset(Dataset):
     def __len__(self) -> int:
         return len(self.windows)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         start = self.windows[idx]
         end   = start + self.seq_len
         return (
             torch.from_numpy(self.x_seq[start:end]),         # (T, 2108)
             torch.from_numpy(self.actions[start:end]),        # (T, 9)
             torch.from_numpy(self.skill_labels[start:end]),   # (T,)
+            torch.from_numpy(self.rewards[start:end]),        # (T,) float32
         )
 
 
@@ -215,6 +226,17 @@ def load_kodaq_dataset(
     print(f"Loading skill labels: {h5_path}")
     assignments, logprobs = load_cluster_data(h5_path)
 
+    # ── Load rewards from D4RL (for reward head) ──────────────────────────────
+    rewards = None
+    try:
+        import d4rl, gym
+        ds      = gym.make(env_name).get_dataset()
+        rewards = ds['rewards'].astype(np.float32)   # (N,) cumulative sparse
+        print(f"  Rewards loaded: shape={rewards.shape}  "
+              f"nonzero={( rewards > 0).sum()}")
+    except Exception as e:
+        print(f"  Rewards not available ({e}). Using zeros.")
+
     print(f"  x_seq={x_seq.shape}  actions={actions.shape}  "
           f"terminals={terminals.sum()}  K={assignments.max()+1}")
 
@@ -227,6 +249,7 @@ def load_kodaq_dataset(
             terminals=terminals,
             seq_len=seq_len,
             stride=stride,
+            rewards=rewards,
         )
     elif mode == 'segment':
         # Need obs to build segments (for backward compat)

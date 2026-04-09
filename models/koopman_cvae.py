@@ -88,7 +88,7 @@ class KoopmanCVAEConfig:
     koopman_dim:  int   = 128    # d_o: lifted state dimension
     gru_hidden:   int   = 256    # d_h: GRU hidden state
     action_latent: int  = 64     # d_u: encoded action dimension
-    num_skills:   int   = 7      # K: number of skill components
+    num_skills:   int   = 8      # K: number of skill components
 
     # ── Architecture ──────────────────────────────────────────────────────────
     mlp_hidden:   int   = 256
@@ -108,6 +108,11 @@ class KoopmanCVAEConfig:
     alpha_q:       float = 1.0
     alpha_qdot:    float = 0.5   # velocities noisier → lower weight
 
+    # ── Reward head ───────────────────────────────────────────────────────────
+    use_reward_head: bool  = True   # binary reward prediction head (BCE)
+    alpha_reward:    float = 1.0    # BCE weight in L_rec
+    dt_control:      float = 0.08   # Kitchen dt=12.5Hz for qdot finite diff
+
     # ── Training phase ────────────────────────────────────────────────────────
     # Updated externally by trainer
     phase:        int   = 1      # 1: rec, 2: +dyn+skill, 3: +reg
@@ -120,12 +125,15 @@ class KoopmanCVAEConfig:
 
     @property
     def rec_weights(self) -> dict:
-        return {
+        d = {
             'delta_e': self.alpha_delta_e,
             'delta_p': self.alpha_delta_p,
             'q':       self.alpha_q,
             'qdot':    self.alpha_qdot,
         }
+        if self.use_reward_head:
+            d['reward'] = self.alpha_reward
+        return d
 
     @property
     def x_slices(self) -> dict:
@@ -390,35 +398,58 @@ class SkillKoopmanOperator(nn.Module):
 
 class MultiHeadDecoder(nn.Module):
     """
-    4 independent MLP heads (§3.4):
-      Δê_t = D_e(o_t)    (2048-dim)
-      Δp̂_t = D_p(o_t)   (42-dim)
-      q̂_t  = D_q(o_t)   (9-dim)
-      q̇̂_t  = D_qd(o_t)  (9-dim)
+    Decoder heads:
+      Δê_t  = D_e(o_t)        (2048-dim, symlog MSE)
+      Δp̂_t  = D_p(o_t)       (42-dim,   symlog MSE)
+      q̂_t   = D_q(o_t)       (9-dim,    symlog MSE)
+      q̇̂_t   = finite_diff(q̂) (9-dim,    symlog MSE)
+                                — physically: q̇ = (q_t - q_{t-1}) / dt
+      r̂_t   = D_r(o_t)       (1-dim,    BCE logit)  optional reward head
 
-    Output in symlog space; targets also symlog'd before MSE.
-    Weighted by α_j to balance scale differences.
+    qdot head is removed and derived from q via finite difference.
+    For single-step input (no time dim) qdot is zero.
     """
     def __init__(self, cfg: KoopmanCVAEConfig):
         super().__init__()
-        m = cfg.koopman_dim
-        h = cfg.mlp_hidden
-        n = cfg.dec_layers
-        d = cfg.dropout
+        m  = cfg.koopman_dim
+        h  = cfg.mlp_hidden
+        n  = cfg.dec_layers
+        d  = cfg.dropout
+        self.dt              = cfg.dt_control
+        self.use_reward_head = cfg.use_reward_head
 
         self.head_delta_e = make_mlp(m, cfg.dim_delta_e, h, n, d)
         self.head_delta_p = make_mlp(m, cfg.dim_delta_p, h, n, d)
         self.head_q       = make_mlp(m, cfg.dim_q,       h, n, d)
-        self.head_qdot    = make_mlp(m, cfg.dim_qdot,    h, n, d)
+        # head_qdot removed — derived from head_q via finite difference
+        if self.use_reward_head:
+            self.head_reward = make_mlp(m, 1, h, max(n - 1, 1), d)
 
     def forward(self, o: torch.Tensor) -> dict:
-        """o: (..., m) → dict of (..., dim_j) in symlog space"""
-        return {
+        """
+        o: (..., m) or (B, T, m)
+
+        qdot:
+          ndim >= 3 (B,T,m): qdot[...,1:,:] = (q[...,1:,:] - q[...,:-1,:]) / dt
+          otherwise:         qdot = zeros_like(q)
+        """
+        q_hat = self.head_q(o)
+
+        if o.dim() >= 3:
+            dq = torch.zeros_like(q_hat)
+            dq[..., 1:, :] = (q_hat[..., 1:, :] - q_hat[..., :-1, :]) / self.dt
+        else:
+            dq = torch.zeros_like(q_hat)
+
+        out = {
             'delta_e': self.head_delta_e(o),
             'delta_p': self.head_delta_p(o),
-            'q':       self.head_q(o),
-            'qdot':    self.head_qdot(o),
+            'q':       q_hat,
+            'qdot':    dq,
         }
+        if self.use_reward_head:
+            out['reward'] = self.head_reward(o)   # (..., 1) raw logit for BCE
+        return out
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -493,6 +524,7 @@ class KoopmanCVAE(nn.Module):
         actions:      torch.Tensor,              # (B, T, da)
         skill_labels: Optional[torch.Tensor] = None,  # (B, T) int64
         mask:         Optional[torch.Tensor] = None,  # (B, T) bool
+        rewards:      Optional[torch.Tensor] = None,  # (B, T) float — reward diff (0/1)
     ) -> Dict[str, torch.Tensor]:
 
         B, T, _ = x_batch.shape
@@ -560,6 +592,7 @@ class KoopmanCVAE(nn.Module):
             skill_labels=skill_labels,
             o_seq=o_seq,
             mask=mask,
+            rewards=rewards,
         )
 
         return {
@@ -576,26 +609,30 @@ class KoopmanCVAE(nn.Module):
 
     def _compute_losses(
         self,
-        x_batch:      torch.Tensor,              # (B, T, x_dim)
-        recon:        dict,                       # per-head decoder outputs (B, T, dim)
-        mu_seq:       torch.Tensor,              # (B, T, m)
-        koopman_pred: torch.Tensor,              # (B, T-1, m)  Ā·o_t + B̄·u_t
-        skill_logits: torch.Tensor,              # (B, T, K)
-        skill_labels: Optional[torch.Tensor],    # (B, T) int64 or None
-        o_seq:        torch.Tensor,              # (B, T, m)  (unused here, for ext)
-        mask:         Optional[torch.Tensor],    # (B, T) bool or None
+        x_batch:      torch.Tensor,
+        recon:        dict,
+        mu_seq:       torch.Tensor,
+        koopman_pred: torch.Tensor,
+        skill_logits: torch.Tensor,
+        skill_labels: Optional[torch.Tensor],
+        o_seq:        torch.Tensor,
+        mask:         Optional[torch.Tensor],
+        rewards:      Optional[torch.Tensor] = None,   # (B, T) reward diff
     ) -> Dict[str, torch.Tensor]:
 
         cfg    = self.cfg
         slices = cfg.x_slices
 
-        # ── L_rec: 4-head reconstruction in symlog space ────────────────────
+        # ── L_rec: multi-head reconstruction ────────────────────────────────
         targets = {
             'delta_e': symlog(x_batch[..., slices['delta_e']]),
             'delta_p': symlog(x_batch[..., slices['delta_p']]),
             'q':       symlog(x_batch[..., slices['q']]),
             'qdot':    symlog(x_batch[..., slices['qdot']]),
         }
+        # Reward head: binary diff target (0/1)
+        if cfg.use_reward_head and rewards is not None and 'reward' in recon:
+            targets['reward'] = rewards.unsqueeze(-1).float()   # (B, T, 1)
         loss_rec, rec_per_head = reconstruction_loss(recon, targets, cfg.rec_weights)
 
         # ── L_dyn: Koopman consistency (t → t+1) ───────────────────────────
@@ -641,11 +678,12 @@ class KoopmanCVAE(nn.Module):
             'loss_skill': loss_skill,
             'loss_reg':   loss_reg,
             'loss_stab':  loss_stab,
-            # Per-head reconstruction for diagnostics
             'loss_rec_delta_e': rec_per_head['delta_e'],
             'loss_rec_delta_p': rec_per_head['delta_p'],
             'loss_rec_q':       rec_per_head['q'],
             'loss_rec_qdot':    rec_per_head['qdot'],
+            'loss_rec_reward':  rec_per_head.get('reward',
+                                    torch.tensor(0.0, device=x_batch.device)),
         }
 
     # ── Inference utilities ──────────────────────────────────────────────────
@@ -718,5 +756,8 @@ class KoopmanCVAE(nn.Module):
         result = {'o_preds': torch.stack(o_preds, dim=1)}
         for key in ['delta_e', 'delta_p', 'q', 'qdot']:
             result[key] = symexp(torch.stack([r[key] for r in recon_preds], dim=1))
+        if self.cfg.use_reward_head and 'reward' in recon_preds[0]:
+            result['reward'] = torch.sigmoid(
+                torch.stack([r['reward'] for r in recon_preds], dim=1))
 
         return result

@@ -84,6 +84,7 @@ class Trainer:
     LOG_KEYS = [
         'loss', 'loss_rec', 'loss_dyn', 'loss_skill', 'loss_reg', 'loss_stab',
         'loss_rec_delta_e', 'loss_rec_delta_p', 'loss_rec_q', 'loss_rec_qdot',
+        'loss_rec_reward',
     ]
 
     def __init__(self, model: KoopmanCVAE, cfg: KoopmanCVAEConfig, args):
@@ -115,21 +116,26 @@ class Trainer:
 
     def _forward_batch(self, batch) -> Dict:
         if isinstance(batch, (list, tuple)):
-            x_seq, actions, skill_labels = batch
+            if len(batch) == 4:
+                x_seq, actions, skill_labels, rewards = batch
+            else:
+                x_seq, actions, skill_labels = batch
+                rewards = None
             mask = None
         else:
             x_seq        = batch['x_seq']
             actions      = batch['actions']
             skill_labels = batch['skill_labels']
             mask         = batch.get('mask', None)
+            rewards      = batch.get('rewards', None)
 
         x_seq        = x_seq.to(self.device)
         actions      = actions.to(self.device)
         skill_labels = skill_labels.to(self.device)
-        if mask is not None:
-            mask = mask.to(self.device)
+        if mask    is not None: mask    = mask.to(self.device)
+        if rewards is not None: rewards = rewards.to(self.device)
 
-        return self.model(x_seq, actions, skill_labels, mask)
+        return self.model(x_seq, actions, skill_labels, mask, rewards)
 
     def train_epoch(self, loader) -> Dict:
         self.model.train()
@@ -172,9 +178,10 @@ class Trainer:
 
             phase = self.model.cfg.phase
             log   = f"[Ph{phase}] Ep {epoch:4d}"
-            for k in ['loss', 'loss_rec', 'loss_dyn', 'loss_skill', 'loss_reg']:
+            for k in ['loss', 'loss_rec', 'loss_dyn', 'loss_skill',
+                      'loss_reg', 'loss_rec_reward']:
                 if k in metrics:
-                    log += f"  {k.replace('loss_','')}={metrics[k]:.4f}"
+                    log += f"  {k.replace('loss_','').replace('rec_','')}={metrics[k]:.4f}"
 
             if val_loader and epoch % self.args.eval_freq == 0:
                 val     = self.eval_epoch(val_loader)
@@ -239,7 +246,7 @@ def parse_args():
     p.add_argument('--koopman_dim',   type=int,   default=None)
     p.add_argument('--gru_hidden',    type=int,   default=None)
     p.add_argument('--action_latent', type=int,   default=None)
-    p.add_argument('--num_skills',    type=int,   default=7)
+    p.add_argument('--num_skills',    type=int,   default=None)
     p.add_argument('--mlp_hidden',    type=int,   default=None)
     p.add_argument('--enc_layers',    type=int,   default=None)
     p.add_argument('--dec_layers',    type=int,   default=None)
@@ -252,13 +259,13 @@ def parse_args():
     p.add_argument('--lambda4', type=float, default=None, help='L_stab weight')
 
     # Phase scheduling
-    p.add_argument('--phase2_epoch', type=int, default=30,
+    p.add_argument('--phase2_epoch', type=int, default=60,
                    help='Epoch to switch to Phase 2 (+L_dyn, +L_skill)')
-    p.add_argument('--phase3_epoch', type=int, default=80,
+    p.add_argument('--phase3_epoch', type=int, default=160,
                    help='Epoch to switch to Phase 3 (+L_reg)')
 
     # Training
-    p.add_argument('--epochs',       type=int,   default=200)
+    p.add_argument('--epochs',       type=int,   default=400)
     p.add_argument('--batch_size',   type=int,   default=32)
     p.add_argument('--lr',           type=float, default=3e-4)
     p.add_argument('--weight_decay', type=float, default=1e-4)
