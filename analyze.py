@@ -236,13 +236,15 @@ def plot_skill_trajectories(model: KoopmanCVAE, samples: list, out_path: str):
 def plot_rollout_quality(model: KoopmanCVAE, samples: list, out_path: str,
                          cond_len: int = 16, horizon: int = 32):
     """
-    Per-episode rollout visualization:
-      Col 0: Δq_t  — 9 joint position diffs
-      Col 1: q̇_t   — 9 joint velocities (finite-diff head)
-      Col 2: Δp_t  — top-5 active object state dims
-      Col 3: r_t   — reward prediction (sigmoid) vs ground-truth sparse signal
+    4개의 별도 figure로 저장:
+      rollout_quality_dq.png   — Δq_t  : N_ep rows × 9 joint cols
+      rollout_quality_qd.png   — q̇_t   : N_ep rows × 9 joint cols
+      rollout_quality_dp.png   — Δp_t  : N_ep rows × 42 dim cols (all)
+      rollout_quality_rew.png  — r_t   : N_ep rows × 1 col (reward head)
+
+    각 서브플롯: solid=true, dashed=pred.
     """
-    cfg  = model.cfg
+    cfg   = model.cfg
     dq_sl = slice(cfg.dim_delta_e + cfg.dim_delta_p,
                   cfg.dim_delta_e + cfg.dim_delta_p + cfg.dim_q)
     qd_sl = slice(cfg.dim_delta_e + cfg.dim_delta_p + cfg.dim_q,
@@ -251,110 +253,155 @@ def plot_rollout_quality(model: KoopmanCVAE, samples: list, out_path: str,
                   cfg.dim_delta_e + cfg.dim_delta_p)
 
     has_reward = cfg.use_reward_head
-    n_cols = 4 if has_reward else 3
-    n      = len(samples)
+    n          = len(samples)
+    cmap9      = plt.get_cmap('tab10')   # 9 joints
+    base_dir   = Path(out_path).parent
 
-    fig, axes = plt.subplots(n, n_cols, figsize=(5 * n_cols, 3 * n))
-    if n == 1: axes = axes.reshape(1, n_cols)
-
-    cmap = plt.get_cmap('tab10')
-
+    # ── Collect rollout results ────────────────────────────────────────────
+    results = []
     rmse_dq_all, rmse_qd_all, rmse_dp_all = [], [], []
     roc_auc_all = []
 
-    for i, samp in enumerate(samples):
+    for samp in samples:
         x, a = samp['x'], samp['a']
         L    = samp['length']
         if L < cond_len + horizon + 2:
-            for ax in axes[i]: ax.set_visible(False)
-            continue
+            results.append(None); continue
 
         x_cond = x[:, :cond_len]
         a_cond = a[:, :cond_len]
         a_plan = a[:, cond_len:cond_len + horizon]
-        x_true = x[0, cond_len:cond_len + horizon].cpu().numpy()   # (H, x_dim)
+        x_true = x[0, cond_len:cond_len + horizon].cpu().numpy()
+        r_true = samp['rewards'][cond_len:cond_len + horizon]
 
-        # Ground-truth reward segment
-        r_true = samp['rewards'][cond_len:cond_len + horizon]       # (H,)
-
-        pred   = model.rollout(x_cond, a_cond, a_plan)
-
-        dq_pred = pred['q'][0].cpu().numpy()         # (H, 9)
+        pred    = model.rollout(x_cond, a_cond, a_plan)
+        dq_pred = pred['q'][0].cpu().numpy()          # (H, 9)
         dq_true = x_true[:, dq_sl]
-        qd_pred = pred['qdot'][0].cpu().numpy()      # (H, 9)
+        qd_pred = pred['qdot'][0].cpu().numpy()       # (H, 9)
         qd_true = x_true[:, qd_sl]
-        dp_pred = pred['delta_p'][0].cpu().numpy()   # (H, 42)
+        dp_pred = pred['delta_p'][0].cpu().numpy()    # (H, 42)
         dp_true = x_true[:, dp_sl]
+        r_pred  = (pred['reward'][0, :, 0].cpu().numpy()
+                   if has_reward and 'reward' in pred else None)
 
-        rmse_dq = np.sqrt(((dq_pred - dq_true)**2).mean(axis=0))   # (9,)
-        rmse_qd = np.sqrt(((qd_pred - qd_true)**2).mean(axis=0))   # (9,)
-        rmse_dp = np.sqrt(((dp_pred - dp_true)**2).mean(axis=0))   # (42,)
+        rmse_dq = np.sqrt(((dq_pred - dq_true)**2).mean(axis=0))
+        rmse_qd = np.sqrt(((qd_pred - qd_true)**2).mean(axis=0))
+        rmse_dp = np.sqrt(((dp_pred - dp_true)**2).mean(axis=0))
         rmse_dq_all.append(rmse_dq)
         rmse_qd_all.append(rmse_qd)
         rmse_dp_all.append(rmse_dp)
 
-        ts = np.arange(horizon)
+        results.append({
+            'dq_pred': dq_pred, 'dq_true': dq_true,
+            'qd_pred': qd_pred, 'qd_true': qd_true,
+            'dp_pred': dp_pred, 'dp_true': dp_true,
+            'r_pred':  r_pred,  'r_true':  r_true,
+            'rmse_dq': rmse_dq, 'rmse_qd': rmse_qd, 'rmse_dp': rmse_dp,
+        })
 
-        # ── Col 0: Δq_t (9 joints) ────────────────────────────────────────
-        ax = axes[i, 0]
+    ts = np.arange(horizon)
+
+    # ── Helper ────────────────────────────────────────────────────────────
+    def _finalize(fig, title, path):
+        fig.suptitle(f'{title}  cond={cond_len}→pred {horizon}  '
+                     f'(solid=true, dashed=pred)',
+                     fontsize=11, fontweight='bold')
+        plt.tight_layout()
+        plt.savefig(path, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"Saved: {path}")
+
+    # ── Figure 1: Δq_t  (N_ep × 9 joints) ────────────────────────────────
+    fig1, axes1 = plt.subplots(n, 9, figsize=(3.2*9, 2.8*n), sharey='row')
+    if n == 1: axes1 = axes1.reshape(1, 9)
+    for i, res in enumerate(results):
+        if res is None:
+            for ax in axes1[i]: ax.set_visible(False); continue
         for d in range(9):
-            c = cmap(d)
-            ax.plot(ts, dq_true[:, d], '-',  color=c, lw=1.2, alpha=0.8)
-            ax.plot(ts, dq_pred[:, d], '--', color=c, lw=1.2, alpha=0.8)
-        ax.axvline(0, color='gray', lw=0.8, ls=':')
-        ax.set_title(f'Ep {i}  Δq (9 joints)\nMean RMSE={rmse_dq.mean():.4f}',
-                     fontsize=9)
-        ax.set_xlabel('step'); ax.set_ylabel('Δq [rad]', fontsize=8)
-        ax.spines[['top','right']].set_visible(False)
+            ax = axes1[i, d]
+            ax.plot(ts, res['dq_true'][:, d], '-',  color=cmap9(d), lw=1.3, alpha=0.85)
+            ax.plot(ts, res['dq_pred'][:, d], '--', color=cmap9(d), lw=1.3, alpha=0.85)
+            rmse_d = res['rmse_dq'][d]
+            ax.set_title(f'J{d}  RMSE={rmse_d:.4f}', fontsize=7)
+            if d == 0: ax.set_ylabel(f'Ep {i}\nΔq[rad]', fontsize=7)
+            ax.set_xlabel('step', fontsize=6)
+            ax.tick_params(labelsize=6)
+            ax.spines[['top','right']].set_visible(False)
+    _finalize(fig1, 'Δq_t per joint',
+              str(base_dir / 'rollout_quality_dq.png'))
 
-        # ── Col 1: q̇_t (9 joints) ─────────────────────────────────────────
-        ax = axes[i, 1]
+    # ── Figure 2: q̇_t  (N_ep × 9 joints) ─────────────────────────────────
+    fig2, axes2 = plt.subplots(n, 9, figsize=(3.2*9, 2.8*n), sharey='row')
+    if n == 1: axes2 = axes2.reshape(1, 9)
+    for i, res in enumerate(results):
+        if res is None:
+            for ax in axes2[i]: ax.set_visible(False); continue
         for d in range(9):
-            c = cmap(d)
-            ax.plot(ts, qd_true[:, d], '-',  color=c, lw=1.2, alpha=0.8)
-            ax.plot(ts, qd_pred[:, d], '--', color=c, lw=1.2, alpha=0.8)
-        ax.axvline(0, color='gray', lw=0.8, ls=':')
-        ax.set_title(f'Ep {i}  q̇ (finite-diff)\nMean RMSE={rmse_qd.mean():.4f}',
-                     fontsize=9)
-        ax.set_xlabel('step'); ax.set_ylabel('q̇ [rad/s]', fontsize=8)
-        ax.spines[['top','right']].set_visible(False)
+            ax = axes2[i, d]
+            ax.plot(ts, res['qd_true'][:, d], '-',  color=cmap9(d), lw=1.3, alpha=0.85)
+            ax.plot(ts, res['qd_pred'][:, d], '--', color=cmap9(d), lw=1.3, alpha=0.85)
+            rmse_d = res['rmse_qd'][d]
+            ax.set_title(f'J{d}  RMSE={rmse_d:.4f}', fontsize=7)
+            if d == 0: ax.set_ylabel(f'Ep {i}\nq̇[rad/s]', fontsize=7)
+            ax.set_xlabel('step', fontsize=6)
+            ax.tick_params(labelsize=6)
+            ax.spines[['top','right']].set_visible(False)
+    _finalize(fig2, 'q̇_t per joint (finite-diff head)',
+              str(base_dir / 'rollout_quality_qd.png'))
 
-        # ── Col 2: Δp_t (top-5 active object dims) ────────────────────────
-        ax = axes[i, 2]
-        top5  = np.argsort(dp_true.var(axis=0))[-5:]
-        for j, d in enumerate(top5):
-            c = PAL[j % len(PAL)]
-            ax.plot(ts, dp_true[:, d], '-',  color=c, lw=1.5, alpha=0.85,
-                    label=f'dim{d}')
-            ax.plot(ts, dp_pred[:, d], '--', color=c, lw=1.5, alpha=0.85)
-        ax.axvline(0, color='gray', lw=0.8, ls=':')
-        top5_rmse = rmse_dp[top5].mean()
-        ax.set_title(f'Ep {i}  Δp (top-5 active)\nTop-5 RMSE={top5_rmse:.4f}',
-                     fontsize=9)
-        ax.set_xlabel('step'); ax.set_ylabel('Δp', fontsize=8)
-        if i == 0: ax.legend(fontsize=7, loc='upper left')
-        ax.spines[['top','right']].set_visible(False)
+    # ── Figure 3: Δp_t  (N_ep × 42 dims) — ALL dims ───────────────────────
+    N_dp  = cfg.dim_delta_p   # 42
+    ncols = min(N_dp, 7)      # 7 cols per row (each object has ~6-7 dims)
+    nrows_per_ep = (N_dp + ncols - 1) // ncols
+    fig3, axes3 = plt.subplots(n * nrows_per_ep, ncols,
+                               figsize=(3.0 * ncols, 2.5 * n * nrows_per_ep))
+    axes3 = np.array(axes3).reshape(n * nrows_per_ep, ncols)
 
-        # ── Col 3: r_t reward prediction ──────────────────────────────────
-        if has_reward and 'reward' in pred:
-            ax  = axes[i, 3]
-            r_pred = pred['reward'][0, :, 0].cpu().numpy()  # (H,) sigmoid prob
+    cmap42 = plt.get_cmap('tab20')
+    for i, res in enumerate(results):
+        row_base = i * nrows_per_ep
+        if res is None:
+            for r in range(nrows_per_ep):
+                for ax in axes3[row_base + r]: ax.set_visible(False)
+            continue
+        for d in range(N_dp):
+            r, c = divmod(d, ncols)
+            ax   = axes3[row_base + r, c]
+            col  = cmap42(d % 20)
+            ax.plot(ts, res['dp_true'][:, d], '-',  color=col, lw=1.2, alpha=0.85)
+            ax.plot(ts, res['dp_pred'][:, d], '--', color=col, lw=1.2, alpha=0.85)
+            rmse_d = res['rmse_dp'][d]
+            ax.set_title(f'dim{d}  R={rmse_d:.4f}', fontsize=6)
+            if c == 0: ax.set_ylabel(f'Ep{i}', fontsize=6)
+            ax.set_xlabel('step', fontsize=5)
+            ax.tick_params(labelsize=5)
+            ax.spines[['top','right']].set_visible(False)
+        # Hide unused subplots in last row
+        for d in range(N_dp, nrows_per_ep * ncols):
+            r, c = divmod(d, ncols)
+            axes3[row_base + r, c].set_visible(False)
+    _finalize(fig3, 'Δp_t all 42 object dims',
+              str(base_dir / 'rollout_quality_dp.png'))
 
-            # Ground-truth: sparse step bar
-            reward_steps = np.where(r_true > 0)[0]
+    # ── Figure 4: reward  (N_ep × 1) ──────────────────────────────────────
+    if has_reward:
+        fig4, axes4 = plt.subplots(n, 1, figsize=(10, 3 * n))
+        if n == 1: axes4 = [axes4]
+        for i, res in enumerate(results):
+            ax = axes4[i]
+            if res is None or res['r_pred'] is None:
+                ax.set_visible(False); continue
+            r_true = res['r_true']
+            r_pred = res['r_pred']
             ax.bar(ts, r_true, color='#43A047', alpha=0.35, width=1.0,
-                   label='GT reward (diff)')
+                   label='GT (diff)')
             ax.plot(ts, r_pred, color='#E53935', lw=1.8,
-                    label='Pred prob (sigmoid)')
-            for rs in reward_steps:
-                ax.axvline(rs, color='#43A047', lw=1.5, ls='--', alpha=0.7)
-
-            # Binary cross-entropy for this segment
-            eps   = 1e-7
-            r_p   = np.clip(r_pred, eps, 1 - eps)
-            bce   = -(r_true * np.log(r_p) + (1 - r_true) * np.log(1 - r_p)).mean()
-
-            # AUC-ROC if both classes exist
+                    label='Pred (sigmoid)')
+            for rs in np.where(r_true > 0)[0]:
+                ax.axvline(rs, color='#43A047', lw=1.5, ls='--', alpha=0.6)
+            eps = 1e-7
+            r_p = np.clip(r_pred, eps, 1-eps)
+            bce = -(r_true * np.log(r_p) + (1-r_true) * np.log(1-r_p)).mean()
             auc_str = ''
             if r_true.sum() > 0 and r_true.sum() < len(r_true):
                 try:
@@ -364,44 +411,13 @@ def plot_rollout_quality(model: KoopmanCVAE, samples: list, out_path: str,
                     auc_str = f'  AUC={auc:.3f}'
                 except Exception:
                     pass
-
-            ax.set_title(f'Ep {i}  Reward prediction\nBCE={bce:.4f}{auc_str}',
-                         fontsize=9)
-            ax.set_xlabel('step')
-            ax.set_ylabel('prob / signal', fontsize=8)
+            ax.set_title(f'Ep {i}  BCE={bce:.4f}{auc_str}', fontsize=9)
+            ax.set_ylabel('prob'); ax.set_xlabel('step')
             ax.set_ylim(-0.05, 1.15)
-            ax.legend(fontsize=7, loc='upper left')
+            ax.legend(fontsize=8, loc='upper left')
             ax.spines[['top','right']].set_visible(False)
-        elif has_reward:
-            axes[i, 3].set_title('reward head: no output', fontsize=8)
-            axes[i, 3].set_visible(False)
-
-    # ── Add legend for joint colors (col 0) ───────────────────────────────
-    from matplotlib.lines import Line2D
-    joint_handles = [
-        Line2D([0],[0], color=cmap(d), lw=1.5, label=f'Joint {d}')
-        for d in range(9)
-    ]
-    fig.legend(handles=joint_handles, loc='lower center',
-               ncol=9, fontsize=7, bbox_to_anchor=(0.4, -0.01))
-
-    if has_reward:
-        leg_r = [
-            Line2D([0],[0], color='#43A047', lw=2, label='GT reward'),
-            Line2D([0],[0], color='#E53935', lw=2, label='Pred reward'),
-        ]
-        fig.legend(handles=leg_r, loc='lower right', fontsize=8,
-                   bbox_to_anchor=(1.0, -0.01))
-
-    fig.suptitle(
-        f'Rollout Quality  cond={cond_len} → pred {horizon} steps  '
-        f'(solid=true, dashed=pred)',
-        fontsize=12, fontweight='bold'
-    )
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"Saved: {out_path}")
+        _finalize(fig4, 'Reward prediction (sigmoid vs GT sparse)',
+                  str(base_dir / 'rollout_quality_rew.png'))
 
     # ── Console summary ────────────────────────────────────────────────────
     dq_avg = np.mean(rmse_dq_all, axis=0)
@@ -421,12 +437,14 @@ def plot_rollout_quality(model: KoopmanCVAE, samples: list, out_path: str,
 
     print(f"\n [Δp_t — Object state (42 dims)]")
     print(f"   Overall mean RMSE: {dp_avg.mean():.4f}")
-    print(f"   Top-3 highest err dims: {np.argsort(dp_avg)[-3:][::-1]}")
+    top3 = np.argsort(dp_avg)[-3:][::-1]
+    print(f"   Top-3 highest err dims: {top3}  RMSE={dp_avg[top3].round(4)}")
 
     if has_reward and roc_auc_all:
         print(f"\n [r_t — Reward prediction]")
         print(f"   Mean AUC-ROC: {np.mean(roc_auc_all):.4f} "
-              f"(over {len(roc_auc_all)} episodes with both reward classes)")
+              f"(over {len(roc_auc_all)} episodes)")
+
 
 
 # ──────────────────────────────────────────────────────────────────────────────
