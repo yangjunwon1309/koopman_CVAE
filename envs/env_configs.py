@@ -43,7 +43,7 @@ ENV_CONFIGS = {
         'koopman_dim':  128,     # d_o: larger for high-dim x_t
         'gru_hidden':   256,     # d_h
         'action_latent': 64,     # d_u
-        'num_skills':   7,       # K (EXTRACT)
+        'num_skills':   8,       # K (EXTRACT)
         'mlp_hidden':   512,     # wider for 2108-dim input
         'enc_layers':   4,
         'dec_layers':   4,
@@ -71,7 +71,7 @@ ENV_CONFIGS = {
         'koopman_dim':  128,
         'gru_hidden':   256,
         'action_latent': 64,
-        'num_skills':   7,
+        'num_skills':   8,
         'mlp_hidden':   512,
         'enc_layers':   4,
         'dec_layers':   4,
@@ -95,7 +95,7 @@ ENV_CONFIGS = {
         'koopman_dim':  128,
         'gru_hidden':   256,
         'action_latent': 64,
-        'num_skills':   7,
+        'num_skills':   8,
         'mlp_hidden':   512,
         'enc_layers':   4,
         'dec_layers':   4,
@@ -187,11 +187,15 @@ def build_config(args) -> KoopmanCVAEConfig:
         'mlp_hidden', 'enc_layers', 'dec_layers', 'dropout',
         'lambda1', 'lambda2', 'lambda3', 'lambda4',
         'alpha_delta_e', 'alpha_delta_p', 'alpha_q', 'alpha_qdot',
-        'phase',
+        'phase', 'dyn_horizon', 'dyn_alpha',
     ]
     for key in override_keys:
         val = getattr(args, key, None)
         if val is not None:
             cfg_kwargs[key] = val
+
+    # --no_multistep_dyn flag
+    if getattr(args, 'no_multistep_dyn', False):
+        cfg_kwargs['multistep_dyn'] = False
 
     return KoopmanCVAEConfig(**cfg_kwargs)

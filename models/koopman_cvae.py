@@ -60,6 +60,7 @@ from models.losses import (
     blend_koopman, koopman_step,
     reconstruction_loss,
     koopman_consistency_loss,
+    multistep_koopman_consistency_loss,
     skill_classification_loss,
     posterior_regularization_loss,
     eigenvalue_stability_loss,
@@ -112,6 +113,11 @@ class KoopmanCVAEConfig:
     use_reward_head: bool  = True   # binary reward prediction head (BCE)
     alpha_reward:    float = 1.0    # BCE weight in L_rec
     dt_control:      float = 0.08   # Kitchen dt=12.5Hz for qdot finite diff
+
+    # ── Multi-step L_dyn (RWM-style) ─────────────────────────────────────────
+    multistep_dyn:  bool  = True    # use multi-step Koopman consistency loss
+    dyn_horizon:    int   = 8       # H: rollout steps (≤ seq_len-1)
+    dyn_alpha:      float = 0.95    # α: per-step decay
 
     # ── Training phase ────────────────────────────────────────────────────────
     # Updated externally by trainer
@@ -544,6 +550,8 @@ class KoopmanCVAE(nn.Module):
         sigma2_list   = []
         skill_logits_list = []
         koopman_pred_list = []  # Ā·o_{t-1} + B̄·u_{t-1}  for t=1..T-1
+        A_bar_list    = []      # Ā(w_t) per step  — for multi-step L_dyn
+        B_bar_list    = []      # B̄(w_t) per step
 
         for t in range(T):
             x_t = x_batch[:, t]      # (B, x_dim)
@@ -561,11 +569,13 @@ class KoopmanCVAE(nn.Module):
             sigma2_list.append(sig2_t)
 
             # Koopman prior prediction for NEXT step (t+1)
-            # Used in L_dyn and L_reg
+            # Collect A_bar, B_bar for multi-step L_dyn
             if t < T - 1:
                 _, A_bar, B_bar = self.koopman(o_t, u_t, w_t)
                 o_next_pred = koopman_step(o_t, u_t, A_bar, B_bar)
-                koopman_pred_list.append(o_next_pred)          # (B, m)
+                koopman_pred_list.append(o_next_pred)   # (B, m)
+                A_bar_list.append(A_bar)                # (B, m, m)
+                B_bar_list.append(B_bar)                # (B, m, d_u)
 
             # GRU update: h_{t+1} = f(h_t, o_t, a_t)
             h = self.recurrent(h, o_t, a_t)
@@ -578,6 +588,8 @@ class KoopmanCVAE(nn.Module):
         sigma2_seq      = torch.stack(sigma2_list,    dim=1)   # (B, T, m)
         skill_logits    = torch.stack(skill_logits_list, dim=1)  # (B, T, K)
         koopman_pred    = torch.stack(koopman_pred_list, dim=1)  # (B, T-1, m)
+        A_bar_seq       = torch.stack(A_bar_list, dim=1)         # (B, T-1, m, m)
+        B_bar_seq       = torch.stack(B_bar_list, dim=1)         # (B, T-1, m, d_u)
 
         # ── Decode ───────────────────────────────────────────────────────────
         recon = self.decoder(o_seq)                             # dict of (B, T, dim)
@@ -588,6 +600,9 @@ class KoopmanCVAE(nn.Module):
             recon=recon,
             mu_seq=mu_seq,
             koopman_pred=koopman_pred,
+            A_bar_seq=A_bar_seq,
+            B_bar_seq=B_bar_seq,
+            u_seq=u_seq[:, :T-1],
             skill_logits=skill_logits,
             skill_labels=skill_labels,
             o_seq=o_seq,
@@ -611,13 +626,16 @@ class KoopmanCVAE(nn.Module):
         self,
         x_batch:      torch.Tensor,
         recon:        dict,
-        mu_seq:       torch.Tensor,
-        koopman_pred: torch.Tensor,
+        mu_seq:       torch.Tensor,              # (B, T, m)
+        koopman_pred: torch.Tensor,              # (B, T-1, m)  single-step pred
+        A_bar_seq:    torch.Tensor,              # (B, T-1, m, m)
+        B_bar_seq:    torch.Tensor,              # (B, T-1, m, d_u)
+        u_seq:        torch.Tensor,              # (B, T-1, d_u)
         skill_logits: torch.Tensor,
         skill_labels: Optional[torch.Tensor],
-        o_seq:        torch.Tensor,
+        o_seq:        torch.Tensor,              # (B, T, m)
         mask:         Optional[torch.Tensor],
-        rewards:      Optional[torch.Tensor] = None,   # (B, T) reward diff
+        rewards:      Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
 
         cfg    = self.cfg
@@ -630,19 +648,28 @@ class KoopmanCVAE(nn.Module):
             'q':       symlog(x_batch[..., slices['q']]),
             'qdot':    symlog(x_batch[..., slices['qdot']]),
         }
-        # Reward head: binary diff target (0/1)
         if cfg.use_reward_head and rewards is not None and 'reward' in recon:
-            targets['reward'] = rewards.unsqueeze(-1).float()   # (B, T, 1)
+            targets['reward'] = rewards.unsqueeze(-1).float()
         loss_rec, rec_per_head = reconstruction_loss(recon, targets, cfg.rec_weights)
 
-        # ── L_dyn: Koopman consistency (t → t+1) ───────────────────────────
-        # μ_φ(x_{t+1}, h_{t+1}) vs Ā(w_t)·o_t + B̄(w_t)·u_t
-        # mu_seq[:, 1:]: posterior mean at t+1
-        # koopman_pred:  Koopman prediction from t (computed during unroll)
-        loss_dyn = koopman_consistency_loss(
-            mu_next = mu_seq[:, 1:],       # (B, T-1, m)
-            o_pred  = koopman_pred,        # (B, T-1, m)
-        )
+        # ── L_dyn: Koopman consistency ────────────────────────────────────
+        if cfg.multistep_dyn:
+            # Multi-step RWM-style: (1/N) Σ α^k ||μ_{t+k} - ẑ_{t+k}||²
+            loss_dyn = multistep_koopman_consistency_loss(
+                mu_seq    = mu_seq,
+                o_seq     = o_seq,
+                A_bar_seq = A_bar_seq,
+                B_bar_seq = B_bar_seq,
+                u_seq     = u_seq,
+                H         = cfg.dyn_horizon,
+                alpha     = cfg.dyn_alpha,
+            )
+        else:
+            # Single-step fallback
+            loss_dyn = koopman_consistency_loss(
+                mu_next = mu_seq[:, 1:],
+                o_pred  = koopman_pred,
+            )
 
         # ── L_skill: cross-entropy vs EXTRACT labels ─────────────────────────
         if skill_labels is not None:

@@ -258,6 +258,14 @@ def parse_args():
     p.add_argument('--lambda3', type=float, default=None, help='L_reg weight')
     p.add_argument('--lambda4', type=float, default=None, help='L_stab weight')
 
+    # Multi-step L_dyn
+    p.add_argument('--dyn_horizon',    type=int,   default=8,
+                   help='H: multi-step rollout horizon for L_dyn (RWM-style)')
+    p.add_argument('--dyn_alpha',      type=float, default=0.95,
+                   help='α: per-step decay factor for multi-step L_dyn')
+    p.add_argument('--no_multistep_dyn', action='store_true',
+                   help='Disable multi-step L_dyn (use single-step fallback)')
+
     # Phase scheduling
     p.add_argument('--phase2_epoch', type=int, default=60,
                    help='Epoch to switch to Phase 2 (+L_dyn, +L_skill)')

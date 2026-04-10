@@ -129,6 +129,8 @@ def reconstruction_loss(
     total    = torch.tensor(0.0, device=next(iter(preds.values())).device)
 
     for key in preds:
+        if key not in targets:
+            continue   # skip heads with no target (e.g. reward head disabled)
         p = preds[key]
         t = targets[key]
         w = weights.get(key, 1.0)
@@ -144,7 +146,7 @@ def reconstruction_loss(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# L_dyn: Koopman Consistency (L2, NOT KL — avoids posterior collapse)
+# L_dyn: Multi-step Koopman Consistency (RWM-style)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def koopman_consistency_loss(
@@ -152,13 +154,74 @@ def koopman_consistency_loss(
     o_pred:    torch.Tensor,   # (B, T-1, m)  Koopman prediction Ā·o_t + B̄·u_t
 ) -> torch.Tensor:
     """
+    Single-step L_dyn (kept for backward compatibility).
     L_dyn = ||μ_φ(x_{t+1}, h_{t+1}) - (Ā·o_t + B̄·u_t)||²
-
-    Regresses the posterior mean at t+1 onto the Koopman prediction.
-    Enforces linear dynamics structure without KL-induced collapse.
-    No stop_gradient here: gradient flows to both encoder and A/B matrices.
     """
     return F.mse_loss(mu_next, o_pred)
+
+
+def multistep_koopman_consistency_loss(
+    mu_seq:     torch.Tensor,        # (B, T, m)   posterior means μ_φ(x_t, h_t)
+    o_seq:      torch.Tensor,        # (B, T, m)   posterior samples o_t
+    A_bar_seq:  torch.Tensor,        # (B, T-1, m, m)  blended Ā(w_t) per step
+    B_bar_seq:  torch.Tensor,        # (B, T-1, m, d_u)
+    u_seq:      torch.Tensor,        # (B, T-1, d_u)   encoded actions
+    H:          int   = 8,           # rollout horizon
+    alpha:      float = 0.95,        # decay factor per step
+) -> torch.Tensor:
+    """
+    Multi-step L_dyn (RWM-style):
+
+        L_dyn = (1/N) Σ_{k=1}^{H} α^k · ||μ_φ(x_{t+k}, h_{t+k}) - ẑ_{t+k}||²
+
+    ẑ_{t+k} = k-step Koopman rollout from o_t:
+        ẑ_{t+1} = Ā(w_t)·o_t     + B̄(w_t)·u_t
+        ẑ_{t+2} = Ā(w_{t+1})·ẑ_{t+1} + B̄(w_{t+1})·u_{t+1}
+        ...
+
+    The α^k decay focuses more on near-term accuracy but still penalizes
+    long-horizon error accumulation.
+
+    L_reg is NOT changed — it keeps single-step stop-gradient alignment.
+    """
+    B, T, m = mu_seq.shape
+    T_seq   = T - 1   # number of valid transition steps
+
+    if H > T_seq:
+        H = T_seq
+
+    total_loss  = torch.tensor(0.0, device=mu_seq.device)
+    total_weight = 0.0
+
+    for t in range(T_seq - H + 1):
+        # k-step rollout starting from o_t
+        z_hat = o_seq[:, t]      # (B, m)
+
+        for k in range(1, H + 1):
+            step = t + k - 1     # index into A_bar_seq / u_seq
+            if step >= T_seq:
+                break
+
+            A_t = A_bar_seq[:, step]   # (B, m, m)
+            B_t = B_bar_seq[:, step]   # (B, m, d_u)
+            u_t = u_seq[:, step]       # (B, d_u)
+
+            # ẑ_{t+k} = Ā_{t+k-1}·ẑ_{t+k-1} + B̄_{t+k-1}·u_{t+k-1}
+            z_hat = (A_t @ z_hat.unsqueeze(-1)).squeeze(-1) \
+                  + (B_t @ u_t.unsqueeze(-1)).squeeze(-1)
+
+            # Target: posterior mean at t+k
+            mu_target = mu_seq[:, t + k]   # (B, m)
+
+            weight      = alpha ** k
+            step_loss   = F.mse_loss(z_hat, mu_target)
+            total_loss  = total_loss + weight * step_loss
+            total_weight += weight
+
+    if total_weight > 0:
+        total_loss = total_loss / total_weight
+
+    return total_loss
 
 
 # ──────────────────────────────────────────────────────────────────────────────
