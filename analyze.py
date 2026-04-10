@@ -74,15 +74,42 @@ def load_rewards(env_name: str = 'kitchen-mixed-v0') -> np.ndarray:
 
 
 def sample_episodes(x_seq, actions, terminals, assignments,
-                    rewards=None, n_ep=5, device='cuda'):
-    """에피소드 경계 기준으로 n_ep개 샘플링 (긴 에피소드 우선)."""
+                    rewards=None, n_ep=5, device='cuda',
+                    ep_indices=None):
+    """
+    에피소드 샘플링.
+
+    ep_indices (List[int]): 지정 시 해당 인덱스의 에피소드만 사용.
+                            None이면 길이 기준 상위 n_ep개 자동 선택.
+
+    에피소드 인덱스는 terminal 기준으로 분리된 순서 (0-based).
+    전체 에피소드 수 확인:
+        python analyze.py --list_eps
+    """
     ends   = list(np.where(terminals)[0])
     starts = [0] + [e + 1 for e in ends[:-1]]
-    eps    = list(zip(starts, ends))
-    eps_sorted = sorted(eps, key=lambda se: se[1]-se[0], reverse=True)[:n_ep]
+    eps    = list(zip(starts, ends))   # [(s0,e0), (s1,e1), ...]
+    n_total = len(eps)
+
+    if ep_indices is not None:
+        # 명시적 인덱스 사용 (범위 체크)
+        invalid = [i for i in ep_indices if i < 0 or i >= n_total]
+        if invalid:
+            print(f"  Warning: ep_indices {invalid} out of range "
+                  f"(total episodes={n_total}). Skipping.")
+        selected = [(i, eps[i]) for i in ep_indices if 0 <= i < n_total]
+        print(f"  Using specified ep_indices={[i for i,_ in selected]}  "
+              f"(total={n_total})")
+    else:
+        # 길이 기준 상위 n_ep
+        sorted_eps = sorted(enumerate(eps),
+                            key=lambda ie: ie[1][1] - ie[1][0], reverse=True)
+        selected   = sorted_eps[:n_ep]
+        print(f"  Auto-selected top-{n_ep} longest episodes "
+              f"(total={n_total})")
 
     samples = []
-    for s, e in eps_sorted:
+    for ep_idx, (s, e) in selected:
         L = e - s + 1
         samp = {
             'x':      torch.FloatTensor(x_seq[s:e+1]).unsqueeze(0).to(device),
@@ -90,11 +117,10 @@ def sample_episodes(x_seq, actions, terminals, assignments,
             'labels': assignments[s:e+1],
             'length': L,
             'start':  s,
+            'ep_idx': ep_idx,
         }
-        if rewards is not None:
-            samp['rewards'] = rewards[s:e+1]   # (L,) float32 diff
-        else:
-            samp['rewards'] = np.zeros(L, dtype=np.float32)
+        samp['rewards'] = (rewards[s:e+1] if rewards is not None
+                           else np.zeros(L, dtype=np.float32))
         samples.append(samp)
     return samples
 
@@ -453,16 +479,20 @@ def plot_rollout_quality(model: KoopmanCVAE, samples: list, out_path: str,
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument('--ckpt',      default='checkpoints/kodaq/best.pt')
-    p.add_argument('--x_cache',   default='checkpoints/skill_pretrain/x_sequences.npz')
-    p.add_argument('--skill_h5',  default='checkpoints/skill_pretrain/cluster_data.h5')
-    p.add_argument('--env',       default='kitchen-mixed-v0',
-                   help='D4RL env name for reward loading')
-    p.add_argument('--out_dir',   default='checkpoints/kodaq/analysis')
-    p.add_argument('--n_ep',      type=int, default=5)
-    p.add_argument('--cond_len',  type=int, default=16)
-    p.add_argument('--horizon',   type=int, default=32)
-    p.add_argument('--device',    default='cuda' if torch.cuda.is_available() else 'cpu')
+    p.add_argument('--ckpt',       default='checkpoints/kodaq/best.pt')
+    p.add_argument('--x_cache',    default='checkpoints/skill_pretrain/x_sequences.npz')
+    p.add_argument('--skill_h5',   default='checkpoints/skill_pretrain/cluster_data.h5')
+    p.add_argument('--env',        default='kitchen-mixed-v0')
+    p.add_argument('--out_dir',    default='checkpoints/kodaq/analysis')
+    p.add_argument('--n_ep',       type=int, default=5,
+                   help='Auto-select top-N longest episodes (ignored if --ep_indices set)')
+    p.add_argument('--ep_indices', type=str, default=None,
+                   help='Comma-separated episode indices to analyze, e.g. "0,3,7,25"')
+    p.add_argument('--list_eps',   action='store_true',
+                   help='Print all episode indices with length and reward, then exit')
+    p.add_argument('--cond_len',   type=int, default=16)
+    p.add_argument('--horizon',    type=int, default=32)
+    p.add_argument('--device',     default='cuda' if torch.cuda.is_available() else 'cpu')
     return p.parse_args()
 
 
@@ -475,8 +505,29 @@ if __name__ == '__main__':
     model   = load_model(args.ckpt, device)
     x_seq, actions, terminals, assignments, K = load_data(args.x_cache, args.skill_h5)
     rewards = load_rewards(args.env)
-    samples = sample_episodes(x_seq, actions, terminals, assignments,
-                              rewards=rewards, n_ep=args.n_ep, device=device)
+
+    # ── --list_eps: 전체 에피소드 목록 출력 후 종료 ──────────────────────────
+    if args.list_eps:
+        ends   = list(np.where(terminals)[0])
+        starts = [0] + [e + 1 for e in ends[:-1]]
+        print(f"\n{'Idx':>5}  {'Start':>7}  {'End':>7}  {'Len':>5}  {'Reward':>7}")
+        print('-' * 42)
+        for i, (s, e) in enumerate(zip(starts, ends)):
+            r_sum = float(rewards[s:e+1].sum()) if rewards is not None else 0.0
+            print(f"{i:>5}  {s:>7}  {e:>7}  {e-s+1:>5}  {r_sum:>7.1f}")
+        print(f"\nTotal episodes: {len(starts)}")
+        exit(0)
+
+    # ── Parse ep_indices ─────────────────────────────────────────────────────
+    ep_indices = None
+    if args.ep_indices:
+        ep_indices = [int(x) for x in args.ep_indices.split(',')]
+
+    samples = sample_episodes(
+        x_seq, actions, terminals, assignments,
+        rewards=rewards, n_ep=args.n_ep,
+        device=device, ep_indices=ep_indices,
+    )
     print(f"Sampled {len(samples)} episodes\n")
 
     print("=== 1. Koopman Eigenvalues ===")
