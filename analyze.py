@@ -445,6 +445,86 @@ def plot_rollout_quality(model: KoopmanCVAE, samples: list, out_path: str,
         _finalize(fig4, 'Reward prediction (sigmoid vs GT sparse)',
                   str(base_dir / 'rollout_quality_rew.png'))
 
+    # ── Figure 0 (통합 overview): rollout_quality.png  N_ep rows × 4 cols ──
+    # Col 0: Δq (9 joints overlaid)  Col 1: q̇  Col 2: Δp top-5  Col 3: reward
+    n_cols_ov = 4 if has_reward else 3
+    fig0, axes0 = plt.subplots(n, n_cols_ov,
+                               figsize=(5 * n_cols_ov, 3.2 * n),
+                               squeeze=False)
+    cmap9_ov = plt.get_cmap('tab10')
+
+    for i, res in enumerate(results):
+        if res is None:
+            for ax in axes0[i]: ax.set_visible(False)
+            continue
+
+        # Col 0: Δq
+        ax = axes0[i, 0]
+        for d in range(9):
+            c = cmap9_ov(d)
+            ax.plot(ts, res['dq_true'][:, d], '-',  color=c, lw=1.2, alpha=0.8)
+            ax.plot(ts, res['dq_pred'][:, d], '--', color=c, lw=1.2, alpha=0.8)
+        ax.set_title(f'Ep {i}  Δq (9 joints)\nMean RMSE={res["rmse_dq"].mean():.4f}',
+                     fontsize=9)
+        ax.set_xlabel('step'); ax.set_ylabel('Δq [rad]', fontsize=8)
+        ax.spines[['top','right']].set_visible(False)
+
+        # Col 1: q̇
+        ax = axes0[i, 1]
+        for d in range(9):
+            c = cmap9_ov(d)
+            ax.plot(ts, res['qd_true'][:, d], '-',  color=c, lw=1.2, alpha=0.8)
+            ax.plot(ts, res['qd_pred'][:, d], '--', color=c, lw=1.2, alpha=0.8)
+        ax.set_title(f'Ep {i}  q̇ (finite-diff)\nMean RMSE={res["rmse_qd"].mean():.4f}',
+                     fontsize=9)
+        ax.set_xlabel('step'); ax.set_ylabel('q̇ [rad/s]', fontsize=8)
+        ax.spines[['top','right']].set_visible(False)
+
+        # Col 2: Δp top-5
+        ax   = axes0[i, 2]
+        top5 = np.argsort(res['dp_true'].var(axis=0))[-5:]
+        for j, d in enumerate(top5):
+            c = PAL[j % len(PAL)]
+            ax.plot(ts, res['dp_true'][:, d], '-',  color=c, lw=1.5, alpha=0.85,
+                    label=f'dim{d}')
+            ax.plot(ts, res['dp_pred'][:, d], '--', color=c, lw=1.5, alpha=0.85)
+        ax.set_title(
+            f'Ep {i}  Δp (top-5)\nRMSE={res["rmse_dp"][top5].mean():.4f}',
+            fontsize=9)
+        ax.set_xlabel('step'); ax.set_ylabel('Δp', fontsize=8)
+        if i == 0: ax.legend(fontsize=7, loc='upper left')
+        ax.spines[['top','right']].set_visible(False)
+
+        # Col 3: reward
+        if has_reward:
+            ax = axes0[i, 3]
+            r_true = res['r_true']
+            r_pred = res['r_pred']
+            if r_pred is not None:
+                ax.bar(ts, r_true, color='#43A047', alpha=0.35, width=1.0,
+                       label='GT')
+                ax.plot(ts, r_pred, color='#E53935', lw=1.8, label='Pred')
+                for rs in np.where(r_true > 0)[0]:
+                    ax.axvline(rs, color='#43A047', lw=1.2, ls='--', alpha=0.6)
+                eps = 1e-7
+                r_p  = np.clip(r_pred, eps, 1-eps)
+                bce  = -(r_true*np.log(r_p)+(1-r_true)*np.log(1-r_p)).mean()
+                ax.set_title(f'Ep {i}  Reward\nBCE={bce:.4f}', fontsize=9)
+                ax.set_ylim(-0.05, 1.15)
+                ax.legend(fontsize=7)
+            else:
+                ax.set_visible(False)
+            ax.spines[['top','right']].set_visible(False)
+
+    from matplotlib.lines import Line2D as _L2D
+    jh = [_L2D([0],[0], color=cmap9_ov(d), lw=1.5, label=f'J{d}')
+          for d in range(9)]
+    fig0.legend(handles=jh, loc='lower center', ncol=9,
+                fontsize=7, bbox_to_anchor=(0.4, -0.01))
+    _finalize(fig0,
+              'Rollout Quality  (solid=true, dashed=pred)',
+              str(base_dir / 'rollout_quality.png'))
+
     # ── Console summary ────────────────────────────────────────────────────
     dq_avg = np.mean(rmse_dq_all, axis=0)
     qd_avg = np.mean(rmse_qd_all, axis=0)
