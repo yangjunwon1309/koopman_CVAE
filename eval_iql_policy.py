@@ -37,7 +37,7 @@ from typing import Dict, List, Optional, Tuple
 from models.koopman_cvae import KoopmanCVAE
 from models.losses import symexp
 from data.extract_skill_label import load_x_sequences
-from lqr_planner import (
+from lqr_koopman import (
     KODAQLQRPlanner, LQRConfig, load_kitchen_episodes,
     obs_to_x_goal, blend_koopman,
     X_DQ_START, X_DQ_END, X_DP_START, X_DP_END,
