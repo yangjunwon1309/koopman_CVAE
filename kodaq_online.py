@@ -57,7 +57,7 @@ from collections import deque
 from models.koopman_cvae import KoopmanCVAE
 from models.losses import symexp
 from data.extract_skill_label import load_x_sequences
-from lqr_koopman import (
+from lqr_planner import (
     KODAQLQRPlanner, LQRConfig,
     load_kitchen_episodes, obs_to_x_goal,
     blend_koopman,
@@ -387,20 +387,39 @@ class KoopmanWorldModelWrapper:
         self.model  = model
         self.device = device
 
-        # Freeze Koopman operator + decoder
+        # Freeze Koopman operator + decoder reconstruction heads
+        # (reward_head는 active로 유지 → online env reward로 fine-tune)
         for p in model.koopman.parameters():
             p.requires_grad_(False)
+
+        # decoder 전체를 먼저 freeze
         for p in model.decoder.parameters():
             p.requires_grad_(False)
+
+        # reward_head 브랜치만 다시 active로 전환
+        # KoopmanCVAE에서 reward head는 두 가지 위치 중 하나:
+        #   A. model.decoder.head_reward  (MultiHeadDecoder 내부)
+        #   B. model.reward_head          (별도 모듈)
+        reward_head_params = []
+        if model.cfg.use_reward_head:
+            if hasattr(model.decoder, 'head_reward'):
+                # Case A: decoder 내부에 있음 → 해당 파라미터만 unfreeze
+                for p in model.decoder.head_reward.parameters():
+                    p.requires_grad_(True)
+                reward_head_params = list(model.decoder.head_reward.parameters())
+            elif hasattr(model, 'reward_head'):
+                # Case B: 별도 모듈
+                for p in model.reward_head.parameters():
+                    p.requires_grad_(True)
+                reward_head_params = list(model.reward_head.parameters())
 
         # Active params
         active_params = (
             list(model.posterior.parameters()) +
             list(model.recurrent.parameters()) +
-            list(model.skill_prior.parameters())
+            list(model.skill_prior.parameters()) +
+            reward_head_params
         )
-        if hasattr(model, 'reward_head') and model.cfg.use_reward_head:
-            active_params += list(model.reward_head.parameters())
 
         self.opt = torch.optim.Adam(active_params, lr=wm_lr)
 
@@ -449,11 +468,17 @@ class KoopmanWorldModelWrapper:
         z_next = (A_bar @ z.T).T + (B_bar @ u.T).T       # (1, m)
         h_next = model.recurrent(h, z, a)                 # (1, d_h)
 
-        recon  = model.decoder(z_next)
-        if model.cfg.use_reward_head and 'reward' in recon:
-            r_hat = torch.sigmoid(recon['reward']).item()
-        else:
-            r_hat = 0.0
+        # reward head 접근 (decoder 내부/외부 모두 처리)
+        r_hat = 0.0
+        if model.cfg.use_reward_head:
+            if hasattr(model.decoder, 'head_reward'):
+                r_logit = model.decoder.head_reward(z_next)
+            elif hasattr(model, 'reward_head'):
+                r_logit = model.reward_head(z_next)
+            else:
+                r_logit = None
+            if r_logit is not None:
+                r_hat = torch.sigmoid(r_logit).mean().item()
 
         return z_next, h_next, r_hat
 
@@ -477,42 +502,49 @@ class KoopmanWorldModelWrapper:
                obs_next_batch: torch.Tensor,
                r_env_batch: torch.Tensor) -> float:
         """
-        Active 파라미터 (posterior, recurrent, reward_head) fine-tune.
+        Active 파라미터 (posterior, reward_head) fine-tune.
 
-        reward_head를 실제 env reward로 지도학습:
-          - r_env ∈ {0, 1} sparse (task completion 시 +1)
-          - BCE loss: reward_head(z_t) ≈ r_env_t
-          - 이렇게 해야 world model의 r̂이 실제 reward와 calibrated됨
+        gradient 경로:
+          obs_batch → posterior(x_t, h_dummy) → z_t → reward_head → BCE loss
+          encode_sequence()는 내부적으로 @no_grad일 수 있으므로
+          posterior를 직접 호출해서 gradient를 살림.
+
+        reward_head BCE:  reward_head(z_t) ≈ r_env (실제 env reward)
         """
+        if not self.model.cfg.use_reward_head:
+            return 0.0
+
         model = self.model
         model.train()
 
-        # x_t 형태로 변환 (B, 2108) → (B, 1, 2108)
-        x_t = obs_batch.unsqueeze(1)       # (B, 1, 2108)
-        a_t = act_batch.unsqueeze(1)       # (B, 1, 9)
-        enc = model.encode_sequence(x_t, a_t)
-        z_t = enc['o_seq'][:, 0]           # (B, m)
+        B   = obs_batch.shape[0]
+        dev = self.device
 
-        loss = torch.tensor(0.0, device=self.device, requires_grad=False)
+        # posterior 직접 호출 (gradient 필요)
+        # h_dummy: context 없는 단일 스텝이므로 zero hidden
+        h_dummy = torch.zeros(B, model.cfg.gru_hidden, device=dev)
+        z_t, _  = model.posterior(obs_batch, h_dummy)   # (B, m)
 
-        if model.cfg.use_reward_head:
-            recon = model.decoder(z_t)
-            if 'reward' in recon:
-                r_logit = recon['reward'].squeeze(-1)   # (B,)
+        # reward head 직접 호출 (decoder 내부/외부 모두 처리)
+        # decoder는 frozen이지만 head_reward만 active
+        if hasattr(model.decoder, 'head_reward'):
+            # Case A: MultiHeadDecoder.head_reward (active)
+            r_logit = model.decoder.head_reward(z_t).squeeze(-1)   # (B,)
+        elif hasattr(model, 'reward_head'):
+            # Case B: 별도 모듈 (active)
+            r_logit = model.reward_head(z_t).squeeze(-1)            # (B,)
+        else:
+            model.eval()
+            return 0.0
 
-                # 실제 env reward를 target으로 사용
-                # r_env ∈ {0,1} sparse → BCE target
-                # clip: 0 이상 (음수 reward 방지), 1 이하 clamp
-                r_target = r_env_batch.clamp(0.0, 1.0)   # (B,)
+        r_target = r_env_batch.clamp(0.0, 1.0).float()   # (B,)
+        loss = F.binary_cross_entropy_with_logits(r_logit, r_target)
 
-                loss = F.binary_cross_entropy_with_logits(
-                    r_logit, r_target.float())
-
-                self.opt.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(
-                    [p for p in model.parameters() if p.requires_grad], 1.0)
-                self.opt.step()
+        self.opt.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(
+            [p for p in model.parameters() if p.requires_grad], 1.0)
+        self.opt.step()
 
         model.eval()
         return loss.item()
