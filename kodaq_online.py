@@ -57,7 +57,7 @@ from collections import deque
 from models.koopman_cvae import KoopmanCVAE
 from models.losses import symexp
 from data.extract_skill_label import load_x_sequences
-from lqr_koopman import (
+from lqr_planner import (
     KODAQLQRPlanner, LQRConfig,
     load_kitchen_episodes, obs_to_x_goal,
     blend_koopman,
@@ -1075,6 +1075,7 @@ def train(cfg: OnlineConfig, trainer: KODAQOnlineTrainer,
     model = wm.model
     Path(out_dir).mkdir(parents=True, exist_ok=True)
 
+    # log: 시각화/저장할 키
     log: Dict[str, List] = {k: [] for k in [
         'loss_q_hi', 'loss_pi_hi', 'kl_hi',
         'loss_q_lo', 'loss_pi_lo',
@@ -1082,7 +1083,13 @@ def train(cfg: OnlineConfig, trainer: KODAQOnlineTrainer,
         'alpha_hi', 'alpha_lo',
         'wm_loss',
     ]}
-    recent = {k: deque(maxlen=cfg.log_every) for k in log}
+    # recent: update 함수가 반환하는 모든 키를 수용 (log보다 넓음)
+    _all_info_keys = [
+        'loss_q_hi', 'loss_pi_hi', 'kl_hi', 'alpha_hi', 'ent_hi',
+        'loss_q_lo', 'loss_pi_lo', 'alpha_lo', 'ent_lo',
+        'ep_reward', 'ep_tasks', 'wm_loss',
+    ]
+    recent = {k: deque(maxlen=cfg.log_every) for k in _all_info_keys}
 
     env   = gym.make(env_name)
     obs   = env.reset()
