@@ -831,16 +831,14 @@ class KODAQOnlineTrainer:
 def get_goal_obs(env_name: str) -> np.ndarray:
     """
     Franka Kitchen 목표 obs 구성.
-    모든 task가 완료된 상태 = obs_element_goals 값으로 채운 obs.
+    OBS_ELEMENT_GOALS 값으로 직접 구성 — env.make() 불필요.
+    obs dim=60: qpos(9) + qvel(9) + obj_qpos(21) + obj_qvel(21)
     """
-    import gym, d4rl
-    env  = gym.make(env_name)
-    obs  = env.reset()
-    goal = obs.copy()
+    # Kitchen obs: 60-dim zeros 기준으로 goal 값만 채움
+    goal = np.zeros(60, dtype=np.float32)
     for task, idx in OBS_ELEMENT_INDICES.items():
         g_val = OBS_ELEMENT_GOALS[task]
         goal[idx] = g_val
-    env.close()
     return goal
 
 
