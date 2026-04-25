@@ -30,7 +30,7 @@ from collections import deque
 from models.koopman_cvae import KoopmanCVAE
 from models.losses import symexp
 from data.extract_skill_label import load_x_sequences
-from lqr_koopman import (
+from lqr_planner import (
     KODAQLQRPlanner, LQRConfig,
     load_kitchen_episodes, obs_to_x_goal,
     blend_koopman,
@@ -57,9 +57,7 @@ class OnlineConfig:
     H_lo:           int   = 4
     gamma:          float = 0.99
     tau_ema:        float = 0.005
-    alpha_init:     float = 0.01
-    alpha_log_min:  float = -5.0
-    alpha_log_max:  float = 1.0
+    alpha:          float = 0.01   # entropy regularization 고정값 (작을수록 약한 penalization)
     kl_weight:      float = 1.0
     gumbel_tau:     float = 1.0
     gumbel_tau_min: float = 0.3
@@ -465,17 +463,13 @@ class KODAQOnlineTrainer:
         self.opt_q  = torch.optim.Adam(
             list(self.Q1.parameters())+list(self.Q2.parameters()), lr=lr)
 
-        log_init = math.log(cfg.alpha_init)
-        self.log_alpha  = torch.tensor(log_init, requires_grad=True,
-                                        device=device, dtype=torch.float32)
-        self.opt_alpha  = torch.optim.Adam([self.log_alpha], lr=lr)
-        self.target_ent = -(cfg.H_lo * action_dim + math.log(n_skills))
+        # α 고정값: entropy regularization penalization
+        # auto-tuning 없음 — target entropy 개념 없음
         self.buf = ReplayBuffer(cfg.buffer_size, device)
 
     @property
     def alpha(self):
-        return self.log_alpha.clamp(
-            self.cfg.alpha_log_min, self.cfg.alpha_log_max).exp().item()
+        return self.cfg.alpha
 
     def _anneal_tau(self):
         frac = min(1.0, self.step / max(self.cfg.n_env_steps, 1))
@@ -527,13 +521,8 @@ class KODAQOnlineTrainer:
         nn.utils.clip_grad_norm_(self.pi_lo.parameters(), self.cfg.grad_clip)
         self.opt_lo.step()
 
-        # Alpha
+        # α 고정값 — auto-tuning 없음
         ent = (self.pi_hi.entropy(z) + self.pi_lo.entropy(z, sp_d)).mean()
-        la  = self.log_alpha.clamp(self.cfg.alpha_log_min, self.cfg.alpha_log_max)
-        loss_a = -(la * (ent - self.target_ent).detach())
-        self.opt_alpha.zero_grad(); loss_a.backward()
-        self.opt_alpha.step()
-        self.log_alpha.data.clamp_(self.cfg.alpha_log_min, self.cfg.alpha_log_max)
 
         # Soft update
         for p,pt in zip(self.Q1.parameters(), self.Q1_t.parameters()):
@@ -552,7 +541,7 @@ class KODAQOnlineTrainer:
         torch.save({'step': self.step, 'pi_hi': self.pi_hi.state_dict(),
                     'pi_lo': self.pi_lo.state_dict(),
                     'Q1': self.Q1.state_dict(), 'Q2': self.Q2.state_dict(),
-                    'log_alpha': self.log_alpha.item(),
+
                     'world_model': self.wm.model.state_dict()}, path)
         print(f"  Saved: {path}")
 
@@ -561,7 +550,7 @@ class KODAQOnlineTrainer:
         self.pi_hi.load_state_dict(ck['pi_hi'])
         self.pi_lo.load_state_dict(ck['pi_lo'])
         self.Q1.load_state_dict(ck['Q1']); self.Q2.load_state_dict(ck['Q2'])
-        self.log_alpha.data.fill_(ck.get('log_alpha', math.log(0.01)))
+
         self.step = ck.get('step', 0)
         print(f"Loaded: {path}  step={self.step}")
 
