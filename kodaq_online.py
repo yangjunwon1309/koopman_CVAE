@@ -57,7 +57,7 @@ from collections import deque
 from models.koopman_cvae import KoopmanCVAE
 from models.losses import symexp
 from data.extract_skill_label import load_x_sequences
-from lqr_koopman import (
+from lqr_planner import (
     KODAQLQRPlanner, LQRConfig,
     load_kitchen_episodes, obs_to_x_goal,
     blend_koopman,
@@ -101,7 +101,7 @@ class OnlineConfig:
     wm_update_freq: int = 10     # N env steps마다 world model 업데이트
 
     # Reward blend
-    r_alpha_warmup: int = 10_000  # r_blend = α*r_env + (1-α)*r_hat
+    r_alpha_warmup: int = 30_000  # world model blend warmup: 길수록 초반에 r_hat 비중 낮음
     # warmup 동안 α: 0→1 (초반엔 world model reward 비중 높음)
 
     # Training
@@ -674,7 +674,12 @@ class KODAQOnlineTrainer:
             q2_nx = self.Q_hi_2_t(z_nx, z_g, se_nx)
             V_next = torch.min(q1_nx, q2_nx) - self.alpha_hi * lp_nx
 
-        y = R_hi + self.cfg.gamma * (1 - done) * V_next
+        # reward normalize
+        R_mean = R_hi.mean(); R_std = R_hi.std().clamp(min=1e-6)
+        R_norm = (R_hi - R_mean) / R_std
+
+        y = R_norm + self.cfg.gamma * (1 - done) * V_next
+        y = y.clamp(-50.0, 50.0)
         q1 = self.Q_hi_1(z, z_g, se)
         q2 = self.Q_hi_2(z, z_g, se)
         loss_q = F.mse_loss(q1, y) + F.mse_loss(q2, y)
@@ -757,7 +762,13 @@ class KODAQOnlineTrainer:
             q2_nx = self.Q_lo_2_t(z_nx, z_g, se, a_nx)
             V_next = torch.min(q1_nx, q2_nx) - self.alpha_lo * lp_nx
 
-        y    = r + self.cfg.gamma * (1 - done) * V_next
+        # reward normalize: 배치 내 running stats로 정규화
+        r_mean = r.mean(); r_std = r.std().clamp(min=1e-6)
+        r_norm = (r - r_mean) / r_std
+
+        y    = r_norm + self.cfg.gamma * (1 - done) * V_next
+        # target clamp: Q 발산 방지 ([-50, 50] 범위로 제한)
+        y    = y.clamp(-50.0, 50.0)
         q1   = self.Q_lo_1(z, z_g, se, a)
         q2   = self.Q_lo_2(z, z_g, se, a)
         loss_q = F.mse_loss(q1, y) + F.mse_loss(q2, y)
@@ -943,13 +954,16 @@ X_QD_START = 2099; X_QD_END = 2108
 def compute_r_blend(r_env: float, r_hat: float, step: int,
                     warmup: int) -> float:
     """
+    초반: r_env만 사용 (world model reward head 미calibrated → 가짜 reward 방지)
+    후반: r_env + r_hat blend (world model이 fine-tune된 후 보조)
+
     α = min(1.0, step / warmup)
-    r_blend = α * r_env + (1-α) * r_hat
-    초반: world model reward 비중 높음 (sparse r_env 보완)
-    후반: real env reward 비중 높음
+    r_blend = r_env + (1-α) * r_hat  ← r_env는 항상 포함
+    clamp [-1, 1]: Q 발산 방지
     """
-    alpha = min(1.0, step / max(warmup, 1))
-    return alpha * r_env + (1 - alpha) * r_hat
+    alpha   = min(1.0, step / max(warmup, 1))
+    r_blend = r_env + (1.0 - alpha) * r_hat
+    return float(np.clip(r_blend, -1.0, 1.0))
 
 
 def visualize_training(log: Dict, out_path: str):
