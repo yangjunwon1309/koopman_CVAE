@@ -57,7 +57,7 @@ class OnlineConfig:
     H_lo:           int   = 4
     gamma:          float = 0.99
     tau_ema:        float = 0.005
-    alpha:          float = 0.01   # entropy regularization 고정값 (작을수록 약한 penalization)
+    alpha:          float = 0.0    # entropy penalization 없음 — 순수 Q maximization
     kl_weight:      float = 1.0
     gumbel_tau:     float = 1.0
     gumbel_tau_min: float = 0.3
@@ -500,29 +500,37 @@ class KODAQOnlineTrainer:
             self.cfg.grad_clip)
         self.opt_q.step()
 
-        # Hi actor
-        sp_new, lp_hi = self.pi_hi.gumbel_sample(z, self.gumbel_tau)
-        a_new,  lp_lo = self.pi_lo.sample(z, sp_new)
-        q_new = torch.min(self.Q1(z,sp_new,a_new), self.Q2(z,sp_new,a_new))
+        # Hi actor: KL(π_hi || p_skill) - Q  (α=0, entropy항 없음)
+        # Q는 detach → critic gradient와 actor gradient 분리
         with torch.no_grad():
             p_prior = self.wm.model.skill_prior.soft_weights(h_t)
-        kl_hi = self.pi_hi.kl_prior(z, p_prior)
-        loss_hi = (self.alpha*lp_hi + self.cfg.kl_weight*kl_hi - q_new).mean()
-        self.opt_hi.zero_grad(); loss_hi.backward(retain_graph=True)
+        sp_new, _ = self.pi_hi.gumbel_sample(z, self.gumbel_tau)
+        # lo sample detach → hi actor는 skill selection에만 집중
+        with torch.no_grad():
+            a_hi, _ = self.pi_lo.sample(z, sp_new.detach())
+        q_hi = torch.min(self.Q1(z, sp_new, a_hi.detach()),
+                         self.Q2(z, sp_new, a_hi.detach()))
+        kl_hi2 = self.pi_hi.kl_prior(z, p_prior)
+        loss_hi = (self.cfg.kl_weight * kl_hi2 - q_hi).mean()
+        self.opt_hi.zero_grad(); loss_hi.backward()
         nn.utils.clip_grad_norm_(self.pi_hi.parameters(), self.cfg.grad_clip)
         self.opt_hi.step()
 
-        # Lo actor
+        # Lo actor: -Q only  (α=0, entropy항 없음)
+        # Q는 gradient 통과 (lo policy만 업데이트)
         sp_d = sp_new.detach()
-        a2, lp2 = self.pi_lo.sample(z, sp_d)
-        q2v = torch.min(self.Q1(z,sp_d,a2), self.Q2(z,sp_d,a2))
-        loss_lo = (self.alpha*lp2 - q2v).mean()
+        a_lo, _ = self.pi_lo.sample(z, sp_d)
+        q_lo = torch.min(self.Q1(z, sp_d, a_lo),
+                         self.Q2(z, sp_d, a_lo))
+        loss_lo = -q_lo.mean()
         self.opt_lo.zero_grad(); loss_lo.backward()
         nn.utils.clip_grad_norm_(self.pi_lo.parameters(), self.cfg.grad_clip)
         self.opt_lo.step()
 
-        # α 고정값 — auto-tuning 없음
-        ent = (self.pi_hi.entropy(z) + self.pi_lo.entropy(z, sp_d)).mean()
+        # entropy logging only (gradient 없음)
+        with torch.no_grad():
+            ent = (self.pi_hi.entropy(z) + self.pi_lo.entropy(z, sp_d)).mean()
+        q_hi2 = q_hi
 
         # Soft update
         for p,pt in zip(self.Q1.parameters(), self.Q1_t.parameters()):
@@ -532,9 +540,9 @@ class KODAQOnlineTrainer:
         self._anneal_tau()
 
         return {'loss_q': loss_q.item(), 'loss_hi': loss_hi.item(),
-                'loss_lo': loss_lo.item(), 'kl_hi': kl_hi.mean().item(),
-                'alpha': self.alpha, 'ent': ent.item(),
-                'q_mean': q_new.mean().item(), 'gumbel_tau': self.gumbel_tau}
+                'loss_lo': loss_lo.item(), 'kl_hi': kl_hi2.mean().item(),
+                'alpha': self.cfg.alpha, 'ent': ent.item(),
+                'q_mean': q_hi2.mean().item(), 'gumbel_tau': self.gumbel_tau}
 
     def save(self, path):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -560,8 +568,8 @@ class KODAQOnlineTrainer:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def compute_r_blend(r_env, r_hat, step, warmup):
-    alpha = min(1.0, step / max(warmup, 1))
-    return float(np.clip(r_env + (1.0-alpha)*r_hat, -1.0, 1.0))
+    # world model reward 미사용 — 순수 env reward만으로 학습
+    return float(np.clip(r_env, -1.0, 1.0))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
