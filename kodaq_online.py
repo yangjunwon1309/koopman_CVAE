@@ -180,15 +180,26 @@ class LowLevelPolicy(nn.Module):
         _, ls = self(z, sp)
         return (0.5*(1 + 2*ls + math.log(2*math.pi))).sum(dim=(-2,-1))
 
-    def pretrain_lqr(self, z_b, sp_b, a_lqr_b, n_steps=200, lr=1e-3):
-        """LQR action target으로 supervised pretrain"""
+    def pretrain_lqr(self, z_b, sp_b, a_lqr_b, n_steps=500, lr=1e-3):
+        """
+        LQR action sequence를 mu 초기값으로 supervised pretrain.
+        - n_steps=500: 충분히 수렴
+        - log_std는 높게 유지 (초반 탐색 허용)
+        """
         opt = torch.optim.Adam(self.parameters(), lr=lr)
         loss_val = 0.0
-        for _ in range(n_steps):
-            mu, _ = self(z_b, sp_b)
-            loss  = F.mse_loss(mu, a_lqr_b)
+        for i in range(n_steps):
+            mu, log_std = self(z_b, sp_b)
+            # mu → LQR 방향으로
+            loss_mu = F.mse_loss(mu, a_lqr_b)
+            # log_std → 초반엔 높게 유지 (-1.0 target: σ≈0.37로 탐색 가능)
+            loss_std = F.mse_loss(log_std,
+                                  torch.full_like(log_std, -1.0))
+            loss = loss_mu + 0.1 * loss_std
             opt.zero_grad(); loss.backward(); opt.step()
-            loss_val = loss.item()
+            loss_val = loss_mu.item()
+            if (i+1) % 100 == 0:
+                print(f"    pretrain [{i+1}/{n_steps}] mu_loss={loss_mu.item():.4f}")
         return loss_val
 
 
@@ -390,9 +401,30 @@ class LQRWarmup:
             aw = np.array(ctx.act_buf[-cond_len:])
             xc = torch.FloatTensor(xw).unsqueeze(0).to(dev)
             ac = torch.FloatTensor(aw).unsqueeze(0).to(dev)
-            # goal = same as current state (keep current pose)
-            xg = torch.FloatTensor(ctx._obs_to_x(obs)).unsqueeze(0).to(dev)
+            # goal: Koopman world model로 H_lo step 자연 dynamics 예측
+            # self-goal(제자리) 대신 skill prior 방향으로 이동하는 goal 사용
             try:
+                with torch.no_grad():
+                    enc_tmp = m.encode_sequence(xc, ac)
+                    z_tmp = enc_tmp['o_seq'][0, -1:]
+                    h_tmp = enc_tmp['h_seq'][0, -1:]
+                    w_tmp = m.skill_prior.soft_weights(h_tmp)
+                    ll = m.koopman.get_log_lambdas()
+                    A_bar, B_bar, _, _ = blend_koopman(
+                        ll, m.koopman.theta_k, m.koopman.G_k,
+                        m.koopman.U, w_tmp)
+                    A_b = A_bar[0]; B_b = B_bar[0]
+                    u_zero = torch.zeros(1, m.cfg.action_latent, device=dev)
+                    z_pred = z_tmp
+                    for _ in range(H_lo):
+                        z_pred = (A_b @ z_pred.T).T + (B_b @ u_zero.T).T
+                    recon_g = m.decoder(z_pred)
+                    xg = torch.cat([
+                        torch.zeros(1, 2048, device=dev),
+                        symexp(recon_g['delta_p']),
+                        symexp(recon_g['q']),
+                        symexp(recon_g['qdot']),
+                    ], dim=-1)  # (1, 2108)
                 plan = self.planner.plan(xc, ac, xg,
                                          horizon=H_lo, compute_uncertainty=False)
                 u_lqr = plan['u_traj'].to(dev)
@@ -568,8 +600,10 @@ class KODAQOnlineTrainer:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def compute_r_blend(r_env, r_hat, step, warmup):
-    # world model reward 미사용 — 순수 env reward만으로 학습
-    return float(np.clip(r_env, -1.0, 1.0))
+    # 초반: world model reward 비중 높음 (sparse r_env 보완)
+    # 후반: r_env 비중 높아짐 (world model fine-tune 후 r_hat도 calibrated)
+    alpha = min(1.0, step / max(warmup, 1))
+    return float(np.clip(alpha * r_env + (1.0 - alpha) * r_hat, -1.0, 1.0))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
