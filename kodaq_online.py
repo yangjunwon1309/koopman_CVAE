@@ -694,6 +694,95 @@ def visualize_training(log, out_path):
 # Train
 # ─────────────────────────────────────────────────────────────────────────────
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Offline Dataset Pre-fill
+# ─────────────────────────────────────────────────────────────────────────────
+
+@torch.no_grad()
+def prefill_buffer_from_offline(
+    trainer: KODAQOnlineTrainer,
+    wm: KoopmanWorldModelWrapper,
+    x_cache_path: str,
+    quality: str = 'mixed',
+    max_transitions: int = 50_000,
+    device: str = 'cuda',
+):
+    """
+    offline mixed dataset → replay buffer pre-fill.
+    SPiRL/EXTRACT와 동일하게 offline data를 초기 buffer로 사용.
+
+    흐름:
+      offline episodes → encode_sequence() → (z_t, h_t)
+      consecutive (z_t, z_{t+1}) pairs → buf.add()
+      skill_probs: skill_prior.soft_weights(h_t) (frozen prior)
+      a_seq: H_lo consecutive real actions (데이터 그대로)
+      r: 실제 episode reward
+    """
+    dev = torch.device(device)
+    model = wm.model
+    model.eval()
+    H_lo = trainer.cfg.H_lo
+    n_skills = trainer.n_skills
+
+    print(f"\n[Offline Pre-fill] loading {x_cache_path} ...")
+    x_seq_full, _, _ = load_x_sequences(x_cache_path)
+
+    episodes, _ = load_kitchen_episodes(quality=quality, min_len=H_lo + 16)
+    np.random.shuffle(episodes)
+
+    n_added = 0
+    for ep in episodes:
+        if n_added >= max_transitions:
+            break
+
+        L      = ep['length']
+        acts   = ep['actions']    # (L, 9)
+        rews   = ep['rewards']    # (L,)
+        s_t    = ep['start_t']
+        x_ep   = x_seq_full[s_t:s_t + L]  # (L, 2108)
+
+        # encode 전체 episode
+        x_t = torch.FloatTensor(x_ep).unsqueeze(0).to(dev)
+        a_t = torch.FloatTensor(acts).unsqueeze(0).to(dev)
+        enc = model.encode_sequence(x_t, a_t)
+        z_ep = enc['o_seq'][0].cpu().numpy()    # (L, m)
+        h_ep = enc['h_seq'][0]                  # (L, d_h) tensor
+
+        # consecutive H_lo pairs → buffer
+        for t in range(L - H_lo - 1):
+            z_t_np   = z_ep[t]
+            z_nx_np  = z_ep[t + H_lo]
+            h_t_tens = h_ep[t:t+1]              # (1, d_h)
+
+            # skill probs from frozen prior
+            sp = model.skill_prior.soft_weights(h_t_tens.to(dev))
+            sp_np = sp.cpu().numpy()[0]          # (K,)
+
+            # action chunk
+            a_chunk = acts[t:t+H_lo].astype(np.float32)  # (H_lo, 9)
+            a_chunk = np.clip(a_chunk, -1.0, 1.0)
+
+            # reward: H_lo step sum
+            r_sum = float(np.sum(rews[t:t+H_lo]))
+            r_clip = np.clip(r_sum, -1.0, 1.0)
+
+            trainer.buf.add(
+                z      = z_t_np,
+                z_next = z_nx_np,
+                h_t    = h_ep[t].cpu().numpy(),
+                sp     = sp_np,
+                a_seq  = a_chunk,
+                r      = r_clip,
+                done   = 0.0,
+            )
+            n_added += 1
+            if n_added >= max_transitions:
+                break
+
+    print(f"[Offline Pre-fill] added {n_added} transitions  buf_size={trainer.buf.size}")
+    return n_added
+
 def train(cfg, trainer, wm, planner, env_name, out_dir, device, use_wandb=False):
     import gym, d4rl
     dev=torch.device(device); model=wm.model
@@ -892,6 +981,19 @@ def main():
 
     if args.resume and Path(args.resume).exists():
         trainer.load(args.resume)
+    else:
+        # resume이 없을 때만 offline pre-fill
+        # (resume이면 이미 학습된 buffer와 weights 사용)
+        if Path(args.x_cache).exists():
+            prefill_buffer_from_offline(
+                trainer, wm,
+                x_cache_path   = args.x_cache,
+                quality        = 'mixed',
+                max_transitions= 50_000,
+                device         = device,
+            )
+        else:
+            print(f"[Warning] x_cache not found: {args.x_cache}  (skipping pre-fill)")
 
     train(cfg, trainer, wm, planner, args.env, args.out_dir, device, use_wandb)
     if use_wandb: wandb.finish()
