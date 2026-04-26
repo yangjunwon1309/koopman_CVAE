@@ -30,7 +30,7 @@ from collections import deque
 from models.koopman_cvae import KoopmanCVAE
 from models.losses import symexp
 from data.extract_skill_label import load_x_sequences
-from lqr_koopman import (
+from lqr_planner import (
     KODAQLQRPlanner, LQRConfig,
     load_kitchen_episodes, obs_to_x_goal,
     blend_koopman,
@@ -578,21 +578,46 @@ class KODAQOnlineTrainer:
 
     def save(self, path):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        torch.save({'step': self.step, 'pi_hi': self.pi_hi.state_dict(),
-                    'pi_lo': self.pi_lo.state_dict(),
-                    'Q1': self.Q1.state_dict(), 'Q2': self.Q2.state_dict(),
-
-                    'world_model': self.wm.model.state_dict()}, path)
+        torch.save({
+            # network weights
+            'step':        self.step,
+            'pi_hi':       self.pi_hi.state_dict(),
+            'pi_lo':       self.pi_lo.state_dict(),
+            'Q1':          self.Q1.state_dict(),
+            'Q2':          self.Q2.state_dict(),
+            'Q1_t':        self.Q1_t.state_dict(),
+            'Q2_t':        self.Q2_t.state_dict(),
+            'world_model': self.wm.model.state_dict(),
+            # optimizer states (Adam momentum/variance 유지)
+            'opt_hi':      self.opt_hi.state_dict(),
+            'opt_lo':      self.opt_lo.state_dict(),
+            'opt_q':       self.opt_q.state_dict(),
+            'wm_opt':      self.wm.opt.state_dict(),
+            # misc
+            'gumbel_tau':  self.gumbel_tau,
+        }, path)
         print(f"  Saved: {path}")
 
     def load(self, path):
         ck = torch.load(path, map_location=self.device)
         self.pi_hi.load_state_dict(ck['pi_hi'])
         self.pi_lo.load_state_dict(ck['pi_lo'])
-        self.Q1.load_state_dict(ck['Q1']); self.Q2.load_state_dict(ck['Q2'])
-
+        self.Q1.load_state_dict(ck['Q1'])
+        self.Q2.load_state_dict(ck['Q2'])
+        self.Q1_t.load_state_dict(ck.get('Q1_t', ck['Q1']))
+        self.Q2_t.load_state_dict(ck.get('Q2_t', ck['Q2']))
+        if 'world_model' in ck:
+            self.wm.model.load_state_dict(ck['world_model'])
+        # optimizer states 복원 (없으면 무시 — 구버전 호환)
+        if 'opt_hi' in ck:
+            self.opt_hi.load_state_dict(ck['opt_hi'])
+            self.opt_lo.load_state_dict(ck['opt_lo'])
+            self.opt_q.load_state_dict(ck['opt_q'])
+        if 'wm_opt' in ck:
+            self.wm.opt.load_state_dict(ck['wm_opt'])
+        self.gumbel_tau = ck.get('gumbel_tau', self.cfg.gumbel_tau)
         self.step = ck.get('step', 0)
-        print(f"Loaded: {path}  step={self.step}")
+        print(f"Loaded: {path}  step={self.step}  gumbel_tau={self.gumbel_tau:.3f}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
