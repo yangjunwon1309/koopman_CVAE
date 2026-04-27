@@ -141,46 +141,46 @@ class LowLevelPolicy(nn.Module):
     직접 action 출력, z_goal 없음 (state-only)
     mu 작게 초기화 → LQR pretrain에 유리
     """
-    def __init__(self, z_dim, n_skills, action_dim, H_lo, hidden, n_layers,
+    def __init__(self, z_dim, action_dim, H_lo, hidden, n_layers,
                  log_std_min=-4.0, log_std_max=1.0):
         super().__init__()
         self.action_dim = action_dim
         self.H_lo = H_lo
         self.log_std_min = log_std_min
         self.log_std_max = log_std_max
-        in_dim = z_dim + n_skills
+        in_dim = z_dim
         self.net   = make_mlp(in_dim, hidden, hidden, n_layers - 1)
         self.mu    = nn.Linear(hidden, H_lo * action_dim)
         self.log_s = nn.Linear(hidden, H_lo * action_dim)
         nn.init.uniform_(self.mu.weight, -0.01, 0.01)
         nn.init.zeros_(self.mu.bias)
 
-    def forward(self, z, sp):
-        feat = self.net(torch.cat([z, sp], dim=-1))
+    def forward(self, z):
+        feat = self.net(z)
         mu   = self.mu(feat).view(-1, self.H_lo, self.action_dim)
         ls   = self.log_s(feat).view(-1, self.H_lo, self.action_dim)
         return mu, ls.clamp(self.log_std_min, self.log_std_max)
 
-    def sample(self, z, sp):
-        mu, ls = self(z, sp)
+    def sample(self, z):
+        mu, ls = self(z)
         dist   = torch.distributions.Normal(mu, ls.exp())
         u      = dist.rsample()
         a      = torch.tanh(u)
         lp     = (dist.log_prob(u) - torch.log(1 - a.pow(2) + 1e-6))
         return a, lp.sum(dim=(-2, -1))
 
-    def log_prob(self, z, sp, a_seq):
-        mu, ls = self(z, sp)
+    def log_prob(self, z, a_seq):
+        mu, ls = self(z)
         u   = torch.atanh(a_seq.clamp(-1+1e-6, 1-1e-6))
         dist= torch.distributions.Normal(mu, ls.exp())
         lp  = dist.log_prob(u) - torch.log(1 - a_seq.pow(2) + 1e-6)
         return lp.sum(dim=(-2, -1))
 
-    def entropy(self, z, sp):
-        _, ls = self(z, sp)
+    def entropy(self, z):
+        _, ls = self(z)
         return (0.5*(1 + 2*ls + math.log(2*math.pi))).sum(dim=(-2,-1))
 
-    def pretrain_lqr(self, z_b, sp_b, a_lqr_b, n_steps=500, lr=1e-3):
+    def pretrain_lqr(self, z_b, a_lqr_b, n_steps=500, lr=1e-3):
         """
         LQR action sequence를 mu 초기값으로 supervised pretrain.
         - n_steps=500: 충분히 수렴
@@ -189,7 +189,7 @@ class LowLevelPolicy(nn.Module):
         opt = torch.optim.Adam(self.parameters(), lr=lr)
         loss_val = 0.0
         for i in range(n_steps):
-            mu, log_std = self(z_b, sp_b)
+            mu, log_std = self(z_b)
             # mu → LQR 방향으로
             loss_mu = F.mse_loss(mu, a_lqr_b)
             # log_std → 초반엔 높게 유지 (-1.0 target: σ≈0.37로 탐색 가능)
@@ -514,7 +514,7 @@ class KODAQOnlineTrainer:
 
         h=cfg.hidden_dim; nl=cfg.n_layers
         self.pi_hi = HighLevelPolicy(z_dim, n_skills, h, nl).to(device)
-        self.pi_lo = LowLevelPolicy(z_dim, n_skills, action_dim,
+        self.pi_lo = LowLevelPolicy(z_dim, action_dim,
                                     cfg.H_lo, h, nl).to(device)
         self.Q1    = QNetwork(z_dim, n_skills, action_dim, cfg.H_lo, h, nl).to(device)
         self.Q2    = QNetwork(z_dim, n_skills, action_dim, cfg.H_lo, h, nl).to(device)
@@ -549,7 +549,7 @@ class KODAQOnlineTrainer:
         # Critic
         with torch.no_grad():
             sp_nx, lp_hi_nx = self.pi_hi.gumbel_sample(z_nx, self.gumbel_tau)
-            a_nx,  lp_lo_nx = self.pi_lo.sample(z_nx, sp_nx)
+            a_nx,  lp_lo_nx = self.pi_lo.sample(z_nx)
             lp_nx  = lp_hi_nx + lp_lo_nx
             V_next = (torch.min(self.Q1_t(z_nx,sp_nx,a_nx),
                                 self.Q2_t(z_nx,sp_nx,a_nx))
@@ -571,7 +571,7 @@ class KODAQOnlineTrainer:
         sp_new, _ = self.pi_hi.gumbel_sample(z, self.gumbel_tau)
         # lo sample detach → hi actor는 skill selection에만 집중
         with torch.no_grad():
-            a_hi, _ = self.pi_lo.sample(z, sp_new.detach())
+            a_hi, _ = self.pi_lo.sample(z)
         q_hi = torch.min(self.Q1(z, sp_new, a_hi.detach()),
                          self.Q2(z, sp_new, a_hi.detach()))
         kl_hi2 = self.pi_hi.kl_prior(z, p_prior)
@@ -580,20 +580,23 @@ class KODAQOnlineTrainer:
         nn.utils.clip_grad_norm_(self.pi_hi.parameters(), self.cfg.grad_clip)
         self.opt_hi.step()
 
-        # Lo actor: -Q only  (α=0, entropy항 없음)
-        # Q는 gradient 통과 (lo policy만 업데이트)
+        # Lo actor: -Q + λ_lqr * KL(π_lo || N(a_buf, σ²))
+        # buffer action을 prior mean으로 → offline/LQR 방향 유지
         sp_d = sp_new.detach()
-        a_lo, _ = self.pi_lo.sample(z, sp_d)
+        a_lo, _ = self.pi_lo.sample(z)
         q_lo = torch.min(self.Q1(z, sp_d, a_lo),
                          self.Q2(z, sp_d, a_lo))
-        loss_lo = -q_lo.mean()
+        # prior: buffer에 저장된 action의 log_prob → KL 역할
+        a_buf = b['a_seq'][:, 0:1, :].expand(-1, self.cfg.H_lo, -1).clamp(-1+1e-6, 1-1e-6)
+        lp_prior = self.pi_lo.log_prob(z, a_buf)
+        loss_lo = (-q_lo - self.cfg.kl_lqr_weight * lp_prior).mean()
         self.opt_lo.zero_grad(); loss_lo.backward()
         nn.utils.clip_grad_norm_(self.pi_lo.parameters(), self.cfg.grad_clip)
         self.opt_lo.step()
 
         # entropy logging only (gradient 없음)
         with torch.no_grad():
-            ent = (self.pi_hi.entropy(z) + self.pi_lo.entropy(z, sp_d)).mean()
+            ent = (self.pi_hi.entropy(z) + self.pi_lo.entropy(z)).mean()
         q_hi2 = q_hi
 
         # Soft update
@@ -695,7 +698,7 @@ def evaluate(trainer, wm, env_name, n_ep, cfg, device):
                 sid,_ = trainer.pi_hi.hard_sample(ctx.z_t); hi_timer=cfg.H_hi
             sp = torch.zeros(1, trainer.n_skills, device=dev); sp[0,sid]=1.0
             with torch.no_grad():
-                a_seq,_ = trainer.pi_lo.sample(ctx.z_t, sp)
+                a_seq,_ = trainer.pi_lo.sample(ctx.z_t)
             for k in range(cfg.H_lo):
                 if done: break
                 obs,r,done,info = env.step(a_seq[0,k].cpu().numpy().clip(-1,1))
@@ -867,7 +870,7 @@ def train(cfg, trainer, wm, planner, env_name, out_dir, device, use_wandb=False)
                 data=lqr_wu.get_pretrain_data()
                 if data:
                     z_pt,sp_pt,a_pt=data
-                    l=trainer.pi_lo.pretrain_lqr(z_pt,sp_pt,a_pt)
+                    l=trainer.pi_lo.pretrain_lqr(z_pt,a_pt)
                     print(f"\n[LQR Pretrain] π_lo loss={l:.4f}  buf={trainer.buf.size}")
                     if use_wandb: wandb.log({'pretrain/lqr_loss':l}, step=global_step)
                 lqr_pretrained=True
@@ -887,7 +890,7 @@ def train(cfg, trainer, wm, planner, env_name, out_dir, device, use_wandb=False)
         if hi_timer==0:
             sid,_=trainer.pi_hi.hard_sample(z_t); hi_timer=cfg.H_hi
         sp=torch.zeros(1,trainer.n_skills,device=dev); sp[0,sid]=1.0
-        with torch.no_grad(): a_seq,_=trainer.pi_lo.sample(z_t,sp)
+        with torch.no_grad(): a_seq,_=trainer.pi_lo.sample(z_t)
         a_np=a_seq[0].cpu().numpy()
 
         z_b=z_t.clone(); h_b=h_t.clone()
@@ -984,7 +987,7 @@ def main():
     p.add_argument('--env',        default='kitchen-mixed-v0')
     p.add_argument('--out_dir',    default='checkpoints/kodaq_v4/online')
     p.add_argument('--H_hi',       type=int,   default=8)
-    p.add_argument('--H_lo',       type=int,   default=4)
+    p.add_argument('--H_lo',       type=int,   default=16)
     p.add_argument('--gamma',      type=float, default=0.99)
     p.add_argument('--lr',         type=float, default=3e-4)
     p.add_argument('--batch_size', type=int,   default=256)
@@ -999,6 +1002,8 @@ def main():
     p.add_argument('--wandb_project', default=None)
     p.add_argument('--wandb_run',  default=None)
     p.add_argument('--cat_ckpt',   default=None)
+    p.add_argument('--iql_ckpt',   default=None)
+    p.add_argument('--kl_lqr_weight', type=float, default=0.5)
     p.add_argument('--Q_scale',    type=float, default=1.0)
     p.add_argument('--R_scale',    type=float, default=10.0)
     p.add_argument('--offline_prefill', action='store_true', default=True,
@@ -1048,7 +1053,13 @@ def main():
     if args.resume and Path(args.resume).exists():
         trainer.load(args.resume)
     else:
-        # resume이 없을 때 offline pre-fill (--no_offline_prefill로 비활성화)
+        # IQL policy → π_lo 초기화 (fine-tune 시작점)
+        iql_path = getattr(args,'iql_ckpt',None) or 'checkpoints/kodaq_v4/iql/iql_final.pt'
+        if Path(iql_path).exists():
+            load_iql_for_online(iql_path, trainer, device)
+        else:
+            print(f"  [Warning] IQL ckpt not found: {iql_path}")
+        # offline pre-fill (--no_offline_prefill로 비활성화)
         if args.offline_prefill:
             if Path(args.x_cache).exists():
                 prefill_buffer_from_offline(

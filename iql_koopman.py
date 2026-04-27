@@ -323,14 +323,12 @@ def build_lqr_cache(
         z_ep    = enc['o_seq'][0].cpu().numpy()    # (L, m)
         h_ep    = enc['h_seq'][0]                  # (L, d_h)
 
-        # real (z_t, u_t, z_{t+1}, r_t)
-        u_ep = model.action_encoder(
-            torch.FloatTensor(acts_ep).to(dev)
-        ).cpu().numpy()  # (L, d_u)
+        # real (z_t, a_t, z_{t+1}, r_t) — robot action 직접 저장
+        acts_clipped = acts_ep.clip(-1.0, 1.0).astype(np.float32)
 
         for t in range(L - 1):
             all_z_real.append(z_ep[t])
-            all_u_real.append(u_ep[t])
+            all_u_real.append(acts_clipped[t])   # robot action (9-dim)
             all_z_next_real.append(z_ep[t + 1])
             all_r_real.append(float(rew_ep[t]))
 
@@ -425,21 +423,21 @@ def build_lqr_cache(
 class IQLTrainer:
     def __init__(
         self,
-        cfg:     IQLConfig,
-        z_dim:   int,
-        u_dim:   int,
-        device:  str,
+        cfg:        IQLConfig,
+        z_dim:      int,
+        action_dim: int,       # robot action dim (9)
+        device:     str,
     ):
         self.cfg    = cfg
         self.device = device
 
-        # Networks
-        self.Q1 = QNetwork(z_dim, u_dim, cfg.hidden_dim, cfg.n_layers).to(device)
-        self.Q2 = QNetwork(z_dim, u_dim, cfg.hidden_dim, cfg.n_layers).to(device)
-        self.Q1_target = QNetwork(z_dim, u_dim, cfg.hidden_dim, cfg.n_layers).to(device)
-        self.Q2_target = QNetwork(z_dim, u_dim, cfg.hidden_dim, cfg.n_layers).to(device)
+        # Networks — robot action space
+        self.Q1 = QNetwork(z_dim, action_dim, cfg.hidden_dim, cfg.n_layers).to(device)
+        self.Q2 = QNetwork(z_dim, action_dim, cfg.hidden_dim, cfg.n_layers).to(device)
+        self.Q1_target = QNetwork(z_dim, action_dim, cfg.hidden_dim, cfg.n_layers).to(device)
+        self.Q2_target = QNetwork(z_dim, action_dim, cfg.hidden_dim, cfg.n_layers).to(device)
         self.V  = VNetwork(z_dim, cfg.hidden_dim, cfg.n_layers).to(device)
-        self.pi = GaussianPolicy(z_dim, u_dim, cfg.hidden_dim, cfg.n_layers).to(device)
+        self.pi = GaussianPolicy(z_dim, action_dim, cfg.hidden_dim, cfg.n_layers).to(device)
 
         # Copy weights to targets
         self.Q1_target.load_state_dict(self.Q1.state_dict())
@@ -454,6 +452,9 @@ class IQLTrainer:
         # Reward normalizer
         self.r_norm = RewardNormalizer()
 
+        # CategoricalRewardHead (optional, 3-way reward)
+        self.cat_head = None
+
         # Logging
         self.log_history = {
             'loss_q': [], 'loss_v': [], 'loss_pi': [],
@@ -464,37 +465,48 @@ class IQLTrainer:
     @torch.no_grad()
     def _compute_h_step_target(
         self,
-        z_hat_seq: torch.Tensor,  # (B, H, m)
-        r_hat_seq: torch.Tensor,  # (B, H)
+        z_hat_seq:  torch.Tensor,  # (B, H, m)  Koopman rollout states
+        r_hat_seq:  torch.Tensor,  # (B, H)     BCE event reward
+        r_real_seq: torch.Tensor,  # (B, H)     offline real env reward
+        cat_head=None,             # CategoricalRewardHead (optional)
     ) -> torch.Tensor:
         """
         H-step discounted return + bootstrapped V.
 
-        y_t = Σ_{k=0}^{H-1} γ^k * r̂_{t+k+1} + γ^H * V(z_hat_H)
+        r_blend_t = 0.5*r_env + 0.2*(r_acc/4) + 0.3*r_event
+        y_t = sum_{k=0}^{H-1} gamma^k * normalize(r_blend_{t+k}) + gamma^H * V(z_H)
 
-        r̂는 z_hat_{t+1..t+H}에서 예측된 reward (reward head output).
-        V는 target network (soft update로 안정화).
+        IQL/Online 통일 reward 구조.
         """
         H   = self.cfg.H
-        γ   = self.cfg.gamma
+        gm  = self.cfg.gamma
         dev = self.device
 
-        # Discount weights: γ^0, γ^1, ..., γ^{H-1}
-        γ_powers = torch.tensor(
-            [γ**k for k in range(H)], dtype=torch.float32, device=dev
-        )  # (H,)
+        gm_powers = torch.tensor(
+            [gm**k for k in range(H)], dtype=torch.float32, device=dev)
 
-        # Normalize reward
-        r_normalized = self.r_norm.normalize(r_hat_seq)   # (B, H)
+        # r_acc: categorical head expected reward (없으면 event reward로 대체)
+        if cat_head is not None:
+            B, Hs, m = z_hat_seq.shape
+            z_flat  = z_hat_seq.reshape(B * Hs, m)
+            r_acc   = cat_head.expected_reward(z_flat).reshape(B, Hs)  # (B, H) in [0,4]
+        else:
+            r_acc   = r_hat_seq * 4.0   # BCE proxy
 
-        # Discounted sum
-        r_sum = (r_normalized * γ_powers.unsqueeze(0)).sum(dim=1)  # (B,)
+        # 3-way blend (per step)
+        r_blend = (0.5 * r_real_seq +
+                   0.2 * (r_acc / 4.0) +
+                   0.3 * r_hat_seq)           # (B, H)
+        r_blend = r_blend.clamp(0.0, 1.0)
 
-        # Bootstrap: V(z_hat_H) — z_hat_seq[:, -1] = z_hat_H
-        z_H = z_hat_seq[:, -1]                     # (B, m)
-        v_H = self.V(z_H)                          # (B,)
+        # normalize per batch
+        r_normalized = self.r_norm.normalize(r_blend)
 
-        y_t = r_sum + (γ**H) * v_H                # (B,)
+        r_sum = (r_normalized * gm_powers.unsqueeze(0)).sum(dim=1)  # (B,)
+
+        z_H = z_hat_seq[:, -1]
+        v_H = self.V(z_H)
+        y_t = r_sum + (gm**H) * v_H
         return y_t.detach()
 
     def update(
@@ -517,19 +529,19 @@ class IQLTrainer:
         z_hat  = lqr_batch['z_hat_seq'] # (B, H, m)
         r_hat  = lqr_batch['r_hat_seq'] # (B, H)
 
-        # ── H-step TD target (LQR rollout 기반) ──────────────────────────
-        y_lqr  = self._compute_h_step_target(z_hat, r_hat)   # (B,)
+        # ── H-step TD target (3-way reward) ──────────────────────────────
+        # r_real_seq: r_r를 H step에 broadcast (offline 데이터의 단일 step reward)
+        # 실제로는 LQR rollout의 각 step reward가 이상적이나
+        # offline cache에 없으므로 현재 step reward를 H step에 동일하게 사용
+        r_real_seq = r_r.unsqueeze(1).expand(-1, self.cfg.H)  # (B, H)
 
-        # 1-step real reward도 TD target에 혼합 (안정화)
-        r_r_n  = self.r_norm.normalize(r_r)
-        with torch.no_grad():
-            v_next = self.V(z_r_nxt)
-        y_real = r_r_n + self.cfg.gamma * v_next              # (B,)
+        # cat_head가 있으면 accumulated reward 사용
+        cat_head = getattr(self, 'cat_head', None)
+        y_lqr  = self._compute_h_step_target(
+            z_hat, r_hat, r_real_seq, cat_head=cat_head)   # (B,)
 
-        # 최종 target: H-step (LQR)과 1-step (real) 가중 평균
-        # → real ratio로 제어: α=0.5면 50:50
-        α = 1.0 - self.cfg.real_ratio                         # LQR 비중
-        y_t = α * y_lqr + (1 - α) * y_real                   # (B,)
+        # y_t = y_lqr (3-way reward로 통일, 1-step 혼합 제거)
+        y_t = y_lqr
 
         # ── Q loss: real (z, u) 위에서만 ────────────────────────────────
         q1 = self.Q1(z_r, u_r)   # (B,)
@@ -718,7 +730,7 @@ def evaluate_policy(
             u_t   = trainer.pi.sample(z_cur)               # (1, d_u)
             # Koopman step
             w_t   = model.skill_prior.soft_weights(h_cur)
-            from lqr_koopman import blend_koopman
+            from lqr_planner import blend_koopman
             log_lam = model.koopman.get_log_lambdas()
             A_bar, B_bar, _, _ = blend_koopman(
                 log_lam, model.koopman.theta_k, model.koopman.G_k,
@@ -868,8 +880,17 @@ def main():
         batch_size=args.batch_size, n_steps=args.n_steps,
         real_ratio=args.real_ratio,
     )
-    trainer = IQLTrainer(iql_cfg, z_dim, u_dim, device)
+    trainer = IQLTrainer(iql_cfg, z_dim, a_dim, device)
     trainer.r_norm.update(r_sum_all)
+
+    # CategoricalRewardHead (3-way reward)
+    cat_ckpt = str(Path(args.out_dir).parent / 'cat_reward' / 'final.pt')
+    if Path(cat_ckpt).exists():
+        from train_reward_head import load_cat_reward_model
+        _, trainer.cat_head = load_cat_reward_model(cat_ckpt, device)
+        print(f'  CategoricalRewardHead loaded: 3-way reward enabled')
+    else:
+        print(f'  No cat_head ({cat_ckpt}), using BCE only')
     print(f"Reward normalizer: mean={trainer.r_norm.mean:.4f}  "
           f"std={math.sqrt(trainer.r_norm.var):.4f}")
 
