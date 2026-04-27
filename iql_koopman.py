@@ -904,8 +904,8 @@ def main():
     r_acc_all  = r_hat_all * 4.0                       # (N, H) proxy [0,4]
     # 3-way blend per step
     r_blend_all = (0.5 * r_real_all +
-                   0.2 * (r_acc_all / 4.0) +
-                   0.3 * r_hat_all).clip(0.0, 1.0)    # (N, H)
+                   0.0 * (r_acc_all / 4.0) +
+                   0.5 * r_hat_all).clip(0.0, 1.0)    # (N, H)
     r_sum_all   = (r_blend_all * γ_powers).sum(axis=1) # (N,)
     print(f"Reward normalizer init: mean={r_sum_all.mean():.4f}  "
           f"std={r_sum_all.std():.4f}")
