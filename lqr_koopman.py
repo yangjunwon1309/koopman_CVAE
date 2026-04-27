@@ -1,975 +1,995 @@
 """
-lqr_planner.py — KODAQ LQR Trajectory Planner (Real Data)
-===========================================================
+iql_koopman.py — IQL + H-step TD in Koopman Latent Space
+=========================================================
 
-D4RL Kitchen task notation (D4RL kitchen_envs.py):
-  OBS_ELEMENT_INDICES: 60-dim obs에서 각 task object 인덱스 (obj offset=9)
-  OBS_ELEMENT_GOALS:   각 task의 goal joint value
-  BONUS_THRESH=0.3:    completion threshold
+학습 구조:
+  - Q network: real (z_t, u_real_t) 위에서만 학습
+  - TD target: Koopman world model H-step rollout으로 Σγ^k r̂ + γ^H V(z_hat_H)
+  - V network: expectile regression τ=0.8
+  - Policy: AWR (Advantage Weighted Regression), exp(β*A) weighted BC
+  - OOD 방지: explicit penalization 없이 expectile V로 자연스럽게
 
-  dataset['infos/tasks_to_complete']: (N, 4) string array
-    → 각 timestep에 남은 task 목록 → task completion timestep 식별
+Usage:
+    # Step 1: LQR rollout 캐시 생성 (없으면 자동 생성)
+    python iql_koopman.py \
+        --ckpt   checkpoints/kodaq_v4/final.pt \
+        --x_cache checkpoints/skill_pretrain/x_sequences.npz \
+        --out_dir checkpoints/kodaq_v4/iql \
+        --device cuda:1
 
-Goal 식별:
-  1. final_goal:    에피소드 마지막 obs (전체 완료 상태)
-  2. subtask_goals: task별 completion timestep obs (중간 goal)
-
-LQR:
-  o_{t+1} = Ā(w_t)·o_t + B̄(w_t)·u_t
-  u_t*    = -Σ_k w_k·L_k·(o_t - o*)
-  L_k     = DARE(A_k, B_k, Q, R)
-
-Uncertainty:
-  τ_d = real(0:d) ⊕ LQR(d:d+H)
-  U   = mean_t Var_d[o_t^(τ_d)]
+    # Step 2: 이미 캐시 있으면 바로 학습
+    python iql_koopman.py \
+        --ckpt       checkpoints/kodaq_v4/final.pt \
+        --x_cache    checkpoints/skill_pretrain/x_sequences.npz \
+        --lqr_cache  checkpoints/kodaq_v4/iql/lqr_cache.npz \
+        --out_dir    checkpoints/kodaq_v4/iql \
+        --device cuda:1
 """
 
-import os, sys
+import os, sys, time, math
 sys.path.insert(0, os.path.expanduser('~/koopman_CVAE'))
 
+import argparse
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from dataclasses import dataclass
 from pathlib import Path
-from scipy.linalg import solve_discrete_are
 from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
+from collections import deque
 
 from models.koopman_cvae import KoopmanCVAE
-from models.losses import symlog, symexp, blend_koopman
+from models.losses import symexp
 from data.extract_skill_label import load_x_sequences
+from lqr_koopman import (
+    KODAQLQRPlanner, LQRConfig,
+    load_kitchen_episodes, obs_to_x_goal,
+    X_DQ_START, X_DQ_END, X_DP_START, X_DP_END,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# D4RL Kitchen constants (from kitchen_envs.py)
-# obs[0:9]  = robot qpos
-# obs[9:60] = obj_qp (51-dim)
-# OBS_ELEMENT_INDICES below are in raw 60-dim obs space (obj offset +9 applied)
+# Config
 # ─────────────────────────────────────────────────────────────────────────────
 
-OBS_ELEMENT_INDICES = {
-    'bottom burner': np.array([11, 12]) + 9,
-    'top burner':    np.array([15, 16]) + 9,
-    'light switch':  np.array([17, 18]) + 9,
-    'slide cabinet': np.array([19])     + 9,
-    'hinge cabinet': np.array([20, 21]) + 9,
-    'microwave':     np.array([22])     + 9,
-    'kettle':        np.array([23, 24, 25, 26, 27, 28, 29]) + 9,
-}
+@dataclass
+class IQLConfig:
+    # IQL
+    tau:            float = 0.8      # expectile for V (0.5=mean, 0.9=high percentile)
+    beta:           float = 3.0      # AWR temperature
+    gamma:          float = 0.99     # discount
 
-OBS_ELEMENT_GOALS = {
-    'bottom burner': np.array([-0.88, -0.01]),
-    'top burner':    np.array([-0.92, -0.01]),
-    'light switch':  np.array([-0.69, -0.05]),
-    'slide cabinet': np.array([0.37]),
-    'hinge cabinet': np.array([0.,   1.45]),
-    'microwave':     np.array([-0.75]),
-    'kettle':        np.array([-0.23, 0.75, 1.62, 0.99, 0., 0., -0.06]),
-}
+    # H-step TD
+    H:              int   = 8        # rollout horizon for TD target
 
-BONUS_THRESH = 0.3
-ALL_TASKS    = list(OBS_ELEMENT_INDICES.keys())
+    # networks
+    hidden_dim:     int   = 256
+    n_layers:       int   = 2
 
-# x_t = [Δe(2048) | Δp(42) | Δq(9) | q̇(9)]
-X_DE_START = 0;    X_DE_END = 2048
-X_DP_START = 2048; X_DP_END = 2090
-X_DQ_START = 2090; X_DQ_END = 2099
-X_QD_START = 2099; X_QD_END = 2108
+    # optimization
+    lr_q:           float = 3e-4
+    lr_v:           float = 3e-4
+    lr_pi:          float = 3e-4
+    batch_size:     int   = 256
+    n_steps:        int   = 500_000
+    target_ema:     float = 0.005    # soft update coefficient
+
+    # data
+    real_ratio:     float = 0.5      # fraction of real data in each batch
+    # remaining (1 - real_ratio) comes from LQR cache for TD target only
+
+    # reward normalization
+    reward_scale:   float = 10.0     # multiply sparse 0/1 reward
+    reward_min:     float = 0.0
+    reward_max:     float = 1.0
+
+    # logging
+    log_every:      int   = 1_000
+    save_every:     int   = 50_000
+
+    # LQR cache generation
+    n_ep_lqr:       int   = 500      # episodes for LQR cache
+    lqr_quality:    str   = 'mixed'
+
+    # policy evaluation
+    eval_every:     int   = 50_000
+    n_eval_ep:      int   = 5
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Task completion detection
+# Networks (모두 Koopman latent space에서 작동)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def detect_task_completions(obs_ep: np.ndarray, tasks: List[str]) -> Dict[str, int]:
+def make_mlp(in_dim: int, out_dim: int, hidden: int, n_layers: int,
+             output_activation=None) -> nn.Sequential:
+    layers = []
+    d = in_dim
+    for _ in range(n_layers):
+        layers += [nn.Linear(d, hidden), nn.LayerNorm(hidden), nn.ELU()]
+        d = hidden
+    layers.append(nn.Linear(d, out_dim))
+    if output_activation is not None:
+        layers.append(output_activation)
+    return nn.Sequential(*layers)
+
+
+class QNetwork(nn.Module):
+    """Q(z_t, u_t) → scalar"""
+    def __init__(self, z_dim: int, u_dim: int, hidden: int, n_layers: int):
+        super().__init__()
+        self.net = make_mlp(z_dim + u_dim, 1, hidden, n_layers)
+
+    def forward(self, z: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+        return self.net(torch.cat([z, u], dim=-1)).squeeze(-1)  # (B,)
+
+
+class VNetwork(nn.Module):
+    """V(z_t) → scalar"""
+    def __init__(self, z_dim: int, hidden: int, n_layers: int):
+        super().__init__()
+        self.net = make_mlp(z_dim, 1, hidden, n_layers)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return self.net(z).squeeze(-1)  # (B,)
+
+
+class GaussianPolicy(nn.Module):
+    """π(u | z_t) — Gaussian policy in latent action space"""
+    def __init__(self, z_dim: int, u_dim: int, hidden: int, n_layers: int,
+                 log_std_min: float = -5.0, log_std_max: float = 2.0):
+        super().__init__()
+        self.u_dim = u_dim
+        self.log_std_min = log_std_min
+        self.log_std_max = log_std_max
+        self.net   = make_mlp(z_dim, hidden, hidden, n_layers - 1)
+        self.mu    = nn.Linear(hidden, u_dim)
+        self.log_s = nn.Linear(hidden, u_dim)
+
+    def forward(self, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        feat = self.net(z)
+        mu   = self.mu(feat)
+        log_std = self.log_s(feat).clamp(self.log_std_min, self.log_std_max)
+        return mu, log_std
+
+    def log_prob(self, z: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+        mu, log_std = self(z)
+        dist = torch.distributions.Normal(mu, log_std.exp())
+        return dist.log_prob(u).sum(dim=-1)  # (B,)
+
+    def sample(self, z: torch.Tensor) -> torch.Tensor:
+        mu, log_std = self(z)
+        return torch.distributions.Normal(mu, log_std.exp()).rsample()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Replay Buffer
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ReplayBuffer:
     """
-    각 task의 첫 completion timestep 반환.
-    D4RL 기준: ||obs[element_idx] - goal|| < BONUS_THRESH
-    Returns {task: timestep}  (-1 = not completed)
+    두 종류의 데이터를 별도로 저장:
+      real:  (z_t, u_real_t, z_{t+1}, r_t)           — Q/V/π 학습용
+      lqr:   (z_t, z_hat_{1..H}, r_hat_{1..H})        — TD target 계산용
     """
-    out = {}
-    for task in tasks:
-        idx  = OBS_ELEMENT_INDICES.get(task)
-        goal = OBS_ELEMENT_GOALS.get(task)
-        if idx is None:
-            out[task] = -1
+    def __init__(self, device: str):
+        self.device = device
+        self.real: Dict[str, np.ndarray] = {}
+        self.lqr:  Dict[str, np.ndarray] = {}
+        self._real_n = 0
+        self._lqr_n  = 0
+
+    def add_real(self, z_t, u_t, z_next, r_t):
+        """실제 데이터 추가"""
+        if not self.real:
+            self.real = {
+                'z':      np.empty((len(z_t), z_t.shape[1]), dtype=np.float32),
+                'u':      np.empty((len(u_t), u_t.shape[1]), dtype=np.float32),
+                'z_next': np.empty((len(z_next), z_next.shape[1]), dtype=np.float32),
+                'r':      np.empty(len(r_t), dtype=np.float32),
+            }
+        n = len(z_t)
+        self.real['z'][:n]      = z_t
+        self.real['u'][:n]      = u_t
+        self.real['z_next'][:n] = z_next
+        self.real['r'][:n]      = r_t
+        self._real_n = n
+
+    def add_lqr(self, z_t, z_hat_seq, r_hat_seq):
+        """
+        z_t:      (N, m)
+        z_hat_seq: (N, H, m)   — Koopman rollout states
+        r_hat_seq: (N, H)      — reward head predictions
+        """
+        if not self.lqr:
+            N, H, m = z_hat_seq.shape
+            self.lqr = {
+                'z':         np.empty((N, m),    dtype=np.float32),
+                'z_hat_seq': np.empty((N, H, m), dtype=np.float32),
+                'r_hat_seq': np.empty((N, H),    dtype=np.float32),
+            }
+        n = len(z_t)
+        self.lqr['z'][:n]         = z_t
+        self.lqr['z_hat_seq'][:n] = z_hat_seq
+        self.lqr['r_hat_seq'][:n] = r_hat_seq
+        self._lqr_n = n
+
+    def sample_real(self, batch_size: int) -> Dict[str, torch.Tensor]:
+        idx = np.random.randint(0, self._real_n, batch_size)
+        return {k: torch.FloatTensor(v[idx]).to(self.device)
+                for k, v in self.real.items()}
+
+    def sample_lqr(self, batch_size: int) -> Dict[str, torch.Tensor]:
+        idx = np.random.randint(0, self._lqr_n, batch_size)
+        return {k: torch.FloatTensor(v[idx]).to(self.device)
+                for k, v in self.lqr.items()}
+
+    @property
+    def real_size(self): return self._real_n
+
+    @property
+    def lqr_size(self): return self._lqr_n
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Reward Normalizer
+# ─────────────────────────────────────────────────────────────────────────────
+
+class RewardNormalizer:
+    """
+    H-step discounted reward를 러닝 통계로 정규화.
+    BCE reward (0/1 sparse) → Σγ^k r̂ 범위가 불안정하므로 필수.
+    """
+    def __init__(self, clip: float = 10.0, momentum: float = 0.001):
+        self.mean   = 0.0
+        self.var    = 1.0
+        self.count  = 0
+        self.clip   = clip
+        self.momentum = momentum
+
+    def update(self, x: np.ndarray):
+        batch_mean = x.mean()
+        batch_var  = x.var() + 1e-8
+        self.mean  = (1 - self.momentum) * self.mean + self.momentum * batch_mean
+        self.var   = (1 - self.momentum) * self.var  + self.momentum * batch_var
+
+    def normalize(self, x: torch.Tensor) -> torch.Tensor:
+        std = math.sqrt(self.var) + 1e-8
+        x_n = (x - self.mean) / std
+        return x_n.clamp(-self.clip, self.clip)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LQR Cache Builder
+# ─────────────────────────────────────────────────────────────────────────────
+
+@torch.no_grad()
+def build_lqr_cache(
+    model:      KoopmanCVAE,
+    planner:    KODAQLQRPlanner,
+    episodes:   List[Dict],
+    x_seq_full: np.ndarray,
+    H:          int   = 8,
+    device:     str   = 'cuda',
+    save_path:  str   = None,
+) -> Dict[str, np.ndarray]:
+    """
+    Sub-goal 기반 LQR rollout 캐시 생성.
+
+    각 stage에서:
+      - context: [stage_start - cond_len : stage_start]
+      - goal:    obs[stage_end]
+      - LQR rollout H 스텝
+      - 저장: (z_0, z_hat_{1..H}, r_hat_{1..H})
+
+    z는 이미 encode_sequence()로 인코딩된 상태.
+    r_hat은 model.decoder의 reward head 예측값.
+    """
+    dev = torch.device(device)
+    model.eval()
+
+    all_z0        = []   # (N, m)
+    all_z_hat_seq = []   # (N, H, m)
+    all_r_hat_seq = []   # (N, H)
+
+    # real data용
+    all_z_real      = []  # (N, m)
+    all_u_real      = []  # (N, d_u)
+    all_z_next_real = []  # (N, m)
+    all_r_real      = []  # (N,)
+
+    cond_len = 16
+    total_stages = 0
+
+    print(f"\n=== Building LQR Cache: {len(episodes)} episodes, H={H} ===")
+
+    for ep_idx, ep in enumerate(episodes):
+        L        = ep['length']
+        obs_ep   = ep['obs']       # (L, 60)
+        acts_ep  = ep['actions']   # (L, 9)
+        rew_ep   = ep['rewards']   # (L,)
+        gi       = ep['goal_info']
+        s_t      = ep['start_t']
+        x_ep     = x_seq_full[s_t:s_t + L]  # (L, 2108)
+
+        if not ep['tasks']:
             continue
-        found = -1
-        for t in range(len(obs_ep)):
-            if np.linalg.norm(obs_ep[t, idx] - goal) < BONUS_THRESH:
-                found = t
-                break
-        out[task] = found
-    return out
+
+        # ── Real data: 에피소드 전체를 consecutive pair로 저장 ──────────────
+        # encode 전체 시퀀스 한 번에
+        x_ep_t  = torch.FloatTensor(x_ep).unsqueeze(0).to(dev)     # (1, L, 2108)
+        a_ep_t  = torch.FloatTensor(acts_ep).unsqueeze(0).to(dev)   # (1, L, 9)
+        enc     = model.encode_sequence(x_ep_t, a_ep_t)
+        z_ep    = enc['o_seq'][0].cpu().numpy()    # (L, m)
+        h_ep    = enc['h_seq'][0]                  # (L, d_h)
+
+        # real (z_t, a_t, z_{t+1}, r_t) — robot action 직접 저장
+        acts_clipped = acts_ep.clip(-1.0, 1.0).astype(np.float32)
+
+        for t in range(L - 1):
+            all_z_real.append(z_ep[t])
+            all_u_real.append(acts_clipped[t])   # robot action (9-dim)
+            all_z_next_real.append(z_ep[t + 1])
+            all_r_real.append(float(rew_ep[t]))
+
+        # ── LQR rollout: sub-goal stage별 ──────────────────────────────────
+        jump_ts    = sorted(gi['completions'].values())
+        stage_ends = jump_ts + [L - 1]
+
+        stage_start = 0
+        for stage_idx, stage_end_t in enumerate(stage_ends):
+            stage_len = stage_end_t - stage_start
+            if stage_len < H:
+                stage_start = stage_end_t + 1
+                continue
+
+            # conditioning
+            cond_s = max(0, stage_start - cond_len)
+            cond_e = stage_start if stage_start > 0 else min(cond_len, stage_end_t)
+
+            x_cond = torch.FloatTensor(x_ep[cond_s:cond_e]).unsqueeze(0).to(dev)
+            a_cond = torch.FloatTensor(acts_ep[cond_s:cond_e]).unsqueeze(0).to(dev)
+
+            goal_obs  = obs_ep[stage_end_t]
+            ref_obs   = obs_ep[0]
+            x_goal_np = obs_to_x_goal(goal_obs, ref_obs)
+            x_goal_t  = torch.FloatTensor(x_goal_np).unsqueeze(0).to(dev)
+
+            # LQR plan
+            try:
+                plan = planner.plan(
+                    x_cond, a_cond, x_goal_t,
+                    horizon=H,
+                    compute_uncertainty=False,
+                )
+            except Exception as e:
+                print(f"  Ep {ep_idx} stage {stage_idx} plan failed: {e}")
+                stage_start = stage_end_t + 1
+                continue
+
+            # z_hat rollout: (H+1, m) → 0번이 z_0, 1..H가 z_hat_{1..H}
+            o_traj = plan['o_traj'].cpu()   # (H+1, m)
+            z0     = o_traj[0].numpy()      # (m,)
+            z_hat  = o_traj[1:].numpy()     # (H, m)
+
+            # reward head로 r_hat 계산
+            with torch.no_grad():
+                recon = model.decoder(o_traj[1:].to(dev))   # (H,) heads
+                # reward head: BCE logit → sigmoid → probability
+                if 'reward' in recon:
+                    r_hat = torch.sigmoid(recon['reward']).squeeze(-1).cpu().numpy()
+                else:
+                    # reward head 없으면 delta_q 변화량으로 proxy
+                    dq = symexp(recon['q'])  # (H, 9)
+                    r_hat = dq.abs().mean(-1).cpu().numpy()
+
+            all_z0.append(z0)
+            all_z_hat_seq.append(z_hat)          # (H, m)
+            all_r_hat_seq.append(r_hat)          # (H,)
+            total_stages += 1
+
+            stage_start = stage_end_t + 1
+
+        if (ep_idx + 1) % 50 == 0:
+            print(f"  Ep {ep_idx+1}/{len(episodes)}  stages so far: {total_stages}")
+
+    print(f"\nCache built: {total_stages} LQR stages, "
+          f"{len(all_z_real)} real transitions")
+
+    cache = {
+        # LQR cache
+        'z0':         np.array(all_z0,        dtype=np.float32),   # (N_lqr, m)
+        'z_hat_seq':  np.array(all_z_hat_seq, dtype=np.float32),   # (N_lqr, H, m)
+        'r_hat_seq':  np.array(all_r_hat_seq, dtype=np.float32),   # (N_lqr, H)
+        # Real transitions
+        'z_real':     np.array(all_z_real,      dtype=np.float32), # (N_real, m)
+        'u_real':     np.array(all_u_real,      dtype=np.float32), # (N_real, d_u)
+        'z_next_real': np.array(all_z_next_real, dtype=np.float32),# (N_real, m)
+        'r_real':     np.array(all_r_real,      dtype=np.float32), # (N_real,)
+    }
+
+    if save_path:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        np.savez(save_path, **cache)
+        print(f"Saved cache → {save_path}")
+
+    return cache
 
 
-def identify_episode_goals(obs_ep: np.ndarray, tasks: List[str]) -> Dict:
-    """
-    에피소드에서 goal 식별:
-      final_goal:    마지막 obs
-      subtask_goals: task별 completion obs (미완료시 OBS_ELEMENT_GOALS로 대체)
-      midpoint_goal: L//2 obs
-    """
-    L           = len(obs_ep)
-    completions = detect_task_completions(obs_ep, tasks)
-    subtask_goals = {}
-    for task in tasks:
-        t = completions[task]
-        if t >= 0:
-            subtask_goals[task] = {'obs': obs_ep[t], 'timestep': t, 'completed': True}
+# ─────────────────────────────────────────────────────────────────────────────
+# IQL Trainer
+# ─────────────────────────────────────────────────────────────────────────────
+
+class IQLTrainer:
+    def __init__(
+        self,
+        cfg:        IQLConfig,
+        z_dim:      int,
+        action_dim: int,       # robot action dim (9)
+        device:     str,
+    ):
+        self.cfg    = cfg
+        self.device = device
+
+        # Networks — robot action space
+        self.Q1 = QNetwork(z_dim, action_dim, cfg.hidden_dim, cfg.n_layers).to(device)
+        self.Q2 = QNetwork(z_dim, action_dim, cfg.hidden_dim, cfg.n_layers).to(device)
+        self.Q1_target = QNetwork(z_dim, action_dim, cfg.hidden_dim, cfg.n_layers).to(device)
+        self.Q2_target = QNetwork(z_dim, action_dim, cfg.hidden_dim, cfg.n_layers).to(device)
+        self.V  = VNetwork(z_dim, cfg.hidden_dim, cfg.n_layers).to(device)
+        self.pi = GaussianPolicy(z_dim, action_dim, cfg.hidden_dim, cfg.n_layers).to(device)
+
+        # Copy weights to targets
+        self.Q1_target.load_state_dict(self.Q1.state_dict())
+        self.Q2_target.load_state_dict(self.Q2.state_dict())
+
+        # Optimizers
+        self.opt_q  = torch.optim.Adam(
+            list(self.Q1.parameters()) + list(self.Q2.parameters()), lr=cfg.lr_q)
+        self.opt_v  = torch.optim.Adam(self.V.parameters(),  lr=cfg.lr_v)
+        self.opt_pi = torch.optim.Adam(self.pi.parameters(), lr=cfg.lr_pi)
+
+        # Reward normalizer
+        self.r_norm = RewardNormalizer()
+
+        # CategoricalRewardHead (optional, 3-way reward)
+        self.cat_head = None
+
+        # Logging
+        self.log_history = {
+            'loss_q': [], 'loss_v': [], 'loss_pi': [],
+            'q_mean': [], 'v_mean': [], 'adv_mean': [],
+            'r_target_mean': [],
+        }
+
+    @torch.no_grad()
+    def _compute_h_step_target(
+        self,
+        z_hat_seq:  torch.Tensor,  # (B, H, m)  Koopman rollout states
+        r_hat_seq:  torch.Tensor,  # (B, H)     BCE event reward
+        r_real_seq: torch.Tensor,  # (B, H)     offline real env reward
+        cat_head=None,             # CategoricalRewardHead (optional)
+    ) -> torch.Tensor:
+        """
+        H-step discounted return + bootstrapped V.
+
+        r_blend_t = 0.5*r_env + 0.2*(r_acc/4) + 0.3*r_event
+        y_t = sum_{k=0}^{H-1} gamma^k * normalize(r_blend_{t+k}) + gamma^H * V(z_H)
+
+        IQL/Online 통일 reward 구조.
+        """
+        H   = self.cfg.H
+        gm  = self.cfg.gamma
+        dev = self.device
+
+        gm_powers = torch.tensor(
+            [gm**k for k in range(H)], dtype=torch.float32, device=dev)
+
+        # r_acc: categorical head expected reward (없으면 event reward로 대체)
+        if cat_head is not None:
+            B, Hs, m = z_hat_seq.shape
+            z_flat  = z_hat_seq.reshape(B * Hs, m)
+            r_acc   = cat_head.expected_reward(z_flat).reshape(B, Hs)  # (B, H) in [0,4]
         else:
-            # goal 미달성 → OBS_ELEMENT_GOALS로 이상적 goal 구성
-            g_obs            = obs_ep[0].copy()
-            g_obs[OBS_ELEMENT_INDICES[task]] = OBS_ELEMENT_GOALS[task]
-            subtask_goals[task] = {'obs': g_obs, 'timestep': -1, 'completed': False}
+            r_acc   = r_hat_seq * 4.0   # BCE proxy
 
+        # 3-way blend (per step)
+        r_blend = (0.5 * r_real_seq +
+                   0.2 * (r_acc / 4.0) +
+                   0.3 * r_hat_seq)           # (B, H)
+        r_blend = r_blend.clamp(0.0, 1.0)
+
+        # normalize per batch
+        r_normalized = self.r_norm.normalize(r_blend)
+
+        r_sum = (r_normalized * gm_powers.unsqueeze(0)).sum(dim=1)  # (B,)
+
+        z_H = z_hat_seq[:, -1]
+        v_H = self.V(z_H)
+        y_t = r_sum + (gm**H) * v_H
+        return y_t.detach()
+
+    def update(
+        self,
+        real_batch: Dict[str, torch.Tensor],
+        lqr_batch:  Dict[str, torch.Tensor],
+    ) -> Dict[str, float]:
+        """
+        Single update step.
+
+        real_batch: z, u, z_next, r  — Q/V/π 학습용
+        lqr_batch:  z0, z_hat_seq, r_hat_seq — TD target 계산용
+        """
+        z_r    = real_batch['z']        # (B, m)
+        u_r    = real_batch['u']        # (B, d_u)
+        z_r_nxt= real_batch['z_next']   # (B, m)
+        r_r    = real_batch['r']        # (B,)
+
+        z_l    = lqr_batch['z']         # (B, m)
+        z_hat  = lqr_batch['z_hat_seq'] # (B, H, m)
+        r_hat  = lqr_batch['r_hat_seq'] # (B, H)
+
+        # ── H-step TD target (3-way reward) ──────────────────────────────
+        # r_real_seq: r_r를 H step에 broadcast (offline 데이터의 단일 step reward)
+        # 실제로는 LQR rollout의 각 step reward가 이상적이나
+        # offline cache에 없으므로 현재 step reward를 H step에 동일하게 사용
+        r_real_seq = r_r.unsqueeze(1).expand(-1, self.cfg.H)  # (B, H)
+
+        # cat_head가 있으면 accumulated reward 사용
+        cat_head = getattr(self, 'cat_head', None)
+        y_lqr  = self._compute_h_step_target(
+            z_hat, r_hat, r_real_seq, cat_head=cat_head)   # (B,)
+
+        # y_t = y_lqr (3-way reward로 통일, 1-step 혼합 제거)
+        y_t = y_lqr
+
+        # ── Q loss: real (z, u) 위에서만 ────────────────────────────────
+        q1 = self.Q1(z_r, u_r)   # (B,)
+        q2 = self.Q2(z_r, u_r)   # (B,)
+
+        loss_q = F.mse_loss(q1, y_t) + F.mse_loss(q2, y_t)
+
+        self.opt_q.zero_grad()
+        loss_q.backward()
+        nn.utils.clip_grad_norm_(
+            list(self.Q1.parameters()) + list(self.Q2.parameters()), 1.0)
+        self.opt_q.step()
+
+        # ── V loss: expectile regression ─────────────────────────────────
+        with torch.no_grad():
+            q_min = torch.min(
+                self.Q1_target(z_r, u_r),
+                self.Q2_target(z_r, u_r),
+            )  # (B,)
+
+        v     = self.V(z_r)            # (B,)
+        adv   = q_min - v              # (B,)
+        τ     = self.cfg.tau
+
+        # Asymmetric L2: τ for positive adv, (1-τ) for negative
+        weight   = torch.where(adv >= 0,
+                               torch.full_like(adv, τ),
+                               torch.full_like(adv, 1 - τ))
+        loss_v   = (weight * adv**2).mean()
+
+        self.opt_v.zero_grad()
+        loss_v.backward()
+        nn.utils.clip_grad_norm_(self.V.parameters(), 1.0)
+        self.opt_v.step()
+
+        # ── Policy loss: AWR ──────────────────────────────────────────────
+        with torch.no_grad():
+            q_min_pi = torch.min(
+                self.Q1(z_r, u_r),
+                self.Q2(z_r, u_r),
+            )
+            v_pi   = self.V(z_r)
+            adv_pi = q_min_pi - v_pi                         # (B,)
+            # exp(β * A), clamped for stability
+            w_pi   = torch.exp(self.cfg.beta * adv_pi).clamp(max=100.0)
+
+        log_prob = self.pi.log_prob(z_r, u_r)               # (B,)
+        loss_pi  = -(w_pi * log_prob).mean()
+
+        self.opt_pi.zero_grad()
+        loss_pi.backward()
+        nn.utils.clip_grad_norm_(self.pi.parameters(), 1.0)
+        self.opt_pi.step()
+
+        # ── Soft update Q target ──────────────────────────────────────────
+        ema = self.cfg.target_ema
+        for p, pt in zip(self.Q1.parameters(), self.Q1_target.parameters()):
+            pt.data.mul_(1 - ema).add_(p.data, alpha=ema)
+        for p, pt in zip(self.Q2.parameters(), self.Q2_target.parameters()):
+            pt.data.mul_(1 - ema).add_(p.data, alpha=ema)
+
+        return {
+            'loss_q':        loss_q.item(),
+            'loss_v':        loss_v.item(),
+            'loss_pi':       loss_pi.item(),
+            'q_mean':        q_min.mean().item(),
+            'v_mean':        v.mean().item(),
+            'adv_mean':      adv.mean().item(),
+            'r_target_mean': y_t.mean().item(),
+        }
+
+    def save(self, path: str, step: int):
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        torch.save({
+            'step':       step,
+            'Q1':         self.Q1.state_dict(),
+            'Q2':         self.Q2.state_dict(),
+            'Q1_target':  self.Q1_target.state_dict(),
+            'Q2_target':  self.Q2_target.state_dict(),
+            'V':          self.V.state_dict(),
+            'pi':         self.pi.state_dict(),
+            'r_norm_mean': self.r_norm.mean,
+            'r_norm_var':  self.r_norm.var,
+        }, path)
+        print(f"  Saved: {path}")
+
+    def load(self, path: str):
+        ckpt = torch.load(path, map_location=self.device)
+        self.Q1.load_state_dict(ckpt['Q1'])
+        self.Q2.load_state_dict(ckpt['Q2'])
+        self.Q1_target.load_state_dict(ckpt['Q1_target'])
+        self.Q2_target.load_state_dict(ckpt['Q2_target'])
+        self.V.load_state_dict(ckpt['V'])
+        self.pi.load_state_dict(ckpt['pi'])
+        self.r_norm.mean = ckpt.get('r_norm_mean', 0.0)
+        self.r_norm.var  = ckpt.get('r_norm_var', 1.0)
+        print(f"Loaded IQL checkpoint: {path}  step={ckpt.get('step', 0)}")
+        return ckpt.get('step', 0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Visualization
+# ─────────────────────────────────────────────────────────────────────────────
+
+def visualize_training(log: Dict[str, List], out_path: str):
+    import matplotlib; matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    keys = ['loss_q', 'loss_v', 'loss_pi', 'q_mean', 'v_mean',
+            'adv_mean', 'r_target_mean']
+    titles = ['Q Loss', 'V Loss', 'π Loss', 'Q mean',
+              'V mean', 'Advantage mean', 'TD Target mean']
+
+    fig, axes = plt.subplots(3, 3, figsize=(18, 12))
+    axes = axes.flatten()
+    PAL = ['#E53935', '#1E88E5', '#43A047', '#FB8C00',
+           '#8E24AA', '#00ACC1', '#FFB300']
+
+    for i, (key, title) in enumerate(zip(keys, titles)):
+        if not log[key]: continue
+        vals = np.array(log[key])
+        # smoothing
+        w = min(50, len(vals) // 10 + 1)
+        smooth = np.convolve(vals, np.ones(w)/w, mode='valid')
+        ax = axes[i]
+        ax.plot(vals,   color=PAL[i], alpha=0.25, lw=0.8)
+        ax.plot(smooth, color=PAL[i], lw=1.8)
+        ax.set_title(title, fontsize=9, fontweight='bold')
+        ax.spines[['top', 'right']].set_visible(False)
+
+    fig.suptitle('IQL + H-step TD Training Curves', fontsize=12, fontweight='bold')
+    plt.tight_layout()
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path, dpi=130, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved training curves: {out_path}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Policy Evaluation
+# ─────────────────────────────────────────────────────────────────────────────
+
+@torch.no_grad()
+def evaluate_policy(
+    trainer:    IQLTrainer,
+    model:      KoopmanCVAE,
+    planner:    KODAQLQRPlanner,
+    episodes:   List[Dict],
+    x_seq_full: np.ndarray,
+    device:     str,
+    n_ep:       int = 5,
+    cond_len:   int = 16,
+) -> Dict[str, float]:
+    """
+    학습된 policy π(u|z)로 롤아웃 → Koopman 공간에서 성능 평가.
+    (실제 시뮬레이터 없이 world model 기반 평가)
+    """
+    dev = torch.device(device)
+    model.eval()
+    trainer.pi.eval()
+
+    all_rewards = []
+    all_rmse_dq = []
+
+    for ep in episodes[:n_ep]:
+        L       = ep['length']
+        obs_ep  = ep['obs']
+        acts_ep = ep['actions']
+        rew_ep  = ep['rewards']
+        s_t     = ep['start_t']
+        x_ep    = x_seq_full[s_t:s_t + L]
+
+        # context encoding
+        x_cond = torch.FloatTensor(x_ep[:cond_len]).unsqueeze(0).to(dev)
+        a_cond = torch.FloatTensor(acts_ep[:cond_len]).unsqueeze(0).to(dev)
+        enc    = model.encode_sequence(x_cond, a_cond)
+        z_cur  = enc['o_seq'][0, -1:]   # (1, m)
+        h_cur  = enc['h_seq'][0, -1:]   # (1, d_h)
+
+        rollout_rewards = []
+        rollout_dq      = []
+        horizon         = min(64, L - cond_len)
+
+        for t in range(horizon):
+            # Policy action
+            u_t   = trainer.pi.sample(z_cur)               # (1, d_u)
+            # Koopman step
+            w_t   = model.skill_prior.soft_weights(h_cur)
+            from lqr_planner import blend_koopman
+            log_lam = model.koopman.get_log_lambdas()
+            A_bar, B_bar, _, _ = blend_koopman(
+                log_lam, model.koopman.theta_k, model.koopman.G_k,
+                model.koopman.U, w_t,
+            )
+            A_bar = A_bar[0]; B_bar = B_bar[0]
+            z_next = (A_bar @ z_cur.T).T + (B_bar @ u_t.T).T  # (1, m)
+
+            # Reward prediction
+            recon = model.decoder(z_next)
+            if 'reward' in recon:
+                r_hat = torch.sigmoid(recon['reward']).item()
+            else:
+                r_hat = 0.0
+
+            rollout_rewards.append(r_hat)
+
+            # Decoded x_t for RMSE
+            x_hat = torch.cat([
+                symexp(recon['delta_e']),
+                symexp(recon['delta_p']),
+                symexp(recon['q']),
+                symexp(recon['qdot']),
+            ], dim=-1).cpu().numpy()  # (1, 2108)
+
+            true_idx = cond_len + t
+            if true_idx < L:
+                dq_err = ((x_hat[0, X_DQ_START:X_DQ_END] -
+                           x_ep[true_idx, X_DQ_START:X_DQ_END])**2).mean()
+                rollout_dq.append(float(dq_err**0.5))
+
+            # GRU update
+            a_decoded = planner._decode_action(u_t)
+            h_cur = model.recurrent(h_cur, z_cur, a_decoded)
+            z_cur = z_next
+
+        all_rewards.append(sum(rollout_rewards))
+        if rollout_dq:
+            all_rmse_dq.append(np.mean(rollout_dq))
+
+    trainer.pi.train()
     return {
-        'final_goal':    obs_ep[-1],
-        'midpoint_goal': obs_ep[L // 2],
-        'subtask_goals': subtask_goals,
-        'completions':   completions,
-        'episode_len':   L,
+        'mean_reward':  np.mean(all_rewards),
+        'std_reward':   np.std(all_rewards),
+        'mean_rmse_dq': np.mean(all_rmse_dq) if all_rmse_dq else 0.0,
     }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# obs → x_goal (2108-dim)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def obs_to_x_goal(goal_obs: np.ndarray, ref_obs: np.ndarray) -> np.ndarray:
-    """
-    x_goal = [Δe=0 | Δp=goal_obj-ref_obj | Δq=goal_q-ref_q | q̇=0]
-    """
-    delta_e = np.zeros(2048, dtype=np.float32)
-    delta_p = (goal_obs[18:60] - ref_obs[18:60]).astype(np.float32)
-    delta_q = (goal_obs[0:9]   - ref_obs[0:9]).astype(np.float32)
-    qdot    = np.zeros(9, dtype=np.float32)
-    x_goal  = np.concatenate([delta_e, delta_p, delta_q, qdot])
-    assert x_goal.shape[0] == 2108
-    return x_goal
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# LQR Config + DARE
-# ─────────────────────────────────────────────────────────────────────────────
-
-@dataclass
-class LQRConfig:
-    Q_scale:       float = 1.0
-    R_scale:       float = 0.1
-    eps_A:         float = 0.01
-    T_replan:      int   = 8
-    dare_max_iter: int   = 300
-    dare_tol:      float = 1e-8
-    lambda_unc:    float = 0.1
-    u_max:         float = 1.0
-    action_inv_steps: int = 30
-    use_u_bounds:  bool  = True   # clip u_t to surveyed ψ(a) range
-
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Action encoder range survey: u = ψ(a),  a ∈ [-1,1]^da
-# ─────────────────────────────────────────────────────────────────────────────
-
-def survey_action_encoder_range(
-    model,
-    n_random:    int   = 20000,
-    n_pertub:    int   = 5000,
-    eps:         float = 1e-3,
-    device:      str   = 'cuda',
-    save_path:   str   = None,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    ψ(a) 범위 조사: a ∈ [-1-eps, 1+eps]^da + perturbation
-
-    Returns:
-        u_min: (d_u,)  각 latent 차원 하한
-        u_max: (d_u,)  각 latent 차원 상한
-    """
-    model.eval()
-    da = model.cfg.action_dim
-    dev = torch.device(device if torch.cuda.is_available() else 'cpu')
-
-    samples = []
-
-    # 1. Random uniform in [-1, 1]^da
-    a_rand = torch.FloatTensor(n_random, da).uniform_(-1., 1.)
-    samples.append(a_rand)
-
-    # 2. Extreme corners (2^min(da,8) subset)
-    n_corners = min(da, 8)
-    for i in range(2**n_corners):
-        corner = np.array([((-1)**((i >> j) & 1)) for j in range(n_corners)]
-                          + [0.0] * (da - n_corners), dtype=np.float32)
-        samples.append(torch.FloatTensor(corner).unsqueeze(0))
-
-    # 3. Boundary perturbation: a ∈ {-1, 1}^da + small noise
-    a_boundary = torch.FloatTensor(n_pertub, da).uniform_(-1., 1.)
-    a_boundary = a_boundary.sign() + torch.randn(n_pertub, da) * eps
-    a_boundary = a_boundary.clamp(-1. - eps, 1. + eps)
-    samples.append(a_boundary)
-
-    # 4. Per-axis extremes (each dim at ±1, rest at 0)
-    for d in range(da):
-        for v in [-1., 1.]:
-            a_ax = torch.zeros(1, da)
-            a_ax[0, d] = v
-            samples.append(a_ax)
-
-    a_all = torch.cat(samples, dim=0).to(dev)
-
-    # Batch forward
-    batch_size = 2048
-    u_list = []
-    with torch.no_grad():
-        for i in range(0, len(a_all), batch_size):
-            u_batch = model.action_encoder(a_all[i:i+batch_size])
-            u_list.append(u_batch.cpu())
-    u_all = torch.cat(u_list, dim=0).numpy()   # (N, d_u)
-
-    u_min = u_all.min(axis=0)   # (d_u,)
-    u_max = u_all.max(axis=0)   # (d_u,)
-
-    print(f"\nAction encoder range survey: {len(a_all)} samples  d_u={u_all.shape[1]}")
-    print(f"  u_min: mean={u_min.mean():.4f}  std={u_min.std():.4f}"
-          f"  min={u_min.min():.4f}  max={u_min.max():.4f}")
-    print(f"  u_max: mean={u_max.mean():.4f}  std={u_max.std():.4f}"
-          f"  min={u_max.min():.4f}  max={u_max.max():.4f}")
-    print(f"  range width: mean={( u_max - u_min).mean():.4f}")
-
-    if save_path:
-        np.savez(save_path, u_min=u_min, u_max=u_max)
-        print(f"  Saved: {save_path}")
-
-    return u_min, u_max
-
-
-def solve_dare_safe(A, B, Q, R, max_iter=300, tol=1e-8):
-    """
-    DARE → (P, L, M)
-
-    L = (R + BᵀPB)⁻¹ BᵀPA   feedback gain
-    M = (R + BᵀPB)⁻¹ BᵀP    feedforward gain
-
-    Optimal control (z* 평형점 가정 없음):
-        u_t* = M·z* - L·z_t
-    """
-    try:
-        P = solve_discrete_are(A, B, Q, R)
-    except Exception:
-        P = Q.copy()
-        for _ in range(max_iter):
-            BtP   = B.T @ P
-            P_new = A.T @ P @ A - A.T @ P @ B @ np.linalg.solve(R + BtP @ B, BtP @ A) + Q
-            if np.max(np.abs(P_new - P)) < tol:
-                P = P_new; break
-            P = P_new
-    BtP   = B.T @ P
-    S_inv = np.linalg.inv(R + BtP @ B)   # (d_u, d_u)
-    L     = S_inv @ BtP @ A               # (d_u, m) feedback
-    M     = S_inv @ BtP                   # (d_u, m) feedforward
-    return P, L, M
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# LQR Planner
-# ─────────────────────────────────────────────────────────────────────────────
-
-class KODAQLQRPlanner:
-    def __init__(self, model: KoopmanCVAE, cfg: LQRConfig):
-        self.model  = model
-        self.cfg    = cfg
-        self.m_cfg  = model.cfg
-        self.device = next(model.parameters()).device
-        m, d_u = self.m_cfg.koopman_dim, self.m_cfg.action_latent
-        self.Q  = np.eye(m)   * cfg.Q_scale
-        self.R  = np.eye(d_u) * cfg.R_scale
-        self._cache: Dict = {}
-        # Per-dim u bounds from survey_action_encoder_range()
-        # None until survey() is called
-        self.u_min: Optional[np.ndarray] = None   # (d_u,)
-        self.u_max: Optional[np.ndarray] = None   # (d_u,)
-        # Clip statistics buffers (reset per rollout)
-        self._clip_raw:  List = []
-        self._clip_post: List = []
-
-    def _get_gain(self, A: np.ndarray, B: np.ndarray):
-        """Cache DARE by (A, B) → (P, L, M)."""
-        key = (A.tobytes()[:64], B.tobytes()[:32])
-        if key not in self._cache:
-            self._cache[key] = solve_dare_safe(
-                A, B, self.Q, self.R, self.cfg.dare_max_iter, self.cfg.dare_tol)
-        return self._cache[key]
-
-    def _blended(self, w: torch.Tensor):
-        """
-        Ā(w), B̄(w) 계산 후 단일 DARE(Ā, B̄) → L, M.
-
-        Per-skill L_k 블렌딩 방식 대신:
-          1. log-eigenvalue space 보간 → Ā(w), B̄(w)
-          2. DARE(Ā, B̄, Q, R) → P, L, M
-        → 블렌딩된 dynamics와 gain이 정확히 일치.
-        """
-        koop    = self.model.koopman
-        log_lam = koop.get_log_lambdas()
-        A_bar, B_bar, _, _ = blend_koopman(
-            log_lam, koop.theta_k, koop.G_k, koop.U, w)
-        A_bar = A_bar[0]   # (m, m)
-        B_bar = B_bar[0]   # (m, d_u)
-
-        A_np = A_bar.detach().cpu().numpy()
-        B_np = B_bar.detach().cpu().numpy()
-        _, L, M = self._get_gain(A_np, B_np)
-        return A_bar, B_bar, L, M
-
-    def _step(self, o, u, A, B):
-        return (A @ o.T).T + (B @ u.T).T
-
-    def survey(
-        self,
-        n_random:  int   = 20000,
-        n_pertub:  int   = 5000,
-        eps:       float = 1e-3,
-        save_path: str   = None,
-    ):
-        """
-        ψ(a) 범위 조사 후 u_min, u_max를 내부에 저장.
-        _lqr_u에서 per-dim clip에 사용됨.
-        """
-        self.u_min, self.u_max = survey_action_encoder_range(
-            self.model, n_random=n_random, n_pertub=n_pertub,
-            eps=eps, device=str(self.device), save_path=save_path,
-        )
-        return self.u_min, self.u_max
-
-    def load_u_bounds(self, path: str):
-        """저장된 u_bounds npz 파일 로드."""
-        data = np.load(path)
-        self.u_min = data['u_min']
-        self.u_max = data['u_max']
-        print(f"Loaded u_bounds: {path}  "
-              f"u_min=[{self.u_min.min():.4f}, {self.u_min.max():.4f}]  "
-              f"u_max=[{self.u_max.min():.4f}, {self.u_max.max():.4f}]")
-
-    def _lqr_u(self, o, o_star, L, M):
-        """
-        u_t* = M·z* - L·z_t   (평형점 가정 없는 정확한 형태)
-
-        L = (R+BᵀPB)⁻¹ BᵀPA   feedback
-        M = (R+BᵀPB)⁻¹ BᵀP    feedforward
-        """
-        z_t   = o[0].cpu().numpy()          # (m,)
-        z_star = o_star[0].cpu().numpy()    # (m,)
-        u_raw = M @ z_star - L @ z_t
-        # Per-dim clip using surveyed ψ(a) range
-        if self.cfg.use_u_bounds and self.u_min is not None:
-            u_np = np.clip(u_raw, self.u_min, self.u_max)
-        else:
-            u_np = np.clip(u_raw, -self.cfg.u_max, self.cfg.u_max)
-        # Record clip statistics
-        self._clip_raw.append(u_raw)
-        self._clip_post.append(u_np)
-        return torch.FloatTensor(u_np).unsqueeze(0).to(self.device)
-
-    @torch.enable_grad()
-    def _decode_action(self, u: torch.Tensor) -> torch.Tensor:
-        da = self.m_cfg.action_dim
-        a  = torch.zeros(1, da, device=self.device, requires_grad=True)
-        opt = torch.optim.Adam([a], lr=0.05)
-        for _ in range(self.cfg.action_inv_steps):
-            opt.zero_grad()
-            F.mse_loss(self.model.action_encoder(a), u.detach()).backward()
-            opt.step()
-            with torch.no_grad(): a.clamp_(-1., 1.)
-        return a.detach()
-
-    @torch.no_grad()
-    def encode_goal(self, x_goal: torch.Tensor, h_ref: torch.Tensor) -> torch.Tensor:
-        if x_goal.dim() == 1: x_goal = x_goal.unsqueeze(0)
-        mu, _ = self.model.posterior(x_goal, h_ref)
-        return mu
-
-    @torch.no_grad()
-    def _lqr_rollout(self, o0, h0, x_goal_t, horizon) -> Dict:
-        """
-        x_goal_t: (1, x_dim) tensor — goal in observation space.
-        z* = μ_φ(x_goal, h_t) 를 T_replan마다 재인코딩 (Option C).
-        u_t* = M(w_t)·z*(h_t) - L(w_t)·z_t  (Option A+C).
-        """
-        model = self.model
-        self._clip_raw  = []   # reset per rollout
-        self._clip_post = []
-        o_list, u_list, a_list, w_list, costs = [o0], [], [], [], []
-        o_cur, h_cur = o0, h0
-
-        w_cur               = model.skill_prior.soft_weights(h_cur)
-        w_list.append(w_cur)
-        A_cur, B_cur, L_cur, M_cur = self._blended(w_cur)
-        A_prev_np           = A_cur.detach().cpu().numpy()
-        o_star              = self.encode_goal(x_goal_t, h_cur)   # (1, m)
-
-        for t in range(horizon):
-            u_t    = self._lqr_u(o_cur, o_star, L_cur, M_cur)
-            a_t    = self._decode_action(u_t)
-            o_next = self._step(o_cur, u_t, A_cur, B_cur)
-            h_next = model.recurrent(h_cur, o_cur, a_t)
-            w_next = model.skill_prior.soft_weights(h_next)
-
-            A_next, B_next, L_next, M_next = self._blended(w_next)
-            A_next_np = A_next.detach().cpu().numpy()
-
-            # Hybrid replan: Ā 변화 크거나 T_replan 주기
-            if (np.linalg.norm(A_next_np - A_prev_np, 'fro') > self.cfg.eps_A
-                    or (t + 1) % self.cfg.T_replan == 0):
-                A_cur, B_cur, L_cur, M_cur = A_next, B_next, L_next, M_next
-                A_prev_np = A_next_np
-                # Option C: h_t가 업데이트됐으므로 z* 재인코딩
-                o_star = self.encode_goal(x_goal_t, h_next)
-
-            # LQR cost: (z_t - z*)ᵀQ(z_t - z*) + u_tᵀRu_t
-            e    = (o_cur - o_star)[0].cpu().numpy()
-            u_np = u_t[0].cpu().numpy()
-            costs.append(float(e @ self.Q @ e + u_np @ self.R @ u_np))
-
-            o_list.append(o_next); u_list.append(u_t)
-            a_list.append(a_t);    w_list.append(w_next)
-            o_cur, h_cur, w_cur = o_next, h_next, w_next
-
-        # Clip statistics
-        clip_raw  = np.stack(self._clip_raw,  axis=0) if self._clip_raw  else None  # (H, d_u)
-        clip_post = np.stack(self._clip_post, axis=0) if self._clip_post else None  # (H, d_u)
-        clip_delta = np.abs(clip_raw - clip_post) if (clip_raw is not None) else None
-        return {
-            'o_traj':      torch.cat(o_list, 0),
-            'u_traj':      torch.cat(u_list, 0),
-            'a_traj':      torch.cat(a_list, 0),
-            'w_traj':      torch.cat(w_list, 0),
-            'costs':       np.array(costs),
-            'total_cost':  float(np.sum(costs)),
-            'o_star':      o_star,
-            'clip_raw':    clip_raw,    # (H, d_u) unconstrained u
-            'clip_post':   clip_post,   # (H, d_u) clipped u
-            'clip_delta':  clip_delta,  # (H, d_u) |raw - post|
-            'clip_active_rate': float(clip_delta.mean()) if clip_delta is not None else 0.0,
-        }
-
-    def _decode_x_traj(self, o_traj: torch.Tensor) -> torch.Tensor:
-        recon = self.model.decoder(o_traj)
-        return torch.cat([symexp(recon['delta_e']), symexp(recon['delta_p']),
-                          symexp(recon['q']),       symexp(recon['qdot'])], dim=-1)
-
-    @torch.no_grad()
-    def uncertainty_rollout(self, o0, h0, x_goal_t, real_actions, lqr_horizon=32) -> Dict:
-        """τ_d = real(0:d) ⊕ LQR(d:d+H). σ²_t = Var_d[o_t^(τ_d)]"""
-        model  = self.model
-        K_real = real_actions.shape[0]
-        base   = self._lqr_rollout(o0, h0, x_goal_t, lqr_horizon)
-        trajs  = [base['o_traj']]
-        o_cur, h_cur = o0.clone(), h0.clone()
-
-        for d in range(1, K_real + 1):
-            a_d    = real_actions[d-1].unsqueeze(0)
-            u_d    = model.action_encoder(a_d)
-            w_d    = model.skill_prior.soft_weights(h_cur)
-            A_d, B_d, _, _ = self._blended(w_d)
-            o_next = self._step(o_cur, u_d, A_d, B_d)
-            h_next = model.recurrent(h_cur, o_cur, a_d)
-            o_cur, h_cur = o_next, h_next
-
-            lqr_d  = self._lqr_rollout(o_cur, h_cur, x_goal_t, lqr_horizon)
-            trajs.append(torch.cat([trajs[0][:d], lqr_d['o_traj']], 0))
-
-        T_com   = lqr_horizon + 1
-        stacked = torch.stack([t[:T_com] for t in trajs if t.shape[0] >= T_com])
-        if stacked.shape[0] > 1:
-            sigma2_t    = stacked.var(dim=0).mean(dim=1)
-            uncertainty = sigma2_t.mean().item()
-        else:
-            sigma2_t    = torch.zeros(T_com, device=self.device)
-            uncertainty = 0.0
-
-        return {
-            'uncertainty':    uncertainty,
-            'sigma2_t':       sigma2_t.cpu().numpy(),
-            'all_o_trajs':    [t.cpu() for t in trajs],
-            'penalized_cost': base['total_cost'] + self.cfg.lambda_unc * uncertainty,
-        }
-
-    @torch.no_grad()
-    def plan(self, x_cond, a_cond, x_goal, horizon=32,
-             real_actions=None, compute_uncertainty=True) -> Dict:
-        dev = self.device
-        enc      = self.model.encode_sequence(x_cond, a_cond)
-        o0       = enc['o_seq'][0, -1:].to(dev)
-        h0       = enc['h_seq'][0, -1:].to(dev)
-        x_goal_t = x_goal.to(dev)
-        if x_goal_t.dim() == 1: x_goal_t = x_goal_t.unsqueeze(0)
-
-        lqr    = self._lqr_rollout(o0, h0, x_goal_t, horizon)
-        x_traj = self._decode_x_traj(lqr['o_traj'].to(dev))
-        result = {**lqr, 'o0': o0, 'h0': h0, 'x_traj': x_traj}
-
-        if compute_uncertainty and real_actions is not None:
-            unc = self.uncertainty_rollout(
-                o0, h0, x_goal_t, real_actions.to(dev), horizon)
-            result.update(unc)
-        return result
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Real dataset loader
-# ─────────────────────────────────────────────────────────────────────────────
-
-def detect_completed_tasks_by_reward(
-    obs_ep:   np.ndarray,   # (L, 60)
-    rew_ep:   np.ndarray,   # (L,)
-) -> Dict[str, int]:
-    """
-    reward jump 시점 + OBS_ELEMENT_GOALS 거리로 실제 완료 task 식별.
-
-    D4RL kitchen reward:
-      - task 하나 완료 시 +1 스파스 보상
-      - reward[t] > reward[t-1] → 해당 시점에 task 완료
-
-    각 jump 시점에서 OBS_ELEMENT_GOALS와 가장 가까운 task를 할당.
-    Returns: {task_name: completion_timestep}  (완료된 task만 포함)
-    """
-    # reward jump 시점 찾기
-    jump_steps = []
-    for t in range(1, len(rew_ep)):
-        if rew_ep[t] > rew_ep[t - 1]:
-            jump_steps.append(t)
-
-    if not jump_steps:
-        return {}
-
-    completed = {}
-    used_tasks = set()
-
-    for t in jump_steps:
-        # 이 시점에서 각 task의 OBS_ELEMENT_GOALS 거리 계산
-        best_task, best_dist = None, float('inf')
-        for task in ALL_TASKS:
-            if task in used_tasks:
-                continue
-            idx  = OBS_ELEMENT_INDICES[task]
-            goal = OBS_ELEMENT_GOALS[task]
-            dist = np.linalg.norm(obs_ep[t, idx] - goal)
-            if dist < best_dist:
-                best_dist = dist
-                best_task = task
-
-        if best_task is not None and best_dist < BONUS_THRESH * 2:
-            completed[best_task] = t
-            used_tasks.add(best_task)
-
-    return completed
-
-
-def load_kitchen_episodes(
-    quality: str = 'mixed',
-    min_len: int = 64,
-) -> Tuple[List[Dict], np.ndarray]:
-    """
-    D4RL Kitchen 로드 + 에피소드 분리.
-
-    Task 식별 전략 (우선순위):
-      1. reward jump + OBS_ELEMENT_GOALS 거리  ← mixed/partial에 유효
-      2. OBS_ELEMENT_GOALS 직접 threshold 탐지 ← fallback
-
-    각 에피소드에 실제 완료된 task만 포함, 완료 timestep 기록.
-    """
-    import d4rl, gym
-    name_map = {'mixed':    'kitchen-mixed-v0',
-                'partial':  'kitchen-partial-v0',
-                'complete': 'kitchen-complete-v0'}
-    d4rl_name = name_map[quality]
-    print(f"Loading {d4rl_name} ...")
-    env     = gym.make(d4rl_name)
-    dataset = env.get_dataset()
-
-    obs       = dataset['observations']
-    actions   = dataset['actions']
-    rewards   = dataset.get('rewards', np.zeros(len(obs)))
-    terminals = dataset['terminals'].astype(bool)
-
-    ep_ends   = list(np.where(terminals)[0])
-    ep_starts = [0] + [e + 1 for e in ep_ends[:-1]]
-    episodes  = []
-    n_with_tasks = 0
-
-    for ep_s, ep_e in zip(ep_starts, ep_ends):
-        L = ep_e - ep_s + 1
-        if L < min_len:
-            continue
-
-        obs_ep  = obs[ep_s:ep_e+1]
-        acts_ep = actions[ep_s:ep_e+1]
-        rew_ep  = rewards[ep_s:ep_e+1]
-
-        # 1. reward jump 기반 task 식별
-        completed = detect_completed_tasks_by_reward(obs_ep, rew_ep)
-
-        # 2. reward 없는 경우 OBS_ELEMENT_GOALS threshold fallback
-        if not completed:
-            completed = detect_task_completions(obs_ep, ALL_TASKS)
-            completed = {k: v for k, v in completed.items() if v >= 0}
-
-        actual_tasks = list(completed.keys())
-        if actual_tasks:
-            n_with_tasks += 1
-
-        # Goal 구성
-        subtask_goals = {}
-        for task, t in completed.items():
-            subtask_goals[task] = {
-                'obs':       obs_ep[t],
-                'timestep':  t,
-                'completed': True,
-            }
-
-        goal_info = {
-            'final_goal':    obs_ep[-1],
-            'midpoint_goal': obs_ep[L // 2],
-            'subtask_goals': subtask_goals,
-            'completions':   completed,
-            'episode_len':   L,
-            'n_completed':   len(completed),
-            'reward_total':  float(rew_ep.sum()),
-        }
-
-        episodes.append({
-            'obs':      obs_ep,
-            'actions':  acts_ep,
-            'rewards':  rew_ep,
-            'start_t':  ep_s,
-            'end_t':    ep_e,
-            'length':   L,
-            'tasks':    actual_tasks,   # 실제 완료된 task만
-            'goal_info': goal_info,
-        })
-
-    print(f"Episodes: {len(episodes)}  (min_len={min_len}  "
-          f"with_tasks={n_with_tasks}/{len(episodes)})")
-    return episodes, obs
-
-
-def run_lqr_on_episodes(
-    planner:      KODAQLQRPlanner,
-    episodes:     List[Dict],
-    x_seq_full:   np.ndarray,
-    cond_len:     int = 16,
-    horizon:      int = 32,
-    unc_real_len: int = 8,
-    device:       str = 'cuda',
-) -> List[Dict]:
-    """
-    각 에피소드를 reward jump 기준으로 단계별 LQR로 실행.
-
-    단계 구조:
-      stage 0: t=0        → t=jump_0   (sub-goal: obs[jump_0])
-      stage 1: t=jump_0   → t=jump_1   (sub-goal: obs[jump_1])
-      ...
-      stage N: t=jump_{N-1} → ep_end   (sub-goal: obs[ep_end])
-
-    각 단계:
-      - conditioning: 해당 단계 시작 시점 앞 cond_len 스텝
-      - goal: 해당 단계의 reward jump 시점 obs
-      - horizon: 해당 단계 길이 (min(jump_t - start_t, horizon)로 clamp)
-      - uncertainty: 해당 구간의 실제 action으로 계산
-    """
-    dev     = torch.device(device)
-    results = []
-
-    for ep_idx, ep in enumerate(episodes):
-        L, obs_ep, acts_ep = ep['length'], ep['obs'], ep['actions']
-        gi    = ep['goal_info']
-        tasks = ep['tasks']
-        s, e  = ep['start_t'], ep['end_t']
-        x_ep  = x_seq_full[s:e+1]   # (L, 2108)
-
-        if L < cond_len + 4:
-            continue
-
-        if not tasks:
-            print(f"Ep {ep_idx}  len={L}  → skip (no completed tasks)")
-            continue
-
-        # ── Sub-goal 시퀀스 구성 ────────────────────────────────────────────
-        # reward jump 시점을 순서대로 정렬 → 각 단계의 goal timestep
-        jump_timesteps = sorted(gi['completions'].values())   # [t1, t2, ...]
-        # 마지막 단계는 에피소드 끝
-        stage_ends = jump_timesteps + [L - 1]
-
-        print(f"\nEp {ep_idx}  len={L}  tasks={tasks}  "
-              f"reward={gi['reward_total']:.0f}  stages={len(stage_ends)}")
-        print(f"  Sub-goal timesteps: {stage_ends}")
-
-        ep_result = {
-            'ep_idx':       ep_idx,
-            'tasks':        tasks,
-            'reward_total': gi['reward_total'],
-            'stages':       [],              # per-stage plan results
-            'full_o_traj':  [],              # concatenated Koopman trajectory
-            'full_a_traj':  [],              # concatenated decoded actions
-            'full_x_traj':  [],              # concatenated decoded x_t
-            'full_costs':   [],
-            'full_sigma2':  [],
-            'full_true_x':  [],
-        }
-
-        stage_start = 0   # 현재 단계 시작 (에피소드 내 상대 인덱스)
-
-        for stage_idx, stage_end_t in enumerate(stage_ends):
-            # ── Conditioning 구간 ──────────────────────────────────────────
-            # cond 시작: stage_start에서 cond_len만큼 앞으로, 음수 방지
-            cond_start = max(0, stage_start - cond_len)
-            cond_end   = stage_start   # 마지막 conditioning step (exclusive)
-
-            # cond가 너무 짧으면 시작점부터
-            actual_cond = cond_end - cond_start
-            if actual_cond < 1:
-                cond_start = 0
-                cond_end   = min(cond_len, stage_end_t)
-
-            # ── Stage horizon (동적) ───────────────────────────────────────
-            # stage 실제 길이 전체를 horizon으로 사용
-            # min_horizon=16으로 하한, horizon 파라미터는 더 이상 상한 아님
-            stage_len     = stage_end_t - max(stage_start, cond_end)
-            min_horizon   = 16
-            stage_horizon = max(min_horizon, stage_len)
-
-            if stage_horizon < 2:
-                stage_start = stage_end_t + 1
-                continue
-
-            # ── Goal obs: 해당 단계 완료 시점의 obs ──────────────────────
-            goal_obs   = obs_ep[stage_end_t]
-            ref_obs    = obs_ep[0]                 # episode-first 기준
-            x_goal_np  = obs_to_x_goal(goal_obs, ref_obs)
-            goal_label = (tasks[stage_idx] if stage_idx < len(tasks)
-                          else f'stage{stage_idx}')
-
-            # ── Tensors ────────────────────────────────────────────────────
-            cond_slice = slice(cond_start, cond_end) if cond_end > cond_start \
-                         else slice(0, min(cond_len, stage_end_t))
-            x_cond = torch.FloatTensor(
-                x_ep[cond_slice]).unsqueeze(0).to(dev)
-            a_cond = torch.FloatTensor(
-                acts_ep[cond_slice]).unsqueeze(0).to(dev)
-            x_goal_t = torch.FloatTensor(x_goal_np).unsqueeze(0).to(dev)
-
-            # uncertainty용 real actions: stage 구간의 실제 action
-            real_start = max(stage_start, cond_end)
-            real_end   = min(real_start + unc_real_len, stage_end_t + 1)
-            real_a     = torch.FloatTensor(
-                acts_ep[real_start:real_end]).to(dev)
-
-            # ── LQR plan ──────────────────────────────────────────────────
-            plan = planner.plan(
-                x_cond, a_cond, x_goal_t,
-                horizon=stage_horizon,
-                real_actions=real_a if len(real_a) > 0 else None,
-                compute_uncertainty=len(real_a) > 0,
-            )
-
-            # ── True trajectory for this stage ────────────────────────────
-            true_start = max(stage_start, cond_end)
-            true_end   = min(true_start + stage_horizon, L)
-            true_x     = x_ep[true_start:true_end]
-            H_c        = min(plan['x_traj'].shape[0], len(true_x))
-            pred_dq    = plan['x_traj'][:H_c, X_DQ_START:X_DQ_END].cpu().numpy()
-            true_dq    = true_x[:H_c, X_DQ_START:X_DQ_END]
-            rmse       = float(np.sqrt(((pred_dq - true_dq)**2).mean()))
-
-            unc = plan.get('uncertainty', 0.0)
-            pen = plan.get('penalized_cost', plan['total_cost'])
-            print(f"  Stage {stage_idx} [{goal_label}@t={stage_end_t}]  "
-                  f"horizon={stage_horizon}  "
-                  f"cost={plan['total_cost']:.3f}  "
-                  f"unc={unc:.5f}  pen={pen:.3f}  RMSE_Δq={rmse:.4f}")
-
-            stage_res = {
-                'stage_idx':   stage_idx,
-                'goal_label':  goal_label,
-                'goal_t':      stage_end_t,
-                'horizon':     stage_horizon,
-                'plan':        plan,
-                'true_x':      true_x,
-                'rmse_dq':     rmse,
-            }
-            ep_result['stages'].append(stage_res)
-
-            # Full trajectory 누적
-            ep_result['full_o_traj'].append(plan['o_traj'].cpu())
-            ep_result['full_a_traj'].append(plan['a_traj'].cpu())
-            ep_result['full_x_traj'].append(plan['x_traj'].cpu())
-            ep_result['full_costs'].extend(plan['costs'].tolist())
-            ep_result['full_true_x'].append(torch.FloatTensor(true_x))
-            if plan.get('sigma2_t') is not None:
-                ep_result['full_sigma2'].extend(plan['sigma2_t'].tolist())
-
-            stage_start = stage_end_t + 1
-
-        # Concatenate full trajectory
-        if ep_result['full_o_traj']:
-            ep_result['full_o_traj'] = torch.cat(ep_result['full_o_traj'], 0)
-            ep_result['full_a_traj'] = torch.cat(ep_result['full_a_traj'], 0)
-            ep_result['full_x_traj'] = torch.cat(ep_result['full_x_traj'], 0)
-            ep_result['full_true_x'] = torch.cat(ep_result['full_true_x'], 0)
-            ep_result['full_costs']  = np.array(ep_result['full_costs'])
-            ep_result['full_sigma2'] = np.array(ep_result['full_sigma2']) \
-                                       if ep_result['full_sigma2'] else None
-
-            total_cost = float(ep_result['full_costs'].sum())
-            all_rmse   = [st['rmse_dq'] for st in ep_result['stages']]
-            print(f"  → Episode total_cost={total_cost:.3f}  "
-                  f"mean_RMSE={np.mean(all_rmse):.4f}")
-
-        results.append(ep_result)
-
-    return results
-
-
-def visualize_lqr_results(results, out_dir='checkpoints/kodaq/lqr'):
-    import matplotlib; matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    PAL = ['#E53935','#1E88E5','#43A047','#FB8C00','#8E24AA','#00ACC1','#FFB300']
-    Path(out_dir).mkdir(parents=True, exist_ok=True)
-
-    for res in results:
-        ep_idx = res['ep_idx']
-        stages = res['stages']
-        if not stages:
-            continue
-        n = len(stages)
-        fig, axes = plt.subplots(n, 3, figsize=(16, 3.5 * max(n, 1)), squeeze=False)
-
-        for si, stage in enumerate(stages):
-            plan   = stage['plan']
-            true_x = stage['true_x']
-            x_traj = plan['x_traj'].cpu().numpy()
-            sig2   = plan.get('sigma2_t', None)
-            H      = x_traj.shape[0] - 1
-            col    = PAL[si % len(PAL)]
-
-            ax = axes[si, 0]
-            ax.plot(plan['costs'], color=col, lw=1.5)
-            ax.set_title(
-                f"Stage {si} [{stage['goal_label']}@t={stage['goal_t']}]"
-                f"\ncost={plan['total_cost']:.3f}", fontsize=8)
-            ax.set_xlabel('step')
-            ax.spines[['top','right']].set_visible(False)
-
-            ax = axes[si, 1]
-            dq_p = x_traj[:, X_DQ_START:X_DQ_END].mean(1)
-            Hc   = min(H + 1, len(true_x))
-            dq_t = true_x[:Hc, X_DQ_START:X_DQ_END].mean(1)
-            ax.plot(dq_p, '--', color=col, lw=1.5, label='pred')
-            ax.plot(np.arange(Hc), dq_t, 'k-', lw=1.5, label='true')
-            ax.set_title(f"Dq_t mean  RMSE={stage['rmse_dq']:.4f}", fontsize=8)
-            ax.legend(fontsize=7)
-            ax.spines[['top','right']].set_visible(False)
-
-            ax = axes[si, 2]
-            if sig2 is not None:
-                ax.fill_between(np.arange(len(sig2)), 0, sig2, alpha=0.4, color=col)
-                ax.plot(sig2, color=col, lw=1.5)
-                ax.set_title(f"sigma2_t  U={plan.get('uncertainty', 0.0):.5f}", fontsize=8)
-            else:
-                ax.set_title("Uncertainty N/A", fontsize=8)
-            ax.spines[['top','right']].set_visible(False)
-
-        tc = float(res['full_costs'].sum()) if isinstance(res['full_costs'], np.ndarray)              else sum(st['plan']['total_cost'] for st in stages)
-        mr = np.mean([st['rmse_dq'] for st in stages])
-        fig.suptitle(
-            f"Ep {ep_idx}  Tasks:{res['tasks']}  reward={res['reward_total']:.0f}\n"
-            f"TotalCost={tc:.3f}  MeanRMSE={mr:.4f}",
-            fontsize=9, fontweight='bold')
-        plt.tight_layout()
-        out = f"{out_dir}/ep{ep_idx}_sequential.png"
-        plt.savefig(out, dpi=130, bbox_inches='tight')
-        plt.close()
-        print(f"Saved: {out}")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Main
+# Main Training Loop
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    import argparse
     p = argparse.ArgumentParser()
-    p.add_argument('--ckpt',       default='checkpoints/kodaq_v3/final.pt')
+    p.add_argument('--ckpt',       default='checkpoints/kodaq_v4/final.pt')
     p.add_argument('--x_cache',    default='checkpoints/skill_pretrain/x_sequences.npz')
-    p.add_argument('--quality',    default='mixed', choices=['mixed','partial','complete'])
-    p.add_argument('--n_ep',       type=int,   default=5)
-    p.add_argument('--cond_len',   type=int,   default=16)
-    p.add_argument('--horizon',    type=int,   default=32)
-    p.add_argument('--unc_len',    type=int,   default=8)
+    p.add_argument('--lqr_cache',  default=None,
+                   help='Path to precomputed lqr_cache.npz (skip generation if exists)')
+    p.add_argument('--iql_ckpt',   default=None,
+                   help='Resume from existing IQL checkpoint')
+    p.add_argument('--out_dir',    default='checkpoints/kodaq_v4/iql')
+    p.add_argument('--quality',    default='mixed')
+    p.add_argument('--n_ep_lqr',   type=int,   default=500)
+    p.add_argument('--H',          type=int,   default=8)
+    p.add_argument('--tau',        type=float, default=0.8)
+    p.add_argument('--beta',       type=float, default=3.0)
+    p.add_argument('--gamma',      type=float, default=0.99)
+    p.add_argument('--lr',         type=float, default=3e-4)
+    p.add_argument('--batch_size', type=int,   default=256)
+    p.add_argument('--n_steps',    type=int,   default=500_000)
+    p.add_argument('--real_ratio', type=float, default=0.5)
     p.add_argument('--Q_scale',    type=float, default=1.0)
     p.add_argument('--R_scale',    type=float, default=10.0)
-    p.add_argument('--lambda_unc', type=float, default=0.1)
-    p.add_argument('--out_dir',    default='checkpoints/kodaq/lqr')
-    p.add_argument('--survey',     action='store_true',
-                   help='Run action encoder range survey before planning')
-    p.add_argument('--u_bounds',   default=None,
-                   help='Path to saved u_bounds.npz (skip survey if provided)')
     p.add_argument('--device',     default='cuda' if torch.cuda.is_available() else 'cpu')
     args = p.parse_args()
 
-    ckpt  = torch.load(args.ckpt, map_location=args.device)
+    Path(args.out_dir).mkdir(parents=True, exist_ok=True)
+    device = args.device
+    print(f"Device: {device}")
+
+    # ── World model 로드 ────────────────────────────────────────────────────
+    print(f"\nLoading world model: {args.ckpt}")
+    ckpt  = torch.load(args.ckpt, map_location=device)
     model = KoopmanCVAE(ckpt['cfg'])
     model.load_state_dict(ckpt['model_state'])
-    model.eval().to(args.device)
-    print(f"Model: K={model.cfg.num_skills}  m={model.cfg.koopman_dim}  "
-          f"phase={ckpt.get('phase',3)}")
+    model.eval().to(device)
+    m_cfg = model.cfg
+    z_dim = m_cfg.koopman_dim      # Koopman latent dim (m)
+    u_dim = m_cfg.action_latent    # action latent dim (d_u)
+    a_dim = m_cfg.action_dim        # robot action dim (9)
+    print(f"  K={m_cfg.num_skills}  m={z_dim}  d_u={u_dim}  "
+          f"reward_head={m_cfg.use_reward_head}")
 
-    planner = KODAQLQRPlanner(model, LQRConfig(
-        Q_scale=args.Q_scale, R_scale=args.R_scale, lambda_unc=args.lambda_unc))
+    lqr_cfg = LQRConfig(Q_scale=args.Q_scale, R_scale=args.R_scale)
+    planner = KODAQLQRPlanner(model, lqr_cfg)
 
-    # ── U-space bounds ──────────────────────────────────────────────────────
-    if args.u_bounds and Path(args.u_bounds).exists():
-        planner.load_u_bounds(args.u_bounds)
-    elif args.survey:
-        save_path = str(Path(args.out_dir) / 'u_bounds.npz')
-        Path(args.out_dir).mkdir(parents=True, exist_ok=True)
-        planner.survey(save_path=save_path)
-    else:
-        print('No u_bounds: using symmetric clip u_max=cfg.u_max  '
-              '(run with --survey to enable per-dim bounds)')
-
+    # ── 데이터 로드 ─────────────────────────────────────────────────────────
+    print(f"\nLoading x_sequences: {args.x_cache}")
     x_seq_full, _, _ = load_x_sequences(args.x_cache)
-    print(f"x_seq: {x_seq_full.shape}")
+    print(f"  x_seq: {x_seq_full.shape}")
 
-    episodes, _ = load_kitchen_episodes(quality=args.quality,
-                                        min_len=args.cond_len + 8)
-    episodes = episodes[:args.n_ep]
+    episodes, _ = load_kitchen_episodes(quality=args.quality, min_len=32)
+    episodes_for_lqr = [ep for ep in episodes if ep['tasks']]
+    episodes_for_lqr = episodes_for_lqr[:args.n_ep_lqr]
+    print(f"  Episodes with tasks: {len(episodes_for_lqr)}")
 
-    results = run_lqr_on_episodes(
-        planner, episodes, x_seq_full,
-        cond_len=args.cond_len, horizon=args.horizon,
-        unc_real_len=args.unc_len, device=args.device)
+    # ── LQR 캐시 로드 또는 생성 ─────────────────────────────────────────────
+    cache_path = args.lqr_cache or f"{args.out_dir}/lqr_cache.npz"
 
-    all_costs = [st['plan']['total_cost'] for r in results for st in r['stages']]
-    all_rmse  = [st['rmse_dq']           for r in results for st in r['stages']]
-    if all_costs:
-        print(f"\n=== Summary ({len(results)} eps, {len(all_costs)} stages) ===")
-        print(f"  stage cost: {np.mean(all_costs):.4f} +/- {np.std(all_costs):.4f}")
-        print(f"  RMSE_Dq:    {np.mean(all_rmse):.4f} +/- {np.std(all_rmse):.4f}")
+    if args.lqr_cache and Path(args.lqr_cache).exists():
+        print(f"\nLoading LQR cache: {args.lqr_cache}")
+        cache = dict(np.load(args.lqr_cache))
+        print(f"  LQR transitions: {len(cache['z0'])}")
+        print(f"  Real transitions: {len(cache['z_real'])}")
+    else:
+        print(f"\nBuilding LQR cache (H={args.H}) ...")
+        cache = build_lqr_cache(
+            model=model, planner=planner,
+            episodes=episodes_for_lqr,
+            x_seq_full=x_seq_full,
+            H=args.H, device=device,
+            save_path=cache_path,
+        )
 
-    visualize_lqr_results(results, args.out_dir)
+    # ── Replay Buffer 구성 ──────────────────────────────────────────────────
+    buf = ReplayBuffer(device)
 
-    # Clip effect analysis
-    try:
-        from analyze_u_bounds import analyze_clip_effect
-        analyze_clip_effect(results,
-                            out_path=args.out_dir + '/clip_analysis.png')
-    except Exception as e:
-        print(f'Clip analysis skipped: {e}')
+    buf.add_real(
+        z_t    = cache['z_real'],
+        u_t    = cache['u_real'],
+        z_next = cache['z_next_real'],
+        r_t    = cache['r_real'],
+    )
+    buf.add_lqr(
+        z_t       = cache['z0'],
+        z_hat_seq = cache['z_hat_seq'],
+        r_hat_seq = cache['r_hat_seq'],
+    )
+    print(f"\nBuffer — real: {buf.real_size}  lqr: {buf.lqr_size}")
 
-    print(f"\nDone. -> {args.out_dir}/")
+    # Reward normalizer 초기화 (전체 H-step target 분포로)
+    γ_powers  = np.array([args.gamma**k for k in range(args.H)])
+    r_hat_all = cache['r_hat_seq']                   # (N, H)
+    r_sum_all = (r_hat_all * γ_powers).sum(axis=1)   # (N,)
+    iql_cfg   = IQLConfig(
+        tau=args.tau, beta=args.beta, gamma=args.gamma,
+        H=args.H, lr_q=args.lr, lr_v=args.lr, lr_pi=args.lr,
+        batch_size=args.batch_size, n_steps=args.n_steps,
+        real_ratio=args.real_ratio,
+    )
+    trainer = IQLTrainer(iql_cfg, z_dim, a_dim, device)
+    trainer.r_norm.update(r_sum_all)
+
+    # CategoricalRewardHead (3-way reward)
+    cat_ckpt = str(Path(args.out_dir).parent / 'cat_reward' / 'final.pt')
+    if Path(cat_ckpt).exists():
+        from train_reward_head import load_cat_reward_model
+        _, trainer.cat_head = load_cat_reward_model(cat_ckpt, device)
+        print(f'  CategoricalRewardHead loaded: 3-way reward enabled')
+    else:
+        print(f'  No cat_head ({cat_ckpt}), using BCE only')
+    print(f"Reward normalizer: mean={trainer.r_norm.mean:.4f}  "
+          f"std={math.sqrt(trainer.r_norm.var):.4f}")
+
+    # ── Resume ─────────────────────────────────────────────────────────────
+    start_step = 0
+    if args.iql_ckpt and Path(args.iql_ckpt).exists():
+        start_step = trainer.load(args.iql_ckpt)
+
+    # ── 학습 ────────────────────────────────────────────────────────────────
+    print(f"\n{'='*60}")
+    print(f"IQL + H-step TD  |  steps={args.n_steps}  H={args.H}")
+    print(f"  τ={args.tau}  β={args.beta}  γ={args.gamma}")
+    print(f"  batch={args.batch_size}  real_ratio={args.real_ratio}")
+    print(f"{'='*60}\n")
+
+    log: Dict[str, List] = {k: [] for k in [
+        'loss_q', 'loss_v', 'loss_pi', 'q_mean', 'v_mean',
+        'adv_mean', 'r_target_mean',
+    ]}
+    recent = {k: deque(maxlen=iql_cfg.log_every) for k in log}
+    t0 = time.time()
+
+    B_real = max(1, int(args.batch_size * args.real_ratio))
+    B_lqr  = args.batch_size - B_real
+
+    for step in range(start_step, args.n_steps):
+
+        # Batch sampling
+        real_batch = buf.sample_real(B_real)
+        lqr_batch  = buf.sample_lqr(B_lqr)
+
+        # Reward normalizer 업데이트 (r_hat 분포 추적)
+        r_hat_batch = lqr_batch['r_hat_seq'].cpu().numpy()
+        γ_pow       = np.array([args.gamma**k for k in range(args.H)])
+        r_sum_batch = (r_hat_batch * γ_pow).sum(axis=1)
+        trainer.r_norm.update(r_sum_batch)
+
+        # Update
+        info = trainer.update(real_batch, lqr_batch)
+
+        for k, v in info.items():
+            recent[k].append(v)
+
+        # Logging
+        if (step + 1) % iql_cfg.log_every == 0:
+            means = {k: np.mean(list(recent[k])) for k in log}
+            for k in log:
+                log[k].append(means[k])
+
+            elapsed = time.time() - t0
+            steps_per_sec = iql_cfg.log_every / (elapsed + 1e-6)
+            t0 = time.time()
+
+            print(
+                f"Step {step+1:7d} | "
+                f"Q={means['loss_q']:.4f}  "
+                f"V={means['loss_v']:.4f}  "
+                f"π={means['loss_pi']:.4f}  |  "
+                f"q_μ={means['q_mean']:.3f}  "
+                f"v_μ={means['v_mean']:.3f}  "
+                f"adv_μ={means['adv_mean']:.3f}  |  "
+                f"r_target={means['r_target_mean']:.3f}  |  "
+                f"{steps_per_sec:.0f} steps/s"
+            )
+
+        # Checkpoint
+        if (step + 1) % iql_cfg.save_every == 0:
+            trainer.save(f"{args.out_dir}/iql_step{step+1}.pt", step + 1)
+            visualize_training(log, f"{args.out_dir}/training_curves.png")
+
+        # Policy evaluation
+        if (step + 1) % iql_cfg.eval_every == 0:
+            eval_eps = [ep for ep in episodes[:20] if ep['tasks']]
+            eval_res = evaluate_policy(
+                trainer, model, planner,
+                eval_eps, x_seq_full,
+                device=device, n_ep=iql_cfg.n_eval_ep,
+            )
+            print(
+                f"\n  [EVAL step {step+1}]  "
+                f"mean_reward={eval_res['mean_reward']:.4f}  "
+                f"±{eval_res['std_reward']:.4f}  "
+                f"RMSE_Δq={eval_res['mean_rmse_dq']:.4f}\n"
+            )
+
+    # ── 최종 저장 ────────────────────────────────────────────────────────────
+    trainer.save(f"{args.out_dir}/iql_final.pt", args.n_steps)
+    visualize_training(log, f"{args.out_dir}/training_curves_final.png")
+
+    # Summary
+    if log['loss_q']:
+        print(f"\n{'='*60}")
+        print(f"Training complete.  {args.n_steps} steps")
+        print(f"  Final Q loss:  {log['loss_q'][-1]:.4f}")
+        print(f"  Final V loss:  {log['loss_v'][-1]:.4f}")
+        print(f"  Final π loss:  {log['loss_pi'][-1]:.4f}")
+        print(f"  Outputs → {args.out_dir}/")
+        print(f"{'='*60}")
 
 
 if __name__ == '__main__':
