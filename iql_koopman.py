@@ -30,6 +30,11 @@ import os, sys, time, math
 sys.path.insert(0, os.path.expanduser('~/koopman_CVAE'))
 
 import argparse
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
 import numpy as np
 import torch
 import torch.nn as nn
@@ -730,7 +735,10 @@ def evaluate_policy(
             u_t   = trainer.pi.sample(z_cur)               # (1, d_u)
             # Koopman step
             w_t   = model.skill_prior.soft_weights(h_cur)
-            from lqr_planner import blend_koopman
+            try:
+                from lqr_koopman import blend_koopman
+            except ImportError:
+                return {}
             log_lam = model.koopman.get_log_lambdas()
             A_bar, B_bar, _, _ = blend_koopman(
                 log_lam, model.koopman.theta_k, model.koopman.G_k,
@@ -805,6 +813,8 @@ def main():
     p.add_argument('--Q_scale',    type=float, default=1.0)
     p.add_argument('--R_scale',    type=float, default=10.0)
     p.add_argument('--device',     default='cuda' if torch.cuda.is_available() else 'cpu')
+    p.add_argument('--wandb_project', default=None)
+    p.add_argument('--wandb_run',     default=None)
     args = p.parse_args()
 
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
@@ -901,6 +911,13 @@ def main():
         start_step = trainer.load(args.iql_ckpt)
 
     # ── 학습 ────────────────────────────────────────────────────────────────
+    # wandb init
+    if WANDB_AVAILABLE and args.wandb_project:
+        wandb.init(project=args.wandb_project,
+                   name=args.wandb_run or 'iql_v2',
+                   config=vars(args))
+        print(f"wandb: {args.wandb_project}/{args.wandb_run}")
+
     print(f"\n{'='*60}")
     print(f"IQL + H-step TD  |  steps={args.n_steps}  H={args.H}")
     print(f"  τ={args.tau}  β={args.beta}  γ={args.gamma}")
@@ -956,6 +973,9 @@ def main():
                 f"r_target={means['r_target_mean']:.3f}  |  "
                 f"{steps_per_sec:.0f} steps/s"
             )
+            if WANDB_AVAILABLE and wandb.run is not None:
+                wandb.log({f'train/{k}': v for k, v in means.items()},
+                          step=step+1)
 
         # Checkpoint
         if (step + 1) % iql_cfg.save_every == 0:
@@ -963,7 +983,7 @@ def main():
             visualize_training(log, f"{args.out_dir}/training_curves.png")
 
         # Policy evaluation
-        if (step + 1) % iql_cfg.eval_every == 0:
+        if (step + 1) % iql_cfg.eval_every == 0 and False:  # eval disabled (no lqr_planner)
             eval_eps = [ep for ep in episodes[:20] if ep['tasks']]
             eval_res = evaluate_policy(
                 trainer, model, planner,
@@ -990,6 +1010,8 @@ def main():
         print(f"  Final π loss:  {log['loss_pi'][-1]:.4f}")
         print(f"  Outputs → {args.out_dir}/")
         print(f"{'='*60}")
+    if WANDB_AVAILABLE and wandb.run is not None:
+        wandb.finish()
 
 
 if __name__ == '__main__':
