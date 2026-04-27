@@ -475,6 +475,8 @@ class IQLTrainer:
             'q_mean': [], 'v_mean': [], 'adv_mean': [],
             'r_target_mean': [],
         }
+        
+        self.step = 0
 
     @torch.no_grad()
     def _compute_h_step_target(
@@ -520,7 +522,11 @@ class IQLTrainer:
 
         z_H = z_hat_seq[:, -1]
         v_H = self.V(z_H)
-        y_t = (r_sum + (gm**H) * v_H).clamp(0.0, 5.0)  # target clamp
+        warmup_steps = 10_000
+        if self.step < warmup_steps:
+            y_t = r_sum.clamp(0.0, 5.0)
+        else:
+            y_t = (r_sum + (gm**H) * v_H).clamp(0.0, 5.0)
         return y_t.detach()
 
     def update(
@@ -911,6 +917,7 @@ def main():
     )
     trainer = IQLTrainer(iql_cfg, z_dim, a_dim, device)
     trainer.r_norm.update(r_sum_all)
+    trainer.step = step + 1
 
     # CategoricalRewardHead (3-way reward)
     cat_ckpt = str(Path(args.out_dir).parent / 'cat_reward' / 'final.pt')
