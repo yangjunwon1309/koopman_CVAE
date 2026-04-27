@@ -30,7 +30,7 @@ from collections import deque
 from models.koopman_cvae import KoopmanCVAE
 from models.losses import symexp
 from data.extract_skill_label import load_x_sequences
-from lqr_koopman import (
+from lqr_planner import (
     KODAQLQRPlanner, LQRConfig,
     load_kitchen_episodes, obs_to_x_goal,
     blend_koopman,
@@ -306,6 +306,10 @@ class KoopmanWorldModelWrapper:
         return z_nx, h_nx, self._r_hat(z_nx)
 
     def _r_hat(self, z):
+        return self._r_hat_event(z)
+
+    def _r_hat_event(self, z):
+        """P(task completion | z_t) via BCE head in (0,1)."""
         m = self.model
         if not m.cfg.use_reward_head: return 0.0
         if hasattr(m.decoder, 'head_reward'):
@@ -624,11 +628,22 @@ class KODAQOnlineTrainer:
 # Reward blend
 # ─────────────────────────────────────────────────────────────────────────────
 
-def compute_r_blend(r_env, r_hat, step, warmup):
-    # alpha=0.5 고정: r_env와 r_hat을 항상 50:50으로 blend
-    # decay 제거 → Q target 분포 안정화
-    alpha = 0.5
-    return float(np.clip(alpha * r_env + (1.0 - alpha) * r_hat, -1.0, 1.0))
+def compute_r_blend(r_env, r_hat_acc=0.0, r_hat_event=0.0,
+                    step=0, warmup=0):
+    """
+    3-way reward blend (weights sum to 1.0):
+      r_env       (0.5): ground truth env {0,1} sparse
+      r_hat_acc   (0.2): E[R_cumulative|z] in [0,4], normalized /4 -> [0,1]
+      r_hat_event (0.3): P(task completion|z) in (0,1)
+    """
+    W_ENV   = 0.5
+    W_ACC   = 0.2
+    W_EVENT = 0.3
+    MAX_ACC = 4.0
+    r_blend = (W_ENV   * float(r_env) +
+               W_ACC   * (float(r_hat_acc) / MAX_ACC) +
+               W_EVENT * float(r_hat_event))
+    return float(np.clip(r_blend, 0.0, 1.0))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -848,7 +863,7 @@ def train(cfg, trainer, wm, planner, env_name, out_dir, device, use_wandb=False)
         a_np=a_seq[0].cpu().numpy()
 
         z_b=z_t.clone(); h_b=h_t.clone()
-        r_env_tot=0.0; r_hat_tot=0.0; done=False
+        r_env_tot=0.0; r_hat_acc=0.0; r_hat_event=0.0; done=False
         a_pad=np.zeros((cfg.H_lo,trainer.action_dim),dtype=np.float32)
         for k in range(cfg.H_lo):
             ak=a_np[k].clip(-1,1)
@@ -859,15 +874,17 @@ def train(cfg, trainer, wm, planner, env_name, out_dir, device, use_wandb=False)
             xnp=ctx._obs_to_x(obs_nx)
             wm_obs_buf.append(xnp); wm_r_buf.append(float(r_env))
             if len(wm_obs_buf)>512: wm_obs_buf.pop(0); wm_r_buf.pop(0)
-            if ctx.z_t is not None:
-                with torch.no_grad():
-                    at=torch.FloatTensor(ak).unsqueeze(0).to(dev)
-                    _,_,rh=wm.koopman_step(ctx.z_t,at,ctx.h_t)
-                    r_hat_tot+=rh
+            # r_hat computed as H-step accumulated after H_lo loop
             ctx.step(obs_nx,ak); obs=obs_nx
             if done: break
 
-        r_blend=compute_r_blend(r_env_tot,r_hat_tot,global_step,cfg.r_alpha_warmup)
+        if z_before is not None and h_before is not None:
+            with torch.no_grad():
+                a_t_full    = torch.FloatTensor(a_pad).to(dev)
+                r_hat_acc   = wm._r_hat_accumulated(z_before, h_before, a_t_full)
+                if ctx.z_t is not None:
+                    r_hat_event = wm._r_hat_event(ctx.z_t)
+        r_blend = compute_r_blend(r_env_tot, r_hat_acc, r_hat_event)
         sp_np=sp.cpu().numpy()[0]
         if ctx.z_t is not None:
             trainer.buf.add(z_b.cpu().numpy()[0],ctx.z_t.cpu().numpy()[0],
@@ -953,6 +970,7 @@ def main():
     p.add_argument('--device',     default='cuda:1' if torch.cuda.is_available() else 'cpu')
     p.add_argument('--wandb_project', default=None)
     p.add_argument('--wandb_run',  default=None)
+    p.add_argument('--cat_ckpt',   default=None)
     p.add_argument('--Q_scale',    type=float, default=1.0)
     p.add_argument('--R_scale',    type=float, default=10.0)
     p.add_argument('--offline_prefill', action='store_true', default=True,
@@ -985,7 +1003,17 @@ def main():
                      n_env_steps=args.n_steps, warmup_lqr=args.warmup_lqr,
                      r_alpha_warmup=args.r_warmup, wm_lr=args.wm_lr,
                      eval_every=args.eval_every, n_eval_ep=args.n_eval_ep)
-    wm      = KoopmanWorldModelWrapper(model, cfg.wm_lr, device)
+    cat_head = None
+    cat_ckpt_path = getattr(args, 'cat_ckpt', None) or                     args.world_ckpt.replace('final.pt', 'cat_reward/final.pt')
+    if Path(cat_ckpt_path).exists():
+        from train_reward_head import load_cat_reward_model
+        _, cat_head = load_cat_reward_model(cat_ckpt_path, device)
+        print(f"  CategoricalRewardHead loaded: {cat_ckpt_path}")
+    else:
+        print("  No CategoricalRewardHead found, using BCE head fallback")
+    wm = KoopmanWorldModelWrapper(model, cfg.wm_lr, device,
+                                  cat_head=cat_head,
+                                  reward_H=8, reward_gamma=0.9)
     trainer = KODAQOnlineTrainer(cfg, wm, z_dim, n_skills, a_dim, device)
     planner = KODAQLQRPlanner(model, LQRConfig(Q_scale=args.Q_scale, R_scale=args.R_scale))
 
