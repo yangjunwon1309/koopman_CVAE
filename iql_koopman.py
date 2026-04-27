@@ -503,15 +503,15 @@ class IQLTrainer:
                    0.2 * (r_acc / 4.0) +
                    0.3 * r_hat_seq)           # (B, H)
         r_blend = r_blend.clamp(0.0, 1.0)
+        # normalize 제거: r_blend ∈ [0,1]로 이미 bounded
+        # normalize하면 mean이 제거되어 양수 reward signal이 사라짐
+        # → bootstrap V가 target을 지배 → 발산
 
-        # normalize per batch
-        r_normalized = self.r_norm.normalize(r_blend)
-
-        r_sum = (r_normalized * gm_powers.unsqueeze(0)).sum(dim=1)  # (B,)
+        r_sum = (r_blend * gm_powers.unsqueeze(0)).sum(dim=1)  # (B,) ∈ [0, ~5]
 
         z_H = z_hat_seq[:, -1]
         v_H = self.V(z_H)
-        y_t = r_sum + (gm**H) * v_H
+        y_t = (r_sum + (gm**H) * v_H).clamp(-10.0, 10.0)  # target clamp
         return y_t.detach()
 
     def update(
@@ -953,7 +953,7 @@ def main():
         r_hat_batch = lqr_batch['r_hat_seq'].cpu().numpy()
         γ_pow       = np.array([args.gamma**k for k in range(args.H)])
         r_sum_batch = (r_hat_batch * γ_pow).sum(axis=1)
-        trainer.r_norm.update(r_sum_batch)
+        pass  # r_norm 미사용 (normalize 제거)
 
         # Update
         info = trainer.update(real_batch, lqr_batch)
