@@ -882,10 +882,10 @@ def train(cfg, trainer, wm, planner, env_name, out_dir, device, use_wandb=False)
             ctx.step(obs_nx,ak); obs=obs_nx
             if done: break
 
-        if z_before is not None and h_before is not None:
+        if z_b is not None and h_b is not None:
             with torch.no_grad():
                 a_t_full    = torch.FloatTensor(a_pad).to(dev)
-                r_hat_acc   = wm._r_hat_accumulated(z_before, h_before, a_t_full)
+                r_hat_acc   = wm._r_hat_accumulated(z_b, h_b, a_t_full)
                 if ctx.z_t is not None:
                     r_hat_event = wm._r_hat_event(ctx.z_t)
         r_blend = compute_r_blend(r_env_tot, r_hat_acc, r_hat_event)
