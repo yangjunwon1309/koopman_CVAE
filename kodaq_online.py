@@ -267,8 +267,12 @@ class ReplayBuffer:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class KoopmanWorldModelWrapper:
-    def __init__(self, model, wm_lr, device):
+    def __init__(self, model, wm_lr, device,
+                 cat_head=None, reward_H=8, reward_gamma=0.9):
         self.model = model; self.device = device
+        self.cat_head = cat_head
+        self.reward_H = reward_H
+        self.reward_gamma = reward_gamma
         for p in model.koopman.parameters(): p.requires_grad_(False)
         for p in model.decoder.parameters(): p.requires_grad_(False)
         reward_params = []
