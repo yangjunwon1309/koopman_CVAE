@@ -881,10 +881,19 @@ def main():
     )
     print(f"\nBuffer — real: {buf.real_size}  lqr: {buf.lqr_size}")
 
-    # Reward normalizer 초기화 (전체 H-step target 분포로)
+    # Reward normalizer 초기화 — 3-way blend 분포로
     γ_powers  = np.array([args.gamma**k for k in range(args.H)])
-    r_hat_all = cache['r_hat_seq']                   # (N, H)
-    r_sum_all = (r_hat_all * γ_powers).sum(axis=1)   # (N,)
+    r_hat_all  = cache['r_hat_seq']                    # (N, H)  BCE event
+    r_real_all = np.zeros_like(r_hat_all)              # offline r_env (대부분 0)
+    # r_acc: cat_head 없으면 r_hat*4 proxy
+    r_acc_all  = r_hat_all * 4.0                       # (N, H) proxy [0,4]
+    # 3-way blend per step
+    r_blend_all = (0.5 * r_real_all +
+                   0.2 * (r_acc_all / 4.0) +
+                   0.3 * r_hat_all).clip(0.0, 1.0)    # (N, H)
+    r_sum_all   = (r_blend_all * γ_powers).sum(axis=1) # (N,)
+    print(f"Reward normalizer init: mean={r_sum_all.mean():.4f}  "
+          f"std={r_sum_all.std():.4f}")
     iql_cfg   = IQLConfig(
         tau=args.tau, beta=args.beta, gamma=args.gamma,
         H=args.H, lr_q=args.lr, lr_v=args.lr, lr_pi=args.lr,
