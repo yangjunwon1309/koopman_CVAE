@@ -76,8 +76,8 @@ class OnlineConfig:
     buffer_size:    int   = 200_000
     log_every:      int   = 1_000
     save_every:     int   = 50_000
-    eval_every:     int   = 25_000
-    n_eval_ep:      int   = 5
+    eval_every:     int   = 10_000
+    n_eval_ep:      int   = 10
     cond_len:       int   = 16
 
 
@@ -625,9 +625,9 @@ class KODAQOnlineTrainer:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def compute_r_blend(r_env, r_hat, step, warmup):
-    # 초반: world model reward 비중 높음 (sparse r_env 보완)
-    # 후반: r_env 비중 높아짐 (world model fine-tune 후 r_hat도 calibrated)
-    alpha = min(1.0, step / max(warmup, 1))
+    # alpha=0.5 고정: r_env와 r_hat을 항상 50:50으로 blend
+    # decay 제거 → Q target 분포 안정화
+    alpha = 0.5
     return float(np.clip(alpha * r_env + (1.0 - alpha) * r_hat, -1.0, 1.0))
 
 
@@ -945,6 +945,8 @@ def main():
     p.add_argument('--batch_size', type=int,   default=256)
     p.add_argument('--kl_weight',  type=float, default=1.0)
     p.add_argument('--n_steps',    type=int,   default=300_000)
+    p.add_argument('--eval_every', type=int,   default=10_000)
+    p.add_argument('--n_eval_ep',  type=int,   default=10)
     p.add_argument('--warmup_lqr', type=int,   default=3_000)
     p.add_argument('--r_warmup',   type=int,   default=30_000)
     p.add_argument('--wm_lr',      type=float, default=1e-4)
@@ -953,6 +955,13 @@ def main():
     p.add_argument('--wandb_run',  default=None)
     p.add_argument('--Q_scale',    type=float, default=1.0)
     p.add_argument('--R_scale',    type=float, default=10.0)
+    p.add_argument('--offline_prefill', action='store_true', default=True,
+                   help='Pre-fill replay buffer with offline mixed dataset')
+    p.add_argument('--no_offline_prefill', dest='offline_prefill',
+                   action='store_false',
+                   help='Disable offline pre-fill')
+    p.add_argument('--prefill_size', type=int, default=50_000,
+                   help='Max transitions to pre-fill from offline data')
     args=p.parse_args()
 
     device=args.device
@@ -974,7 +983,8 @@ def main():
     cfg=OnlineConfig(H_hi=args.H_hi, H_lo=args.H_lo, gamma=args.gamma,
                      lr=args.lr, batch_size=args.batch_size, kl_weight=args.kl_weight,
                      n_env_steps=args.n_steps, warmup_lqr=args.warmup_lqr,
-                     r_alpha_warmup=args.r_warmup, wm_lr=args.wm_lr)
+                     r_alpha_warmup=args.r_warmup, wm_lr=args.wm_lr,
+                     eval_every=args.eval_every, n_eval_ep=args.n_eval_ep)
     wm      = KoopmanWorldModelWrapper(model, cfg.wm_lr, device)
     trainer = KODAQOnlineTrainer(cfg, wm, z_dim, n_skills, a_dim, device)
     planner = KODAQLQRPlanner(model, LQRConfig(Q_scale=args.Q_scale, R_scale=args.R_scale))
@@ -982,18 +992,20 @@ def main():
     if args.resume and Path(args.resume).exists():
         trainer.load(args.resume)
     else:
-        # resume이 없을 때만 offline pre-fill
-        # (resume이면 이미 학습된 buffer와 weights 사용)
-        if Path(args.x_cache).exists():
-            prefill_buffer_from_offline(
-                trainer, wm,
-                x_cache_path   = args.x_cache,
-                quality        = 'mixed',
-                max_transitions= 50_000,
-                device         = device,
-            )
+        # resume이 없을 때 offline pre-fill (--no_offline_prefill로 비활성화)
+        if args.offline_prefill:
+            if Path(args.x_cache).exists():
+                prefill_buffer_from_offline(
+                    trainer, wm,
+                    x_cache_path   = args.x_cache,
+                    quality        = 'mixed',
+                    max_transitions= args.prefill_size,
+                    device         = device,
+                )
+            else:
+                print(f"[Warning] x_cache not found: {args.x_cache}  (skipping pre-fill)")
         else:
-            print(f"[Warning] x_cache not found: {args.x_cache}  (skipping pre-fill)")
+            print("[Offline Pre-fill] disabled (--no_offline_prefill)")
 
     train(cfg, trainer, wm, planner, args.env, args.out_dir, device, use_wandb)
     if use_wandb: wandb.finish()
