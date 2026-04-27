@@ -511,8 +511,8 @@ class IQLTrainer:
 
         # 3-way blend (per step)
         r_blend = (0.5 * r_real_seq +
-                   0.2 * (r_acc / 4.0) +
-                   0.3 * r_hat_seq)           # (B, H)
+                   0.0 * (r_acc / 4.0) +
+                   0.5 * r_hat_seq)           # (B, H)
         r_blend = r_blend.clamp(0.0, 1.0)
         # normalize 제거: r_blend ∈ [0,1]로 이미 bounded
         # normalize하면 mean이 제거되어 양수 reward signal이 사라짐
@@ -973,7 +973,7 @@ def main():
         # Update
         info = trainer.update(real_batch, lqr_batch)
         trainer.step = step + 1
-        
+
         for k, v in info.items():
             recent[k].append(v)
 
