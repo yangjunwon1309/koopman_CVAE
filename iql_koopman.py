@@ -61,9 +61,9 @@ from lqr_koopman import (
 @dataclass
 class IQLConfig:
     # IQL
-    tau:            float = 0.7      # expectile for V (0.5=mean, 0.9=high percentile)
+    tau:            float = 0.6      # expectile for V (0.5=mean, 0.9=high percentile)
     beta:           float = 3.0      # AWR temperature
-    gamma:          float = 0.7     # discount
+    gamma:          float = 0.5     # discount
 
     # H-step TD
     H:              int   = 8        # rollout horizon for TD target
@@ -521,7 +521,7 @@ class IQLTrainer:
         r_sum = (r_blend * gm_powers.unsqueeze(0)).sum(dim=1)  # (B,) ∈ [0, ~5]
 
         z_H = z_hat_seq[:, -1]
-        v_H = self.V(z_H)
+        v_H = self.V(z_H).clamp(0, 1.0)
         warmup_steps = 10_000
         if self.step < warmup_steps:
             y_t = r_sum.clamp(0.0, 5.0)
