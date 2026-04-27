@@ -61,9 +61,9 @@ from lqr_koopman import (
 @dataclass
 class IQLConfig:
     # IQL
-    tau:            float = 0.8      # expectile for V (0.5=mean, 0.9=high percentile)
+    tau:            float = 0.7      # expectile for V (0.5=mean, 0.9=high percentile)
     beta:           float = 3.0      # AWR temperature
-    gamma:          float = 0.99     # discount
+    gamma:          float = 0.7     # discount
 
     # H-step TD
     H:              int   = 8        # rollout horizon for TD target
@@ -107,33 +107,42 @@ class IQLConfig:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def make_mlp(in_dim: int, out_dim: int, hidden: int, n_layers: int,
-             output_activation=None) -> nn.Sequential:
+             output_activation=None, output_scale: float = 1.0) -> nn.Sequential:
     layers = []
     d = in_dim
     for _ in range(n_layers):
         layers += [nn.Linear(d, hidden), nn.LayerNorm(hidden), nn.ELU()]
         d = hidden
-    layers.append(nn.Linear(d, out_dim))
+    out_layer = nn.Linear(d, out_dim)
+    # 출력층 variance 낮춤: 초기 Q/V 출력이 0 근처에서 시작
+    # output_scale=0.01이면 weight가 default의 1/100 크기
+    nn.init.orthogonal_(out_layer.weight, gain=output_scale)
+    nn.init.zeros_(out_layer.bias)
+    layers.append(out_layer)
     if output_activation is not None:
         layers.append(output_activation)
     return nn.Sequential(*layers)
 
 
 class QNetwork(nn.Module):
-    """Q(z_t, u_t) → scalar"""
+    """Q(z_t, a_t) → scalar, 출력층 작게 초기화"""
     def __init__(self, z_dim: int, u_dim: int, hidden: int, n_layers: int):
         super().__init__()
-        self.net = make_mlp(z_dim + u_dim, 1, hidden, n_layers)
+        # output_scale=0.01: 초기 Q(z,a) ≈ 0
+        self.net = make_mlp(z_dim + u_dim, 1, hidden, n_layers,
+                            output_scale=0.01)
 
     def forward(self, z: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
         return self.net(torch.cat([z, u], dim=-1)).squeeze(-1)  # (B,)
 
 
 class VNetwork(nn.Module):
-    """V(z_t) → scalar"""
+    """V(z_t) → scalar, 출력층 작게 초기화"""
     def __init__(self, z_dim: int, hidden: int, n_layers: int):
         super().__init__()
-        self.net = make_mlp(z_dim, 1, hidden, n_layers)
+        # output_scale=0.01: 초기 V(z) ≈ 0
+        self.net = make_mlp(z_dim, 1, hidden, n_layers,
+                            output_scale=0.01)
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         return self.net(z).squeeze(-1)  # (B,)
@@ -245,7 +254,7 @@ class RewardNormalizer:
     H-step discounted reward를 러닝 통계로 정규화.
     BCE reward (0/1 sparse) → Σγ^k r̂ 범위가 불안정하므로 필수.
     """
-    def __init__(self, clip: float = 10.0, momentum: float = 0.001):
+    def __init__(self, clip: float = 5.0, momentum: float = 0.001):
         self.mean   = 0.0
         self.var    = 1.0
         self.count  = 0
@@ -261,7 +270,7 @@ class RewardNormalizer:
     def normalize(self, x: torch.Tensor) -> torch.Tensor:
         std = math.sqrt(self.var) + 1e-8
         x_n = (x - self.mean) / std
-        return x_n.clamp(-self.clip, self.clip)
+        return x_n.clamp(0, self.clip)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -511,7 +520,7 @@ class IQLTrainer:
 
         z_H = z_hat_seq[:, -1]
         v_H = self.V(z_H)
-        y_t = (r_sum + (gm**H) * v_H).clamp(-10.0, 10.0)  # target clamp
+        y_t = (r_sum + (gm**H) * v_H).clamp(0.0, 5.0)  # target clamp
         return y_t.detach()
 
     def update(
