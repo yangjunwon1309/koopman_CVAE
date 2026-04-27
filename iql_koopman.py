@@ -820,6 +820,7 @@ def main():
     m_cfg = model.cfg
     z_dim = m_cfg.koopman_dim      # Koopman latent dim (m)
     u_dim = m_cfg.action_latent    # action latent dim (d_u)
+    a_dim = m_cfg.action_dim        # robot action dim (9)
     print(f"  K={m_cfg.num_skills}  m={z_dim}  d_u={u_dim}  "
           f"reward_head={m_cfg.use_reward_head}")
 
