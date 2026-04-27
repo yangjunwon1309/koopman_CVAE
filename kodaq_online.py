@@ -323,6 +323,30 @@ class KoopmanWorldModelWrapper:
         else: return 0.0
         return torch.sigmoid(r).mean().item()
 
+    def _r_hat_accumulated(self, z0, h0, a_seq):
+        """Sum_{k=0}^{H-1} gamma^k * E[R | z_{k+1}] via world model rollout."""
+        m  = self.model
+        H  = min(self.reward_H, len(a_seq))
+        gm = self.reward_gamma
+        z, h  = z0, h0
+        r_acc = 0.0
+        wll   = m.koopman.get_log_lambdas()
+        for k in range(H):
+            ak = a_seq[k].unsqueeze(0) if a_seq.dim() == 2 else a_seq[k:k+1]
+            u  = m.action_encoder(ak)
+            w  = m.skill_prior.soft_weights(h)
+            A, B, _, _ = blend_koopman(wll, m.koopman.theta_k,
+                                       m.koopman.G_k, m.koopman.U, w)
+            A = A[0]; B = B[0]
+            z_nx = (A @ z.T).T + (B @ u.T).T
+            h_nx = m.recurrent(h, z, ak)
+            if self.cat_head is not None:
+                r_acc += (gm ** k) * self.cat_head.expected_reward(z_nx).mean().item()
+            else:
+                r_acc += (gm ** k) * self._r_hat_event(z_nx)
+            z, h = z_nx, h_nx
+        return r_acc
+
     def update(self, x_b, r_env_b):
         if not self.model.cfg.use_reward_head: return 0.0
         m = self.model; m.train()
