@@ -475,7 +475,7 @@ class IQLTrainer:
             'q_mean': [], 'v_mean': [], 'adv_mean': [],
             'r_target_mean': [],
         }
-        
+
         self.step = 0
 
     @torch.no_grad()
@@ -917,7 +917,6 @@ def main():
     )
     trainer = IQLTrainer(iql_cfg, z_dim, a_dim, device)
     trainer.r_norm.update(r_sum_all)
-    trainer.step = step + 1
 
     # CategoricalRewardHead (3-way reward)
     cat_ckpt = str(Path(args.out_dir).parent / 'cat_reward' / 'final.pt')
@@ -973,7 +972,8 @@ def main():
 
         # Update
         info = trainer.update(real_batch, lqr_batch)
-
+        trainer.step = step + 1
+        
         for k, v in info.items():
             recent[k].append(v)
 
