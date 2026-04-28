@@ -366,6 +366,38 @@ class KoopmanWorldModelWrapper:
         self.opt.step(); m.eval()
         return loss.item()
 
+def load_iql_for_online(iql_ckpt, trainer, device):
+    """
+    IQL pi(a|z) → Online pi_lo(a|z) 완전 이식.
+    pi_lo는 skill conditioning 없음 → IQL과 완전 동일 구조.
+    backbone net: 직접 copy
+    mu/log_s: IQL(9) → pi_lo(H_lo*9), 각 step에 반복 copy
+    """
+    from iql_koopman import GaussianPolicy, IQLConfig
+    ckpt    = torch.load(iql_ckpt, map_location=device)
+    z_dim   = trainer.z_dim
+    a_dim   = trainer.action_dim
+    H_lo    = trainer.cfg.H_lo
+    cfg_iql = IQLConfig()
+    pi_iql  = GaussianPolicy(z_dim, a_dim, cfg_iql.hidden_dim, cfg_iql.n_layers)
+    pi_iql.load_state_dict(ckpt['pi']); pi_iql.eval()
+    with torch.no_grad():
+        # backbone 완전 copy
+        for p1, p2 in zip(trainer.pi_lo.net.parameters(),
+                          pi_iql.net.parameters()):
+            p1.data.copy_(p2.data)
+        # mu, log_s: 9-dim → H_lo*9-dim (각 step 반복)
+        for k in range(H_lo):
+            trainer.pi_lo.mu.weight.data[k*a_dim:(k+1)*a_dim].copy_(
+                pi_iql.mu.weight.data)
+            trainer.pi_lo.mu.bias.data[k*a_dim:(k+1)*a_dim].copy_(
+                pi_iql.mu.bias.data)
+            trainer.pi_lo.log_s.weight.data[k*a_dim:(k+1)*a_dim].copy_(
+                pi_iql.log_s.weight.data)
+            trainer.pi_lo.log_s.bias.data[k*a_dim:(k+1)*a_dim].copy_(
+                pi_iql.log_s.bias.data)
+    print(f"  pi_lo fully initialized from IQL: {iql_ckpt}  H_lo={H_lo}")
+    return pi_iql
 
 # ─────────────────────────────────────────────────────────────────────────────
 # EnvContext
