@@ -59,6 +59,7 @@ class OnlineConfig:
     tau_ema:        float = 0.005
     alpha:          float = 0.0    # entropy penalization 없음 — 순수 Q maximization
     kl_weight:      float = 1.0
+    kl_lqr_weight:  float = 0.5
     gumbel_tau:     float = 1.0
     gumbel_tau_min: float = 0.3
     hidden_dim:     int   = 256
