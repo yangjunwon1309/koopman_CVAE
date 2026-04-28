@@ -587,8 +587,10 @@ class KODAQOnlineTrainer:
             V_next = (torch.min(self.Q1_t(z_nx,sp_nx,a_nx),
                                 self.Q2_t(z_nx,sp_nx,a_nx))
                       - self.alpha * lp_nx)
+        
         r_norm = (r - r.mean()) / r.std().clamp(min=1e-6)
         y = (r_norm + self.cfg.gamma*(1-done)*V_next).clamp(-50,50)
+        
         q1 = self.Q1(z,sp,a); q2 = self.Q2(z,sp,a)
         loss_q = F.mse_loss(q1,y) + F.mse_loss(q2,y)
         self.opt_q.zero_grad(); loss_q.backward()
@@ -607,6 +609,8 @@ class KODAQOnlineTrainer:
             a_hi, _ = self.pi_lo.sample(z)
         q_hi = torch.min(self.Q1(z, sp_new, a_hi.detach()),
                          self.Q2(z, sp_new, a_hi.detach()))
+
+        # 왜 KL이 z랑 p_prior? sp_new랑 p_prior가 아니라
         kl_hi2 = self.pi_hi.kl_prior(z, p_prior)
         loss_hi = (self.cfg.kl_weight * kl_hi2 - q_hi).mean()
         self.opt_hi.zero_grad(); loss_hi.backward()
@@ -701,8 +705,8 @@ def compute_r_blend(r_env, r_hat_acc=0.0, r_hat_event=0.0,
       r_hat_event (0.3): P(task completion|z) in (0,1)
     """
     W_ENV   = 0.5
-    W_ACC   = 0.2
-    W_EVENT = 0.3
+    W_ACC   = 0.0
+    W_EVENT = 0.5
     MAX_ACC = 4.0
     r_blend = (W_ENV   * float(r_env) +
                W_ACC   * (float(r_hat_acc) / MAX_ACC) +

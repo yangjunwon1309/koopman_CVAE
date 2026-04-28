@@ -154,6 +154,7 @@ def rollout_episode(env, model, policy, device, cond_len=16,
     ctx = EnvContext(model, device, cond_len); ctx.reset(obs); policy.reset()
     frames=[render_frame(env)] if render else []
     rewards=[]; skill_ids=[]; info_hist=[]; info_keys=set()
+    z_seq_list=[]; action_list=[]
     total_r=0.0; n_tasks_max=0; done=False; t=0
 
     while t < max_steps and not done:
@@ -162,6 +163,8 @@ def rollout_episode(env, model, policy, device, cond_len=16,
             obs, r, done, info = env.step(a); ctx.step(obs, a)
             if render: frames.append(render_frame(env))
             total_r+=r; rewards.append(r); skill_ids.append(-1)
+            action_list.append(a)
+            if ctx.z_t is not None: z_seq_list.append(ctx.z_t[0].cpu().numpy())
             n_t,_=inspect_info(info); n_tasks_max=max(n_tasks_max,n_t)
             info_hist.append(info); info_keys.update(info.keys()); t+=1; continue
 
@@ -172,12 +175,17 @@ def rollout_episode(env, model, policy, device, cond_len=16,
             obs, r, done, info = env.step(ak); ctx.step(obs, ak)
             if render: frames.append(render_frame(env))
             total_r+=r; rewards.append(r); skill_ids.append(sid)
+            action_list.append(ak)
+            if ctx.z_t is not None: z_seq_list.append(ctx.z_t[0].cpu().numpy())
             n_t,_=inspect_info(info); n_tasks_max=max(n_tasks_max,n_t)
             info_hist.append(info); info_keys.update(info.keys()); t+=1
 
     return {'frames':frames,'rewards':rewards,'total_reward':total_r,
             'n_tasks':n_tasks_max,'skill_ids':skill_ids,
-            'info_keys':info_keys,'n_steps':t}
+            'info_keys':info_keys,'n_steps':t,
+            'z_seq':   z_seq_list,    # (T, m) for reward analysis
+            'actions': action_list,   # (T, 9) for action distribution
+            'H_lo':    policy.H_lo}
 
 
 # ─── Visualize ─────────────────────────────────────────────────────────────
@@ -300,8 +308,447 @@ def main():
     if task_keys: print(f"  → task candidates: {task_keys}")
     print(f"{'='*55}")
     visualize_summary(results, args.mode, f"{args.out_dir}/summary_{args.mode}.png")
+
+    # ─── Analysis (online mode에서 전체 분석 실행) ─────────────────────────
+    if args.mode == 'online':
+        print("\n" + "="*55 + "\nRunning analysis...")
+        res_a = analyze_skill_switching(
+            results, f"{args.out_dir}/analysis_skill_switching.png")
+        res_b = analyze_action_distribution(
+            results, f"{args.out_dir}/analysis_action_dist.png")
+        res_c = analyze_reward_distribution(
+            results, wm, f"{args.out_dir}/analysis_reward_dist.png", args.device)
+        # save text report
+        report = "\n\n".join([
+            res_a.get('text',''), res_b.get('text',''), res_c.get('text','')])
+        rpath = f"{args.out_dir}/analysis_report.txt"
+        Path(rpath).write_text(report)
+        print(f"  Text report: {rpath}")
+
+    elif args.mode == 'iql':
+        # IQL도 action 분포와 reward 분포 분석
+        res_b = analyze_action_distribution(
+            results, f"{args.out_dir}/analysis_action_dist.png")
+        res_c = analyze_reward_distribution(
+            results, wm, f"{args.out_dir}/analysis_reward_dist.png", args.device)
+        report = "\n\n".join([res_b.get('text',''), res_c.get('text','')])
+        rpath = f"{args.out_dir}/analysis_report.txt"
+        Path(rpath).write_text(report)
+        print(f"  Text report: {rpath}")
+
     print(f"\nOutputs → {args.out_dir}/")
 
 
 if __name__=='__main__':
     main()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Analysis Module: Skill switching / Action distribution / Reward distribution
+# ═══════════════════════════════════════════════════════════════════════════
+
+@torch.no_grad()
+def analyze_skill_switching(results_with_extra, out_path: str):
+    """
+    분석 1: Hi-level skill switching 패턴
+
+    - skill change rate: 매 H_hi step마다 skill이 바뀌는 비율
+    - action discontinuity: 연속된 chunk 간 action 차이 (L2 norm)
+    - skill duration histogram: 각 skill이 몇 step 유지됐는지
+
+    진동 원인 진단:
+      skill이 매 chunk마다 바뀌면 → action 불연속 → 진동
+      skill이 유지되면 → action이 일관됨 → 안정적
+    """
+    import matplotlib.gridspec as gridspec
+
+    all_sid    = []
+    all_adiff  = []
+    sid_durations = {}  # skill_id → list of durations
+    chunk_changes = []  # 0 or 1 per chunk
+
+    for res in results_with_extra:
+        sids    = np.array(res['skill_ids'])
+        actions = np.array(res['actions'])   # (T, 9)
+
+        # skill change per step
+        if len(sids) > 1:
+            changes = (sids[1:] != sids[:-1]).astype(float)
+            chunk_changes.extend(changes.tolist())
+
+        # consecutive action chunk L2 diff
+        H_lo = res.get('H_lo', 4)
+        for t in range(H_lo, len(actions) - H_lo, H_lo):
+            prev_chunk = actions[t - H_lo:t]
+            curr_chunk = actions[t:t + H_lo]
+            diff = np.linalg.norm(curr_chunk - prev_chunk, axis=-1).mean()
+            all_adiff.append(diff)
+
+        # skill durations
+        run_sid, run_len = sids[0] if len(sids) else -1, 0
+        for sid in sids:
+            if sid == run_sid:
+                run_len += 1
+            else:
+                if run_sid >= 0:
+                    sid_durations.setdefault(int(run_sid), []).append(run_len)
+                run_sid, run_len = sid, 1
+        if run_sid >= 0 and run_len > 0:
+            sid_durations.setdefault(int(run_sid), []).append(run_len)
+
+        all_sid.extend(sids[sids >= 0].tolist())
+
+    # Text summary
+    change_rate = np.mean(chunk_changes) if chunk_changes else 0.0
+    mean_adiff  = np.mean(all_adiff) if all_adiff else 0.0
+    text_lines  = [
+        "=== Skill Switching Analysis ===",
+        f"Skill change rate per step: {change_rate:.3f}  "
+        f"(1.0 = every step, 0.0 = never)",
+        f"Mean action chunk L2 diff:  {mean_adiff:.4f}",
+        f"Diagnosis: {'SEVERE OSCILLATION (skill changes too often)' if change_rate > 0.3 else 'OK' if change_rate < 0.1 else 'MODERATE'}",
+        "",
+        "Skill usage (steps):",
+    ]
+    PAL = ['#E53935','#1E88E5','#43A047','#FB8C00','#8E24AA','#00ACC1','#FFB300']
+    for sid in sorted(sid_durations):
+        durs = sid_durations[sid]
+        text_lines.append(f"  Skill {sid}: count={len(durs)}  "
+                          f"mean_duration={np.mean(durs):.1f}  "
+                          f"max={np.max(durs)}")
+
+    print("\n" + "\n".join(text_lines))
+
+    # Plot
+    fig = plt.figure(figsize=(18, 10))
+    gs  = gridspec.GridSpec(2, 3, figure=fig)
+
+    # 1. Skill ID histogram
+    ax = fig.add_subplot(gs[0, 0])
+    if all_sid:
+        unique, counts = np.unique(all_sid, return_counts=True)
+        ax.bar(unique, counts, color=[PAL[int(s)%len(PAL)] for s in unique], alpha=0.8)
+        ax.set_xlabel('Skill ID'); ax.set_ylabel('Step count')
+        ax.set_title('Skill Usage Distribution', fontweight='bold')
+    ax.spines[['top','right']].set_visible(False)
+
+    # 2. Skill change rate rolling
+    ax = fig.add_subplot(gs[0, 1])
+    if chunk_changes:
+        cc  = np.array(chunk_changes)
+        w   = min(50, max(1, len(cc)//10))
+        roll= np.convolve(cc, np.ones(w)/w, 'valid')
+        ax.plot(roll, color='#E53935', lw=1.5)
+        ax.axhline(change_rate, color='k', ls='--', lw=1, alpha=0.6,
+                   label=f'mean={change_rate:.3f}')
+        ax.set_title('Rolling Skill Change Rate', fontweight='bold')
+        ax.set_ylabel('Change rate'); ax.legend(fontsize=8)
+    ax.spines[['top','right']].set_visible(False)
+
+    # 3. Action chunk discontinuity
+    ax = fig.add_subplot(gs[0, 2])
+    if all_adiff:
+        ax.hist(all_adiff, bins=40, color='#1E88E5', alpha=0.8, edgecolor='white')
+        ax.axvline(mean_adiff, color='#E53935', ls='--', lw=1.5,
+                   label=f'mean={mean_adiff:.3f}')
+        ax.set_title('Action Chunk L2 Discontinuity', fontweight='bold')
+        ax.set_xlabel('L2 norm diff'); ax.legend(fontsize=8)
+    ax.spines[['top','right']].set_visible(False)
+
+    # 4. Skill duration boxplot
+    ax = fig.add_subplot(gs[1, :2])
+    if sid_durations:
+        data  = [sid_durations[k] for k in sorted(sid_durations)]
+        labels= [f'Skill {k}' for k in sorted(sid_durations)]
+        bp    = ax.boxplot(data, labels=labels, patch_artist=True)
+        for patch, col in zip(bp['boxes'], PAL):
+            patch.set_facecolor(col); patch.set_alpha(0.7)
+        ax.set_ylabel('Duration (steps)')
+        ax.set_title('Skill Duration Distribution', fontweight='bold')
+    ax.spines[['top','right']].set_visible(False)
+
+    # 5. Text summary
+    ax = fig.add_subplot(gs[1, 2])
+    ax.axis('off')
+    ax.text(0.05, 0.95, "\n".join(text_lines[:8]), transform=ax.transAxes,
+            fontsize=8, va='top', fontfamily='monospace',
+            bbox=dict(boxstyle='round', facecolor='#f5f5f5', alpha=0.8))
+
+    fig.suptitle('Skill Switching & Action Continuity Analysis',
+                 fontsize=13, fontweight='bold')
+    plt.tight_layout()
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path, dpi=130, bbox_inches='tight'); plt.close()
+    print(f"  Saved: {out_path}")
+
+    return {'change_rate': change_rate, 'mean_adiff': mean_adiff,
+            'text': "\n".join(text_lines)}
+
+
+@torch.no_grad()
+def analyze_action_distribution(results_with_extra, out_path: str):
+    """
+    분석 2: Action sequence 분포
+
+    - 각 joint (9-dim)별 action 분포 (histogram)
+    - action chunk 내 time consistency (chunk 내에서 action이 얼마나 일관적인지)
+    - action magnitude over episode (진동 패턴)
+    """
+    all_actions = []  # (T_total, 9)
+    chunk_std   = []  # per chunk, action std across H_lo steps
+
+    joint_names = [f'J{i}' for i in range(9)]
+
+    for res in results_with_extra:
+        acts   = np.array(res['actions'])   # (T, 9)
+        H_lo   = res.get('H_lo', 4)
+        all_actions.append(acts)
+        for t in range(0, len(acts) - H_lo + 1, H_lo):
+            chunk = acts[t:t+H_lo]
+            chunk_std.append(chunk.std(axis=0))  # (9,)
+
+    if not all_actions:
+        return {}
+
+    all_acts  = np.concatenate(all_actions, axis=0)   # (N, 9)
+    chunk_std = np.array(chunk_std)                    # (M, 9)
+
+    # Text summary
+    text_lines = [
+        "=== Action Distribution Analysis ===",
+        f"Total action steps: {len(all_acts)}",
+        "",
+        "Per-joint stats (mean ± std):",
+    ]
+    for j in range(9):
+        text_lines.append(f"  J{j}: mean={all_acts[:,j].mean():.3f}  "
+                          f"std={all_acts[:,j].std():.3f}  "
+                          f"[{all_acts[:,j].min():.2f}, {all_acts[:,j].max():.2f}]")
+    if len(chunk_std):
+        text_lines += ["", "Intra-chunk std (consistency within chunk):"]
+        for j in range(9):
+            text_lines.append(f"  J{j}: {chunk_std[:,j].mean():.4f}")
+
+    print("\n" + "\n".join(text_lines))
+
+    # Plot
+    fig, axes = plt.subplots(3, 3, figsize=(15, 12))
+    axes = axes.flatten()
+    PAL  = ['#E53935','#1E88E5','#43A047','#FB8C00','#8E24AA',
+            '#00ACC1','#FFB300','#607D8B','#795548']
+
+    for j in range(9):
+        ax = axes[j]
+        ax.hist(all_acts[:, j], bins=50, color=PAL[j], alpha=0.8,
+                edgecolor='white', density=True)
+        m, s = all_acts[:,j].mean(), all_acts[:,j].std()
+        ax.axvline(m, color='k', ls='--', lw=1.5, label=f'μ={m:.3f}')
+        ax.axvspan(m-s, m+s, alpha=0.15, color=PAL[j])
+        ax.set_title(f'Joint {j}  σ={s:.3f}', fontsize=9, fontweight='bold')
+        ax.set_xlabel('Action value [-1, 1]')
+        ax.legend(fontsize=7)
+        ax.spines[['top','right']].set_visible(False)
+
+    fig.suptitle('Action Distribution per Joint', fontsize=13, fontweight='bold')
+    plt.tight_layout()
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path, dpi=130, bbox_inches='tight'); plt.close()
+
+    # Intra-chunk std plot
+    if len(chunk_std):
+        fig2, ax2 = plt.subplots(1, 1, figsize=(12, 5))
+        x = np.arange(9)
+        ax2.bar(x, chunk_std.mean(axis=0), color=PAL[:9], alpha=0.8)
+        ax2.set_xticks(x); ax2.set_xticklabels([f'J{i}' for i in range(9)])
+        ax2.set_ylabel('Mean intra-chunk std')
+        ax2.set_title('Action Consistency Within Chunk\n'
+                      '(high = action changes a lot within one chunk → oscillation)',
+                      fontsize=10, fontweight='bold')
+        ax2.spines[['top','right']].set_visible(False)
+        chunk_path = out_path.replace('.png', '_chunk_std.png')
+        plt.tight_layout()
+        plt.savefig(chunk_path, dpi=130, bbox_inches='tight'); plt.close()
+        print(f"  Saved: {chunk_path}")
+
+    print(f"  Saved: {out_path}")
+    return {'mean_per_joint': all_acts.mean(axis=0).tolist(),
+            'std_per_joint':  all_acts.std(axis=0).tolist(),
+            'text': "\n".join(text_lines)}
+
+
+@torch.no_grad()
+def analyze_reward_distribution(results_with_extra, wm,
+                                out_path: str, device: str):
+    """
+    분석 3: Event / Accumulated reward 분포
+
+    실제 시뮬레이션에서 얻은 z_t에 대해:
+    - r_event = BCE head sigmoid(z_t)
+    - r_acc   = cat_head.expected_reward(z_t)  if available
+    - 두 reward의 분포를 episode 진행에 따라 확인
+    - OOD 여부: world model이 본 적 없는 z_t에서 reward가 어떻게 나오는지
+    """
+    dev   = torch.device(device)
+    model = wm.model
+    model.eval()
+
+    all_r_event = []
+    all_r_acc   = []
+    all_r_env   = []
+    all_t       = []   # normalized time (0~1)
+
+    for res in results_with_extra:
+        z_seq  = np.array(res['z_seq'])    # (T, m)
+        r_env  = np.array(res['rewards'])  # (T,)
+        T      = len(z_seq)
+        if T == 0: continue
+
+        z_t = torch.FloatTensor(z_seq).to(dev)
+
+        # Event reward: BCE head
+        r_event_vals = []
+        if model.cfg.use_reward_head:
+            if hasattr(model.decoder, 'head_reward'):
+                logits = model.decoder.head_reward(z_t)
+            elif hasattr(model, 'reward_head'):
+                logits = model.reward_head(z_t)
+            else:
+                logits = None
+            if logits is not None:
+                r_event_vals = torch.sigmoid(logits).squeeze(-1).cpu().numpy()
+        if not len(r_event_vals):
+            r_event_vals = np.zeros(T)
+
+        # Accumulated reward: cat_head
+        r_acc_vals = np.zeros(T)
+        if wm.cat_head is not None:
+            r_acc_vals = wm.cat_head.expected_reward(z_t).cpu().numpy()
+
+        all_r_event.extend(r_event_vals.tolist())
+        all_r_acc.extend(r_acc_vals.tolist())
+        all_r_env.extend(r_env[:T].tolist())
+        all_t.extend((np.arange(T) / max(T-1, 1)).tolist())
+
+    all_r_event = np.array(all_r_event)
+    all_r_acc   = np.array(all_r_acc)
+    all_r_env   = np.array(all_r_env)
+    all_t       = np.array(all_t)
+
+    # Text summary
+    text_lines = [
+        "=== Reward Head Distribution Analysis ===",
+        "",
+        f"Event reward (BCE):      mean={all_r_event.mean():.4f}  "
+        f"std={all_r_event.std():.4f}  "
+        f">0.5: {(all_r_event>0.5).mean()*100:.1f}%",
+        f"Accumulated reward (cat): mean={all_r_acc.mean():.4f}  "
+        f"std={all_r_acc.std():.4f}  "
+        f"max={all_r_acc.max():.2f}",
+        f"Env reward (actual):      mean={all_r_env.mean():.4f}  "
+        f">0.5: {(all_r_env>0.5).mean()*100:.1f}%",
+        "",
+        "Diagnosis:",
+        f"  r_event saturation: {'HIGH (>0.5 = 30%+) → unreliable' if (all_r_event>0.5).mean()>0.3 else 'OK'}",
+        f"  r_acc range: {'SATURATED near max (4)' if all_r_acc.mean()>3.0 else 'OK' if all_r_acc.mean()<1.0 else 'MODERATE'}",
+        f"  r_env sparse: {(all_r_env>0.5).mean()*100:.2f}% steps with actual reward",
+    ]
+
+    print("\n" + "\n".join(text_lines))
+
+    # Plot
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    PAL = ['#E53935', '#1E88E5', '#43A047', '#FB8C00', '#8E24AA', '#00ACC1']
+
+    # 1. r_event histogram
+    ax = axes[0, 0]
+    ax.hist(all_r_event, bins=50, color=PAL[0], alpha=0.8, edgecolor='white')
+    ax.axvline(all_r_event.mean(), color='k', ls='--', lw=1.5,
+               label=f'mean={all_r_event.mean():.3f}')
+    ax.axvline(0.5, color='orange', ls=':', lw=1.5, label='threshold=0.5')
+    ax.set_title('Event Reward (BCE) Distribution', fontweight='bold')
+    ax.set_xlabel('r_event'); ax.legend(fontsize=8)
+    ax.spines[['top','right']].set_visible(False)
+
+    # 2. r_acc histogram
+    ax = axes[0, 1]
+    ax.hist(all_r_acc, bins=50, color=PAL[1], alpha=0.8, edgecolor='white')
+    ax.axvline(all_r_acc.mean(), color='k', ls='--', lw=1.5,
+               label=f'mean={all_r_acc.mean():.3f}')
+    ax.set_title('Accumulated Reward (Cat) Distribution\nE[R|z_t] ∈ [0,4]',
+                 fontweight='bold')
+    ax.set_xlabel('r_acc'); ax.legend(fontsize=8)
+    ax.spines[['top','right']].set_visible(False)
+
+    # 3. r_env (actual) histogram
+    ax = axes[0, 2]
+    ax.hist(all_r_env, bins=20, color=PAL[2], alpha=0.8, edgecolor='white')
+    ax.set_title(f'Actual Env Reward Distribution\n'
+                 f'({(all_r_env>0.5).mean()*100:.2f}% > 0.5)',
+                 fontweight='bold')
+    ax.set_xlabel('r_env')
+    ax.spines[['top','right']].set_visible(False)
+
+    # 4. r_event over normalized episode time
+    ax = axes[1, 0]
+    if len(all_t) > 100:
+        # bin by time
+        bins = np.linspace(0, 1, 21)
+        bin_means, bin_stds = [], []
+        for i in range(len(bins)-1):
+            mask = (all_t >= bins[i]) & (all_t < bins[i+1])
+            if mask.any():
+                bin_means.append(all_r_event[mask].mean())
+                bin_stds.append(all_r_event[mask].std())
+            else:
+                bin_means.append(0); bin_stds.append(0)
+        bc = 0.5*(bins[:-1]+bins[1:])
+        ax.plot(bc, bin_means, color=PAL[0], lw=1.5)
+        ax.fill_between(bc,
+                        np.array(bin_means)-np.array(bin_stds),
+                        np.array(bin_means)+np.array(bin_stds),
+                        alpha=0.2, color=PAL[0])
+    ax.set_xlabel('Normalized episode time (0=start, 1=end)')
+    ax.set_ylabel('r_event')
+    ax.set_title('Event Reward over Episode', fontweight='bold')
+    ax.spines[['top','right']].set_visible(False)
+
+    # 5. r_acc over time
+    ax = axes[1, 1]
+    if len(all_t) > 100:
+        bin_means, bin_stds = [], []
+        for i in range(len(bins)-1):
+            mask = (all_t >= bins[i]) & (all_t < bins[i+1])
+            if mask.any():
+                bin_means.append(all_r_acc[mask].mean())
+                bin_stds.append(all_r_acc[mask].std())
+            else:
+                bin_means.append(0); bin_stds.append(0)
+        ax.plot(bc, bin_means, color=PAL[1], lw=1.5)
+        ax.fill_between(bc,
+                        np.array(bin_means)-np.array(bin_stds),
+                        np.array(bin_means)+np.array(bin_stds),
+                        alpha=0.2, color=PAL[1])
+    ax.set_xlabel('Normalized episode time')
+    ax.set_ylabel('r_acc')
+    ax.set_title('Accumulated Reward over Episode', fontweight='bold')
+    ax.spines[['top','right']].set_visible(False)
+
+    # 6. Text summary box
+    ax = axes[1, 2]
+    ax.axis('off')
+    ax.text(0.05, 0.95, "\n".join(text_lines), transform=ax.transAxes,
+            fontsize=8, va='top', fontfamily='monospace',
+            bbox=dict(boxstyle='round', facecolor='#f5f5f5', alpha=0.8))
+
+    fig.suptitle('Reward Head Distribution Analysis\n'
+                 '(from actual simulation z_t)',
+                 fontsize=13, fontweight='bold')
+    plt.tight_layout()
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path, dpi=130, bbox_inches='tight'); plt.close()
+    print(f"  Saved: {out_path}")
+
+    return {'r_event_mean': all_r_event.mean(),
+            'r_acc_mean':   all_r_acc.mean(),
+            'r_env_mean':   all_r_env.mean(),
+            'text': "\n".join(text_lines)}
