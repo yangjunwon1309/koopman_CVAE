@@ -55,7 +55,7 @@ def inspect_info(info):
     if 'score' in info:
         # score는 완료된 subtask 수 (0~4)
         return int(round(float(info['score']) * 4)), []
-    if 'num_success' in info: return int(info['num_success']), []
+    if 'episode_task_completions' in info: return int(info['episode_task_completions']), []
     if 'completed_tasks' in info: return len(info['completed_tasks']), list(info['completed_tasks'])
     if 'goal_achieved' in info: return int(info['goal_achieved']), []
     return 0, []
