@@ -103,12 +103,17 @@ class PolicyWrapper:
             from train_reward_head import load_cat_reward_model
             _, cat_head = load_cat_reward_model(cat_ckpt, dev)
             print("  CategoricalRewardHead loaded")
-        cfg = OnlineConfig()
+        # H_lo를 checkpoint에서 자동 감지
+        pc = torch.load(policy_ckpt, map_location=dev)
+        if 'world_model' in pc: model.load_state_dict(pc['world_model']); model.eval()
+        pi_lo_w = pc['pi_lo']['mu.weight']          # (H_lo*9, hidden)
+        H_lo_ckpt = pi_lo_w.shape[0] // a_dim       # 자동 감지
+        print(f"  H_lo detected from checkpoint: {H_lo_ckpt}")
+
+        cfg = OnlineConfig(H_lo=H_lo_ckpt)
         wm  = KoopmanWorldModelWrapper(model, cfg.wm_lr, dev,
                                         cat_head=cat_head, reward_H=8, reward_gamma=0.9)
         trainer = KODAQOnlineTrainer(cfg, wm, z_dim, n_skills, a_dim, dev)
-        pc = torch.load(policy_ckpt, map_location=dev)
-        if 'world_model' in pc: model.load_state_dict(pc['world_model']); model.eval()
         trainer.pi_hi.load_state_dict(pc['pi_hi'])
         trainer.pi_lo.load_state_dict(pc['pi_lo'])
         trainer.pi_hi.eval(); trainer.pi_lo.eval()
