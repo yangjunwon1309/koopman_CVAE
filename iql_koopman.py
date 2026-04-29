@@ -40,7 +40,7 @@ from collections import deque
 from models.koopman_cvae import KoopmanCVAE
 from models.losses import symexp
 from data.extract_skill_label import load_x_sequences
-from lqr_koopman import (
+from lqr_planner import (
     KODAQLQRPlanner, LQRConfig,
     load_kitchen_episodes, obs_to_x_goal,
     X_DQ_START, X_DQ_END, X_DP_START, X_DP_END,
@@ -59,7 +59,7 @@ class IQLConfig:
     gae_lambda:   float = 0.95   # GAE lambda
 
     # Policy chunk
-    H_lo:         int   = 16     # action chunk length (1.28s)
+    H_lo:         int   = 4      # action chunk length (0.32s)
 
     # H-step TD
     H:            int   = 8      # LQR rollout horizon
@@ -79,9 +79,9 @@ class IQLConfig:
     real_ratio:   float = 0.5
 
     # Reward
-    w_env:        float = 0.5
-    w_event:      float = 0.5
-    w_acc:        float = 0.0    # cat_head 포화 문제로 0
+    w_env:        float = 0.4
+    w_event:      float = 0.2
+    w_acc:        float = 0.4
 
     # Logging
     log_every:    int   = 1_000
@@ -99,8 +99,8 @@ class IQLConfig:
 
 def compute_r_blend(r_env: float, r_hat_event: float = 0.0,
                     r_hat_acc: float = 0.0,
-                    w_env: float = 0.5, w_event: float = 0.5,
-                    w_acc: float = 0.0) -> float:
+                    w_env: float = 0.4, w_event: float = 0.2,
+                    w_acc: float = 0.4) -> float:
     """
     3-way reward blend.
     r_env:        sparse env reward (diff된 0/1 값)
@@ -338,7 +338,7 @@ def build_lqr_cache(model: KoopmanCVAE, planner: KODAQLQRPlanner,
         if not ep['tasks']: continue
 
         # episode reward → diff (subtask completion only)
-        rew_diff = episode_reward_to_diff(rew_ep)
+        # env reward: raw 그대로 사용 (no diff)
 
         # encode full episode
         x_t = torch.FloatTensor(x_ep).unsqueeze(0).to(dev)
@@ -373,7 +373,7 @@ def build_lqr_cache(model: KoopmanCVAE, planner: KODAQLQRPlanner,
         acts_clip = acts_ep.clip(-1, 1).astype(np.float32)
         for t in range(L - H_lo - 1):
             a_chunk = acts_clip[t:t + H_lo]          # (H_lo, 9)
-            r_env_t = rew_diff[t]
+            r_env_t = float(rew_ep[t])
             r_blend = compute_r_blend(
                 r_env_t, r_event_ep[t], r_acc_ep[t],
                 cfg.w_env, cfg.w_event, cfg.w_acc)
@@ -419,12 +419,14 @@ def build_lqr_cache(model: KoopmanCVAE, planner: KODAQLQRPlanner,
                     ).squeeze(-1).cpu().numpy()
 
             # real env reward along this stage (broadcast)
-            r_real_stage = float(rew_diff[stage_start:stage_end_t].sum())
+            r_real_stage = float(rew_ep[stage_start:stage_end_t].sum())
             r_real_seq   = np.full(H, r_real_stage / max(H, 1), dtype=np.float32)
 
-            # blend for each step
+            # acc reward proxy: use stage start z's cat_head value
+            r_acc_stage = float(r_acc_ep[min(stage_start, L-1)]) if cat_head is not None else 0.0
+            # blend for each step (acc reward included)
             r_blend_seq = np.array([
-                compute_r_blend(r_real_seq[k], r_hat_seq[k], 0.0,
+                compute_r_blend(r_real_seq[k], r_hat_seq[k], r_acc_stage,
                                 cfg.w_env, cfg.w_event, cfg.w_acc)
                 for k in range(H)], dtype=np.float32)
 
@@ -706,7 +708,7 @@ def main():
     p.add_argument('--quality',     default='mixed')
     p.add_argument('--n_ep_lqr',    type=int,   default=500)
     p.add_argument('--H',           type=int,   default=8)
-    p.add_argument('--H_lo',        type=int,   default=16)
+    p.add_argument('--H_lo',        type=int,   default=4)
     p.add_argument('--tau',         type=float, default=0.8)
     p.add_argument('--gamma',       type=float, default=0.7)
     p.add_argument('--gae_lambda',  type=float, default=0.95)
@@ -714,9 +716,9 @@ def main():
     p.add_argument('--batch_size',  type=int,   default=256)
     p.add_argument('--n_steps',     type=int,   default=500_000)
     p.add_argument('--real_ratio',  type=float, default=0.5)
-    p.add_argument('--w_env',       type=float, default=0.5)
-    p.add_argument('--w_event',     type=float, default=0.5)
-    p.add_argument('--w_acc',       type=float, default=0.0)
+    p.add_argument('--w_env',       type=float, default=0.4)
+    p.add_argument('--w_event',     type=float, default=0.2)
+    p.add_argument('--w_acc',       type=float, default=0.4)
     p.add_argument('--Q_scale',     type=float, default=1.0)
     p.add_argument('--R_scale',     type=float, default=10.0)
     p.add_argument('--device',      default='cuda:1' if torch.cuda.is_available() else 'cpu')
