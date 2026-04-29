@@ -5,29 +5,9 @@ train.py — KODAQ v5 Training Script
 v5 changes over v4:
   - After each optimizer step: model.soft_update_target_Q()  (EMA target Q)
   - LOG_KEYS extended: loss_reward, loss_q, loss_pi, rho, q_scale
-  - rewards batch field now required for v5 heads
-  - Policy prior training starts at phase 2 (controlled inside model)
-
-Phase schedule (same as v4):
-  Phase 1: L_rec + L_reward + L_Q  (world model + new heads, no π)
-  Phase 2: + L_dyn + L_skill + L_π  (Koopman structure + policy)
-  Phase 3: + L_reg
-
-Note: L_reward and L_Q are active from phase 1 because the reward / Q heads
-don't need the Koopman dynamics to be well-trained first — they just need
-the posterior encoder to produce meaningful latents.  L_π starts at phase 2
-because meaningful Q values are needed first.
-"""
-"""
-train.py — KODAQ v5 Training Script
-=====================================
-
-v5 changes over v4:
-  - After each optimizer step: model.soft_update_target_Q()  (EMA target Q)
-  - LOG_KEYS extended: loss_reward, loss_q, loss_pi, rho, q_scale
   - rewards = step reward {0,1} (not accumulated)
   - Policy prior training starts at phase 2 (controlled inside model)
-  - wandb logging (--wandb_project / --wandb_entity / --disable_wandb)
+  - wandb logging (--wandb_project / --wandb_run, iql_koopman.py 패턴)
 
 Phase schedule:
   Phase 1: WM rec + L_R + L_Q   (world model + Q/reward heads, no pi)
@@ -36,12 +16,10 @@ Phase schedule:
 
 nohup example:
   mkdir -p logs checkpoints/kodaq_v5
-  nohup python train.py \\
+  nohup python train_kodaq.py \\
       --env kitchen_mixed \\
       --wandb_project kodaq \\
-      --wandb_entity YOUR_ENTITY \\
-      --wandb_run_name v5_kitchen_run1 \\
-      --wandb_tags v5,kitchen_mixed \\
+      --wandb_run v5_kitchen_run1 \\
       --save_dir checkpoints/kodaq_v5 \\
       --epochs 400 \\
       --device cuda \\
@@ -154,76 +132,8 @@ class Trainer:
 
         self.use_wandb = (
             _WANDB_AVAILABLE
-            and not args.disable_wandb
             and args.wandb_project is not None
         )
-
-    # ── wandb helpers ────────────────────────────────────────────────────────
-
-    def _wandb_init(self):
-        if not self.use_wandb:
-            return
-        args = self.args
-        cfg  = self.cfg
-        wandb.init(
-            project  = args.wandb_project,
-            entity   = args.wandb_entity or None,
-            name     = args.wandb_run_name or None,
-            group    = args.wandb_group or None,
-            tags     = [t.strip() for t in args.wandb_tags.split(',') if t.strip()],
-            dir      = str(self.save_dir),
-            resume   = 'allow',
-            config   = {
-                # arch
-                'koopman_dim':   cfg.koopman_dim,
-                'gru_hidden':    cfg.gru_hidden,
-                'action_latent': cfg.action_latent,
-                'num_skills':    cfg.num_skills,
-                'mlp_hidden':    cfg.mlp_hidden,
-                # v5
-                'num_bins':      cfg.num_bins,
-                'v_min':         cfg.v_min,
-                'v_max':         cfg.v_max,
-                'num_q':         cfg.num_q,
-                'tau':           cfg.tau,
-                'gamma':         cfg.gamma,
-                'entropy_coef':  cfg.entropy_coef,
-                'log_std_min':   cfg.log_std_min,
-                'log_std_max':   cfg.log_std_max,
-                # loss weights
-                'lambda1':       cfg.lambda1,
-                'lambda2':       cfg.lambda2,
-                'lambda3':       cfg.lambda3,
-                'lambda4':       cfg.lambda4,
-                'lambda_reward': cfg.lambda_reward,
-                'lambda_q':      cfg.lambda_q,
-                'lambda_pi':     cfg.lambda_pi,
-                # train
-                'lr':            args.lr,
-                'weight_decay':  args.weight_decay,
-                'batch_size':    args.batch_size,
-                'epochs':        args.epochs,
-                'seq_len':       args.seq_len,
-                'env':           args.env,
-                'phase2_epoch':  args.phase2_epoch,
-                'phase3_epoch':  args.phase3_epoch,
-            },
-        )
-        print(f"[wandb] project={args.wandb_project}  run={wandb.run.name}",
-              flush=True)
-        print(f"[wandb] url: {wandb.run.url}", flush=True)
-
-    def _wandb_log(self, metrics: Dict, step: int, prefix: str):
-        if not self.use_wandb:
-            return
-        wandb.log(
-            {f"{prefix}/{k}": v for k, v in metrics.items()},
-            step=step,
-        )
-
-    def _wandb_finish(self):
-        if self.use_wandb:
-            wandb.finish()
 
     # ── Phase control ────────────────────────────────────────────────────────
 
@@ -307,7 +217,13 @@ class Trainer:
     # ── Main loop ────────────────────────────────────────────────────────────
 
     def train(self, train_loader, val_loader=None):
-        self._wandb_init()
+        if self.use_wandb:
+            wandb.init(project=self.args.wandb_project,
+                       name=self.args.wandb_run or None,
+                       config=vars(self.args))
+            print(f"[wandb] project={self.args.wandb_project}  "
+                  f"run={wandb.run.name}  url={wandb.run.url}",
+                  flush=True)
         best_val = float('inf')
         t0       = time.time()
 
@@ -318,13 +234,17 @@ class Trainer:
             # train
             metrics = self.train_epoch(train_loader)
             self.scheduler.step()
-            self._wandb_log(metrics, step=epoch, prefix='train')
+            if self.use_wandb:
+                wandb.log({f'train/{k}': v for k, v in metrics.items()},
+                          step=epoch)
 
             # eval
             val_metrics = {}
             if val_loader and epoch % self.args.eval_freq == 0:
                 val_metrics = self.eval_epoch(val_loader)
-                self._wandb_log(val_metrics, step=epoch, prefix='val')
+                if self.use_wandb:
+                    wandb.log({f'val/{k}': v for k, v in val_metrics.items()},
+                              step=epoch)
                 val_loss = val_metrics.get('loss', float('inf'))
                 if val_loss < best_val:
                     best_val = val_loss
@@ -362,7 +282,8 @@ class Trainer:
         self.save_checkpoint('final.pt')
         print(f"\nDone. best_val={best_val:.4f}  "
               f"time={(time.time()-t0)/60:.1f}m", flush=True)
-        self._wandb_finish()
+        if self.use_wandb:
+            wandb.finish()
 
     # ── Checkpoint ───────────────────────────────────────────────────────────
 
@@ -455,18 +376,11 @@ def parse_args():
     p.add_argument('--num_workers',   type=int,   default=2)
     p.add_argument('--val_ratio',     type=float, default=0.1)
 
-    # wandb
-    p.add_argument('--wandb_project',  type=str, default=None,
-                   help='wandb project. If None, wandb is off.')
-    p.add_argument('--wandb_entity',   type=str, default=None,
-                   help='wandb entity (username or team)')
-    p.add_argument('--wandb_run_name', type=str, default=None,
-                   help='Run name shown in wandb UI')
-    p.add_argument('--wandb_group',    type=str, default=None,
-                   help='Group name for comparing multiple runs')
-    p.add_argument('--wandb_tags',     type=str, default='',
-                   help='Comma-separated tags e.g. "v5,kitchen,debug"')
-    p.add_argument('--disable_wandb',  action='store_true')
+    # wandb  (iql_koopman.py 패턴: project + run 두 개만)
+    p.add_argument('--wandb_project', type=str, default=None,
+                   help='wandb project name. None=disabled.')
+    p.add_argument('--wandb_run',     type=str, default=None,
+                   help='Run name shown in wandb UI.')
 
     return p.parse_args()
 
@@ -514,7 +428,7 @@ if __name__ == '__main__':
           f" lam3={cfg.lambda3} lam4={cfg.lambda4}")
     print(f"  phase: 1->{args.phase2_epoch}  2->{args.phase3_epoch}"
           f"  3->{args.epochs}")
-    print(f"  wandb: {'off' if args.disable_wandb or not args.wandb_project else args.wandb_project}")
+    print(f"  wandb: {args.wandb_project or 'off'}")
     print("=" * 65, flush=True)
 
     model   = KoopmanCVAE(cfg)
