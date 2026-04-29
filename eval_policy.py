@@ -40,14 +40,45 @@ def save_gif(frames, path, fps=10):
         print(f"    Strip: {strip}")
 
 
-def render_frame(env, w=256, h=256):
+def render_frame(env, w=512, h=512,
+                 crop_center: bool = True,
+                 crop_ratio: float = 0.55,
+                 upscale: int = 2) -> np.ndarray:
+    """
+    환경 프레임 렌더링 + 중앙 crop + 2배 업스케일.
+
+    crop_ratio: 전체 이미지 대비 crop 크기 비율 (0.55 = 중앙 55% 영역)
+    upscale:    crop 후 업스케일 배수
+    """
     try:
         f = env.render(mode='rgb_array', width=w, height=h)
         if f is None: f = env.unwrapped.sim.render(w, h, camera_name='main_cam')
     except Exception:
         try: f = env.unwrapped.sim.render(w, h)
         except Exception: f = np.zeros((h, w, 3), dtype=np.uint8)
-    return f
+
+    if not crop_center or f is None:
+        return f
+
+    # 중앙 crop
+    H_f, W_f = f.shape[:2]
+    ch = int(H_f * crop_ratio)
+    cw = int(W_f * crop_ratio)
+    y0 = (H_f - ch) // 2
+    x0 = (W_f - cw) // 2
+    cropped = f[y0:y0+ch, x0:x0+cw]
+
+    # 2배 업스케일 (PIL 없으면 numpy repeat)
+    if upscale > 1:
+        try:
+            from PIL import Image
+            img = Image.fromarray(cropped.astype(np.uint8))
+            img = img.resize((cw * upscale, ch * upscale), Image.LANCZOS)
+            cropped = np.array(img)
+        except ImportError:
+            cropped = np.repeat(np.repeat(cropped, upscale, axis=0),
+                                upscale, axis=1)
+    return cropped
 
 
 def inspect_info(info):
