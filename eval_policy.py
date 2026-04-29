@@ -55,7 +55,7 @@ def inspect_info(info):
     if 'score' in info:
         # score는 완료된 subtask 수 (0~4)
         return int(round(float(info['score']) * 4)), []
-    if 'episode_task_completions' in info: return int(info['episode_task_completions']), []
+    if 'num_success' in info: return int(info['num_success']), []
     if 'completed_tasks' in info: return len(info['completed_tasks']), list(info['completed_tasks'])
     if 'goal_achieved' in info: return int(info['goal_achieved']), []
     return 0, []
@@ -74,7 +74,7 @@ class PolicyWrapper:
 
     @classmethod
     def load_iql(cls, world_ckpt, policy_ckpt, device):
-        from iql_koopman import GaussianPolicy, IQLConfig
+        from iql_koopman import ChunkPolicy, IQLConfig
         dev = device
         print(f"\n[IQL] world: {world_ckpt}")
         wc    = torch.load(world_ckpt, map_location=dev)
@@ -83,13 +83,15 @@ class PolicyWrapper:
         z_dim = model.cfg.koopman_dim; a_dim = model.cfg.action_dim
         print(f"  m={z_dim}  action_dim={a_dim}")
         cfg_iql = IQLConfig()
-        pi_iql  = GaussianPolicy(z_dim, a_dim, cfg_iql.hidden_dim, cfg_iql.n_layers)
+        # H_lo 자동 감지
         pc = torch.load(policy_ckpt, map_location=dev)
+        H_lo_ckpt = pc['pi']['mu.weight'].shape[0] // a_dim
+        pi_iql  = ChunkPolicy(z_dim, a_dim, H_lo_ckpt, cfg_iql.hidden_dim, cfg_iql.n_layers)
         pi_iql.load_state_dict(pc['pi']); pi_iql.eval().to(dev)
         print(f"[IQL] policy: {policy_ckpt}  step={pc.get('step','N/A')}")
         cfg_on = OnlineConfig()
         wm     = KoopmanWorldModelWrapper(model, cfg_on.wm_lr, dev)
-        pw = cls('iql', device); pw._pi_iql = pi_iql; pw.H_lo = 1
+        pw = cls('iql', device); pw._pi_iql = pi_iql; pw.H_lo = H_lo_ckpt
         return pw, model, wm
 
     @classmethod
@@ -134,9 +136,10 @@ class PolicyWrapper:
     def act(self, z_t):
         dev = torch.device(self.device)
         if self.mode == 'iql':
+            # ChunkPolicy: (1, H_lo, 9) chunk → execute first step deterministically
             mu, _ = self._pi_iql(z_t)
-            a = torch.tanh(mu)
-            return a[0].cpu().numpy().reshape(1, -1)  # (1, 9)
+            a = torch.tanh(mu)   # (1, H_lo, 9)
+            return a[0].cpu().numpy()  # (H_lo, 9)
         else:
             trainer = self._trainer; cfg = self._cfg
             if self._hi_timer == 0:
