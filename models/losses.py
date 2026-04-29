@@ -17,13 +17,33 @@ All functions are pure (no nn.Module state).
 koopman_cvae.py delegates all loss computation here.
 """
 
+"""
+losses.py — KODAQ v5 Loss Functions
+=====================================
+
+v5 additions on top of v4:
+  L_reward : Categorical CE with Two-Hot encoding over [0,4], B=16 bins
+  L_Q      : Categorical CE with Two-Hot target = Bellman TD target
+             y_t = r_t + γ · E[Q̄(o_{t+1}, π(o_{t+1}))]
+  L_pi     : Policy prior loss (TD-MPC2 style)
+             L_π = ((entropy_coef · log_π - Q) * rho).mean()
+  rho      : Moving 5th/95th percentile normalization of Q values (DreamerV3/TD-MPC2)
+
+Bin design (accumulated reward, no symlog):
+  [0, 4] → 16 bins, width = 4/15 ≈ 0.267
+  bins[i] = i * 4.0 / (B-1)  for i=0..B-1
+  Two-Hot interpolates between adjacent bins for non-integer values.
+
+Existing v4 losses unchanged.
+"""
+
 import torch
 import torch.nn.functional as F
 from typing import Optional
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Symlog / Symexp  (scale compression for wide-range signals)
+# v4 utilities (unchanged)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def symlog(x: torch.Tensor) -> torch.Tensor:
@@ -34,298 +54,112 @@ def symexp(x: torch.Tensor) -> torch.Tensor:
     return torch.sign(x) * (torch.exp(torch.abs(x)) - 1.0)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Skill-interpolated Koopman: log-eigenvalue space blending
-# ──────────────────────────────────────────────────────────────────────────────
-
-def blend_koopman(
-    log_lambdas: torch.Tensor,   # (K, m)  log-magnitude of eigenvalues per skill
-    thetas:      torch.Tensor,   # (K, m)  phase angles per skill
-    G_k:         torch.Tensor,   # (K, m, da)  skill-specific input coupling
-    U:           torch.Tensor,   # (m, m)  shared eigenbasis
-    w:           torch.Tensor,   # (B, K)  soft skill weights (sum=1)
-) -> tuple:
-    """
-    Skill-interpolated Koopman matrices in log-eigenvalue space.
-    Guarantees |λ̄_i| ≤ 1 when all |λ^(k)_i| ≤ 1.
-
-    Ā(w) = U · diag(exp(Σ_k w_k · log_λ_k) · e^{iθ̄}) · U⁻¹
-    B̄(w) = U · (Σ_k w_k · G_k)
-
-    Returns:
-        A_bar: (B, m, m)  blended transition
-        B_bar: (B, m, da) blended input coupling
-        r_bar: (B, m)     blended log-magnitudes
-        t_bar: (B, m)     blended phases
-    """
-    # Interpolate in log-eigenvalue space: (B, m)
-    r_bar = torch.einsum('bk,km->bm', w, log_lambdas)  # (B, m)
-    t_bar = torch.einsum('bk,km->bm', w, thetas)        # (B, m)
-
-    # Build diagonal complex eigenvalues in real form
-    # λ̄_i = exp(r̄_i) · e^{iθ̄_i}  → 2x2 rotation-scaling blocks
-    # We work in real-valued block-diagonal representation
-    # Λ̄ = diag(..., [exp(r)*cos(θ), -exp(r)*sin(θ);
-    #                  exp(r)*sin(θ),  exp(r)*cos(θ)], ...)
-    # For simplicity with full U: Ā = U Λ̄ U⁻¹ using complex representation
-    r_exp = torch.exp(r_bar)                            # (B, m) magnitudes
-
-    # Build Λ̄ as complex: (B, m) complex
+def blend_koopman(log_lambdas, thetas, G_k, U, w):
+    r_bar = torch.einsum('bk,km->bm', w, log_lambdas)
+    t_bar = torch.einsum('bk,km->bm', w, thetas)
+    r_exp = torch.exp(r_bar)
     lambdas_c = torch.complex(
         r_exp * torch.cos(t_bar),
         r_exp * torch.sin(t_bar),
-    )  # (B, m)
-
-    # Ā = U · diag(λ̄) · U⁻¹
-    # U: (m, m) real — treat as complex
-    U_c    = U.to(dtype=torch.complex64)                       # (m, m)
-    U_inv  = torch.linalg.inv(U_c)                            # (m, m)
-
-    # (B, m, m): batch diagonal
-    Lam    = torch.diag_embed(lambdas_c)                       # (B, m, m)
-    A_c    = U_c.unsqueeze(0) @ Lam @ U_inv.unsqueeze(0)      # (B, m, m)
-    A_bar  = A_c.real                                          # (B, m, m)
-
-    # B̄ = U · (Σ_k w_k G_k): (B, m, da)
-    G_mix  = torch.einsum('bk,kmd->bmd', w, G_k)              # (B, m, da)
-    B_bar  = U.unsqueeze(0) @ G_mix                           # (B, m, da)
-
+    )
+    U_c   = U.to(dtype=torch.complex64)
+    U_inv = torch.linalg.inv(U_c)
+    Lam   = torch.diag_embed(lambdas_c)
+    A_c   = U_c.unsqueeze(0) @ Lam @ U_inv.unsqueeze(0)
+    A_bar = A_c.real
+    G_mix = torch.einsum('bk,kmd->bmd', w, G_k)
+    B_bar = U.unsqueeze(0) @ G_mix
     return A_bar, B_bar, r_bar, t_bar
 
 
-def koopman_step(
-    o:     torch.Tensor,   # (B, m)  current lifted state
-    u:     torch.Tensor,   # (B, da) encoded action
-    A_bar: torch.Tensor,   # (B, m, m)
-    B_bar: torch.Tensor,   # (B, m, da)
-) -> torch.Tensor:
-    """
-    o_{t+1} = Ā(w) · o_t + B̄(w) · u_t
-    Returns: (B, m)
-    """
+def koopman_step(o, u, A_bar, B_bar):
     return (A_bar @ o.unsqueeze(-1)).squeeze(-1) + \
            (B_bar @ u.unsqueeze(-1)).squeeze(-1)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# L_rec: Weighted multi-head reconstruction
-# ──────────────────────────────────────────────────────────────────────────────
-
-def reconstruction_loss(
-    preds:   dict,          # {'delta_e': (B,T,2048), 'delta_p': (B,T,42),
-                            #  'q': (B,T,9), 'qdot': (B,T,9), 'reward': (B,T,1)}
-    targets: dict,          # same keys, same shapes
-    weights: dict,          # {'delta_e': α_e, ..., 'reward': α_r}
-) -> tuple:
-    """
-    L_rec = Σ_j α_j · loss_j(x̂^(j), x^(j))
-
-    'reward' key uses BCE loss (sparse 0/1 target).
-    All other keys use MSE in symlog space.
-
-    Returns (total_loss, {key: per_head_loss})
-    """
+def reconstruction_loss(preds, targets, weights):
     per_head = {}
     total    = torch.tensor(0.0, device=next(iter(preds.values())).device)
-
     for key in preds:
         if key not in targets:
-            continue   # skip heads with no target (e.g. reward head disabled)
+            continue
         p = preds[key]
         t = targets[key]
         w = weights.get(key, 1.0)
         if key == 'reward':
-            # BCE for sparse binary reward (0/1)
             loss = F.binary_cross_entropy_with_logits(p, t.float())
         else:
             loss = F.mse_loss(p, t)
         per_head[key] = loss
         total = total + w * loss
-
     return total, per_head
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# L_dyn: Multi-step Koopman Consistency (RWM-style)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def koopman_consistency_loss(
-    mu_next:   torch.Tensor,   # (B, T-1, m)  posterior mean at t+1
-    o_pred:    torch.Tensor,   # (B, T-1, m)  Koopman prediction Ā·o_t + B̄·u_t
-) -> torch.Tensor:
-    """
-    Single-step L_dyn (kept for backward compatibility).
-    L_dyn = ||μ_φ(x_{t+1}, h_{t+1}) - (Ā·o_t + B̄·u_t)||²
-    """
+def koopman_consistency_loss(mu_next, o_pred):
     return F.mse_loss(mu_next, o_pred)
 
 
 def multistep_koopman_consistency_loss(
-    mu_seq:     torch.Tensor,        # (B, T, m)   posterior means μ_φ(x_t, h_t)
-    o_seq:      torch.Tensor,        # (B, T, m)   posterior samples o_t
-    A_bar_seq:  torch.Tensor,        # (B, T-1, m, m)  blended Ā(w_t) per step
-    B_bar_seq:  torch.Tensor,        # (B, T-1, m, d_u)
-    u_seq:      torch.Tensor,        # (B, T-1, d_u)   encoded actions
-    H:          int   = 8,           # rollout horizon
-    alpha:      float = 0.95,        # decay factor per step
-) -> torch.Tensor:
-    """
-    Multi-step L_dyn (RWM-style):
-
-        L_dyn = (1/N) Σ_{k=1}^{H} α^k · ||μ_φ(x_{t+k}, h_{t+k}) - ẑ_{t+k}||²
-
-    ẑ_{t+k} = k-step Koopman rollout from o_t:
-        ẑ_{t+1} = Ā(w_t)·o_t     + B̄(w_t)·u_t
-        ẑ_{t+2} = Ā(w_{t+1})·ẑ_{t+1} + B̄(w_{t+1})·u_{t+1}
-        ...
-
-    The α^k decay focuses more on near-term accuracy but still penalizes
-    long-horizon error accumulation.
-
-    L_reg is NOT changed — it keeps single-step stop-gradient alignment.
-    """
+    mu_seq, o_seq, A_bar_seq, B_bar_seq, u_seq, H=8, alpha=0.95
+):
     B, T, m = mu_seq.shape
-    T_seq   = T - 1   # number of valid transition steps
-
+    T_seq   = T - 1
     if H > T_seq:
         H = T_seq
-
-    total_loss  = torch.tensor(0.0, device=mu_seq.device)
+    total_loss   = torch.tensor(0.0, device=mu_seq.device)
     total_weight = 0.0
-
     for t in range(T_seq - H + 1):
-        # k-step rollout starting from o_t
-        z_hat = o_seq[:, t]      # (B, m)
-
+        z_hat = o_seq[:, t]
         for k in range(1, H + 1):
-            step = t + k - 1     # index into A_bar_seq / u_seq
+            step = t + k - 1
             if step >= T_seq:
                 break
-
-            A_t = A_bar_seq[:, step]   # (B, m, m)
-            B_t = B_bar_seq[:, step]   # (B, m, d_u)
-            u_t = u_seq[:, step]       # (B, d_u)
-
-            # ẑ_{t+k} = Ā_{t+k-1}·ẑ_{t+k-1} + B̄_{t+k-1}·u_{t+k-1}
+            A_t   = A_bar_seq[:, step]
+            B_t   = B_bar_seq[:, step]
+            u_t   = u_seq[:, step]
             z_hat = (A_t @ z_hat.unsqueeze(-1)).squeeze(-1) \
                   + (B_t @ u_t.unsqueeze(-1)).squeeze(-1)
-
-            # Target: posterior mean at t+k
-            mu_target = mu_seq[:, t + k]   # (B, m)
-
-            weight      = alpha ** k
-            step_loss   = F.mse_loss(z_hat, mu_target)
-            total_loss  = total_loss + weight * step_loss
+            mu_target    = mu_seq[:, t + k]
+            weight       = alpha ** k
+            step_loss    = F.mse_loss(z_hat, mu_target)
+            total_loss   = total_loss + weight * step_loss
             total_weight += weight
-
     if total_weight > 0:
         total_loss = total_loss / total_weight
-
     return total_loss
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# L_skill: Cross-entropy vs EXTRACT labels
-# ──────────────────────────────────────────────────────────────────────────────
-
-def skill_classification_loss(
-    logits: torch.Tensor,   # (B, T, K)  log p_θ(c_t | h_t)
-    labels: torch.Tensor,   # (B, T)     int64, EXTRACT cluster assignments
-    mask:   Optional[torch.Tensor] = None,  # (B, T) bool, valid timesteps
-) -> torch.Tensor:
-    """
-    L_skill = -log p_θ(c_t = ĉ_t | h_t)
-            = CrossEntropy(logits, labels)
-
-    mask: optionally exclude padding timesteps.
-    """
+def skill_classification_loss(logits, labels, mask=None):
     B, T, K = logits.shape
     logits_flat = logits.reshape(B * T, K)
     labels_flat = labels.reshape(B * T).long()
-
     if mask is not None:
-        valid = mask.reshape(B * T)
+        valid       = mask.reshape(B * T)
         logits_flat = logits_flat[valid]
         labels_flat = labels_flat[valid]
-
     return F.cross_entropy(logits_flat, labels_flat)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# L_reg: Posterior-prior alignment (stop-gradient on prior)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def posterior_regularization_loss(
-    mu_t:   torch.Tensor,   # (B, T-1, m)  posterior mean at t (t=1..T-1)
-    o_pred: torch.Tensor,   # (B, T-1, m)  Koopman prior prediction at t
-                            #              = Ā(w_{t-1})·o_{t-1} + B̄(w_{t-1})·u_{t-1}
-) -> torch.Tensor:
-    """
-    L_reg = ||μ_φ(x_t, h_t) - sg(Ā(w_{t-1})·o_{t-1} + B̄(w_{t-1})·u_{t-1})||²
-
-    stop_gradient on the prior prediction prevents h_t drift.
-    Gradient flows only to the posterior encoder φ.
-    """
+def posterior_regularization_loss(mu_t, o_pred):
     target = o_pred.detach()
     return F.mse_loss(mu_t, target)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Stability: |λ^(k)_i| ≤ 1 via tanh parameterization (no additional loss needed)
-# But we add a soft penalty for monitoring and robustness
-# ──────────────────────────────────────────────────────────────────────────────
-
-def eigenvalue_stability_loss(
-    log_lambdas: torch.Tensor,   # (K, m)  log-magnitudes (should be ≤ 0 for stable)
-    margin: float = 0.0,
-) -> torch.Tensor:
-    """
-    Soft penalty for log_lambdas > margin (i.e., |λ| > exp(margin)).
-    Since we use tanh(r)·e^{iθ}, |λ| = tanh(r) < 1 is guaranteed.
-    This loss monitors for near-boundary values and adds a soft push.
-
-    With tanh parameterization this is primarily a diagnostic / light regularizer.
-    """
-    # tanh(r) → log_lambda should be <= 0
-    # Penalize if log_lambda > margin (exp(margin) = target_radius > 1: forbidden)
+def eigenvalue_stability_loss(log_lambdas, margin=0.0):
     excess = F.relu(log_lambdas - margin)
     return (excess ** 2).mean()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Combined loss (called from KoopmanCVAE._compute_losses)
-# ──────────────────────────────────────────────────────────────────────────────
-
 def compute_total_loss(
-    loss_rec:    torch.Tensor,
-    loss_dyn:    torch.Tensor,
-    loss_skill:  torch.Tensor,
-    loss_reg:    torch.Tensor,
-    loss_stab:   torch.Tensor,
-    lambda1: float,   # Koopman weight
-    lambda2: float,   # Skill supervision weight
-    lambda3: float,   # Posterior regularization weight
-    lambda4: float,   # Stability weight
-    phase:   int,     # 1: rec only, 2: +dyn+skill, 3: +reg
-) -> tuple:
-    """
-    Phase-gated loss aggregation.
-    L_rec already includes reward head loss (weighted by alpha_reward).
-
-    Phase 1 (warm-up) : L_rec only  (includes reward head)
-    Phase 2 (Koopman) : L_rec + λ1·L_dyn + λ2·L_skill
-    Phase 3 (full)    : L_rec + λ1·L_dyn + λ2·L_skill + λ3·L_reg
-
-    Returns (total, weights_used_dict)
-    """
+    loss_rec, loss_dyn, loss_skill, loss_reg, loss_stab,
+    lambda1, lambda2, lambda3, lambda4, phase,
+):
     total = loss_rec
-
     if phase >= 2:
         total = total + lambda1 * loss_dyn + lambda2 * loss_skill
     if phase >= 3:
         total = total + lambda3 * loss_reg
     total = total + lambda4 * loss_stab
-
     return total, {
         'rec':   1.0,
         'dyn':   lambda1 if phase >= 2 else 0.0,
@@ -333,3 +167,214 @@ def compute_total_loss(
         'reg':   lambda3 if phase >= 3 else 0.0,
         'stab':  lambda4,
     }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# v5: Two-Hot Encoding / Decoding  [0, 4], B bins
+# ──────────────────────────────────────────────────────────────────────────────
+
+def get_bins(num_bins: int, v_min: float = 0.0, v_max: float = 4.0,
+             device=None) -> torch.Tensor:
+    """
+    Bin centers uniformly spaced in [v_min, v_max].
+    bins[i] = v_min + i * (v_max - v_min) / (num_bins - 1)
+    """
+    return torch.linspace(v_min, v_max, num_bins, device=device)
+
+
+def two_hot_encode(x: torch.Tensor, bins: torch.Tensor) -> torch.Tensor:
+    """
+    Two-Hot encoding of scalar(s) x into B-dim soft label.
+
+    x:    (...,)        scalar targets
+    bins: (B,)          bin centers, monotonically increasing
+
+    Returns: (..., B)   soft labels, sum=1 (mostly sparse, at most 2 non-zero)
+
+    Algorithm:
+      lower_idx = clamp(searchsorted(bins, x) - 1, 0, B-2)
+      upper_idx = lower_idx + 1
+      upper_w   = (x - bins[lower_idx]) / (bins[upper_idx] - bins[lower_idx])
+      lower_w   = 1 - upper_w
+      label[lower_idx] = lower_w,  label[upper_idx] = upper_w
+    """
+    B   = bins.shape[0]
+    dev = x.device
+
+    # searchsorted returns index where x would be inserted to keep sorted order
+    # shape: same as x
+    idx = torch.searchsorted(bins.contiguous(), x.contiguous())
+    idx = idx.clamp(1, B - 1)          # upper bin index, in [1, B-1]
+    lower_idx = idx - 1                 # lower bin index, in [0, B-2]
+
+    b_lo = bins[lower_idx]              # (...,)
+    b_hi = bins[idx]                    # (...,)
+    span = (b_hi - b_lo).clamp(min=1e-8)
+
+    upper_w = ((x - b_lo) / span).clamp(0.0, 1.0)  # (...,)
+    lower_w = 1.0 - upper_w                          # (...,)
+
+    # Scatter into B-dim vector
+    label = torch.zeros(*x.shape, B, device=dev, dtype=x.dtype)
+    label.scatter_(-1, lower_idx.unsqueeze(-1), lower_w.unsqueeze(-1))
+    label.scatter_(-1, idx.unsqueeze(-1),       upper_w.unsqueeze(-1))
+    return label                        # (..., B)
+
+
+def two_hot_decode(logits: torch.Tensor, bins: torch.Tensor) -> torch.Tensor:
+    """
+    Decode categorical logits → scalar via E[bin_center].
+
+    logits: (..., B)  raw (unnormalized) or probabilities
+    bins:   (B,)
+
+    Returns: (...,)  scalar expected value
+    """
+    probs = torch.softmax(logits, dim=-1)           # (..., B)
+    return (probs * bins.to(logits.device)).sum(-1) # (...,)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# v5: Categorical Reward Loss  (Two-Hot CE)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def reward_categorical_loss(
+    logits:  torch.Tensor,   # (..., B)  reward head output
+    targets: torch.Tensor,   # (...,)    accumulated reward scalar ∈ [0,4]
+    bins:    torch.Tensor,   # (B,)
+) -> torch.Tensor:
+    """
+    L_R = CE(reward_logits, TwoHot(R_t))
+
+    targets are accumulated episode reward ∈ [0, 4].
+    Two-Hot encodes the target before computing CE.
+    """
+    label = two_hot_encode(targets.clamp(0.0, 4.0), bins)  # (..., B)
+    # CE with soft labels: -sum(label * log_softmax(logits))
+    log_p = F.log_softmax(logits, dim=-1)
+    return -(label * log_p).sum(-1).mean()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# v5: Categorical Q Loss  (Bellman TD, Two-Hot CE)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def q_categorical_loss(
+    q_logits:        torch.Tensor,   # (B_batch, T-1, num_q, num_bins)
+    reward_seq:      torch.Tensor,   # (B_batch, T-1)   accumulated reward at t
+    q_target_scalar: torch.Tensor,   # (B_batch, T-1)   Q̄(o_{t+1}, π(o_{t+1}))
+    bins:            torch.Tensor,   # (num_bins,)
+    gamma:           float = 0.99,
+) -> torch.Tensor:
+    """
+    Bellman TD target:
+        y_t = r_t + γ · Q̄(o_{t+1}, π(o_{t+1}))   (scalar, clamped to [0,4])
+
+    Loss:
+        L_Q = CE(Q(o_t, u_t), TwoHot(y_t))
+
+    q_logits:        raw logits from Q head ensemble
+    q_target_scalar: scalar expected value from target Q network, stop-gradient
+    """
+    with torch.no_grad():
+        td_target = (reward_seq + gamma * q_target_scalar).clamp(0.0, 4.0)  # (B, T-1)
+        label     = two_hot_encode(td_target, bins.to(td_target.device))    # (B, T-1, num_bins)
+
+    # q_logits: (B, T-1, num_q, num_bins)
+    num_q = q_logits.shape[2]
+
+    # Expand label to match num_q
+    label_expanded = label.unsqueeze(2).expand_as(q_logits)  # (B, T-1, num_q, num_bins)
+
+    log_p = F.log_softmax(q_logits, dim=-1)
+    loss  = -(label_expanded * log_p).sum(-1).mean()         # scalar
+    return loss
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# v5: Moving Percentile Scale  (DreamerV3 / TD-MPC2 rho)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class MovingPercentileScale:
+    """
+    Tracks EMA of 5th and 95th percentile of Q values.
+    Used to normalize policy loss magnitude so that entropy_coef
+    remains task-invariant regardless of Q scale.
+
+    rho = 1 / max(1, S)   where S = EMA(95th) - EMA(5th)
+
+    Usage:
+        scale_tracker = MovingPercentileScale()
+        ...
+        scale_tracker.update(q_values.detach())
+        rho = scale_tracker.rho
+        pi_loss = ((entropy_coef * log_pi - q_pi) * rho).mean()
+    """
+
+    def __init__(self, decay: float = 0.99, lo: float = 0.05, hi: float = 0.95):
+        self.decay = decay
+        self.lo    = lo
+        self.hi    = hi
+        self._ema_lo: Optional[float] = None
+        self._ema_hi: Optional[float] = None
+
+    def update(self, values: torch.Tensor):
+        """values: any shape tensor of Q values."""
+        v = values.detach().float().flatten()
+        if v.numel() < 2:
+            return
+        lo_val = torch.quantile(v, self.lo).item()
+        hi_val = torch.quantile(v, self.hi).item()
+        if self._ema_lo is None:
+            self._ema_lo = lo_val
+            self._ema_hi = hi_val
+        else:
+            self._ema_lo = self.decay * self._ema_lo + (1 - self.decay) * lo_val
+            self._ema_hi = self.decay * self._ema_hi + (1 - self.decay) * hi_val
+
+    @property
+    def scale(self) -> float:
+        if self._ema_lo is None:
+            return 1.0
+        return max(1.0, self._ema_hi - self._ema_lo)
+
+    @property
+    def rho(self) -> float:
+        return 1.0 / self.scale
+
+    def state_dict(self):
+        return {'ema_lo': self._ema_lo, 'ema_hi': self._ema_hi,
+                'decay': self.decay, 'lo': self.lo, 'hi': self.hi}
+
+    def load_state_dict(self, d):
+        self._ema_lo = d['ema_lo']
+        self._ema_hi = d['ema_hi']
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# v5: Policy Prior Loss  (TD-MPC2 style, entropy + Q maximization)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def policy_prior_loss(
+    log_pi:       torch.Tensor,   # (B, T, action_latent)  log prob of sampled action
+    q_pi:         torch.Tensor,   # (B, T)  Q(o_t, π(o_t)) scalar
+    rho:          float,          # moving-percentile normalization
+    entropy_coef: float = 0.01,
+) -> torch.Tensor:
+    """
+    L_π = E[(entropy_coef · log_π(u|o) - Q(o, u)) * rho]
+
+    Minimizing this:
+      - pushes log_π down (maximize entropy)
+      - pushes Q(o, π(o)) up (maximize Q)
+      - rho normalizes loss magnitude to Q's current scale
+
+    log_pi:  summed log prob of action dimensions, shape (B, T)
+    q_pi:    scalar Q estimate for sampled action, shape (B, T)
+    """
+    # log_pi: sum over action dims if passed per-dim
+    if log_pi.dim() > q_pi.dim():
+        log_pi = log_pi.sum(-1)   # (B, T)
+
+    loss = ((entropy_coef * log_pi - q_pi) * rho).mean()
+    return loss

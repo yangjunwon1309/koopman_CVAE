@@ -7,14 +7,26 @@ from models.koopman_cvae import (
     SkillPrior,
     SkillKoopmanOperator,
     MultiHeadDecoder,
+    RewardCategoricalHead,
+    QHead,
+    PolicyPrior,
 )
 from models.losses import (
     symlog, symexp,
     blend_koopman, koopman_step,
     reconstruction_loss,
     koopman_consistency_loss,
+    multistep_koopman_consistency_loss,
     skill_classification_loss,
     posterior_regularization_loss,
     eigenvalue_stability_loss,
     compute_total_loss,
+    # v5
+    get_bins,
+    two_hot_encode,
+    two_hot_decode,
+    reward_categorical_loss,
+    q_categorical_loss,
+    MovingPercentileScale,
+    policy_prior_loss,
 )
