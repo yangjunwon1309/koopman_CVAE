@@ -61,7 +61,7 @@ def load_model_v5(ckpt_path: str, device: str) -> KoopmanCVAE:
 
     # v5 필드 없으면 기본값 주입 (v4 ckpt 호환)
     v5_defaults = dict(
-        num_bins=16, v_min=0.0, v_max=5.0, num_q=2, tau=0.005,
+        num_bins=101, v_min=0.0, v_max=5.0, num_q=2, tau=0.005,
         gamma=0.99, entropy_coef=0.01, log_std_min=-5.0, log_std_max=2.0,
         lambda_reward=1.0, lambda_q=1.0, lambda_pi=0.1,
         reward_ensemble_n=5, td_horizon=4, mopo_beta=1.0,
@@ -142,22 +142,33 @@ def plot_rollout_quality(model: KoopmanCVAE, samples: list, out_dir: Path,
     results, rmse_dq_all, rmse_dp_all = [], [], []
     ts = np.arange(horizon)
 
+    rng = np.random.default_rng(seed=42)
+
     for samp in samples:
         x, a = samp['x'], samp['a']
         L = samp['length']
         if L < cond_len + horizon + 2:
             results.append(None); continue
 
-        x_cond = x[:, :cond_len]
-        a_cond = a[:, :cond_len]
-        a_plan = a[:, cond_len:cond_len + horizon]
-        x_true = x[0, cond_len:cond_len + horizon].cpu().numpy()
+        # Random start: pick a conditioning window anywhere in the episode
+        # (not always from t=0) so we sample different dynamics regions.
+        max_start = L - cond_len - horizon - 1
+        t_start   = int(rng.integers(0, max(1, max_start)))
+        t_cond_e  = t_start + cond_len
+        t_pred_e  = t_cond_e + horizon
+
+        x_cond = x[:, t_start:t_cond_e]
+        a_cond = a[:, t_start:t_cond_e]
+        a_plan = a[:, t_cond_e:t_pred_e]
+        x_true = x[0, t_cond_e:t_pred_e].cpu().numpy()
 
         pred    = model.rollout(x_cond, a_cond, a_plan)
         dq_pred = pred['q'][0].cpu().numpy()
         dq_true = x_true[:, dq_sl]
         dp_pred = pred['delta_p'][0].cpu().numpy()
         dp_true = x_true[:, dp_sl]
+        samp['_t_start']  = t_start
+        samp['_t_cond_e'] = t_cond_e
 
         rmse_dq = np.sqrt(((dq_pred - dq_true)**2).mean(axis=0))
         rmse_dp = np.sqrt(((dp_pred - dp_true)**2).mean(axis=0))
@@ -176,11 +187,12 @@ def plot_rollout_quality(model: KoopmanCVAE, samples: list, out_dir: Path,
         if res is None:
             for ax in axes[i]: ax.set_visible(False)
             continue
+        t_s = samp.get('_t_cond_e', cond_len)
         ax = axes[i, 0]
         for d in range(9):
             ax.plot(ts, res['dq_true'][:,d], '-',  color=cmap9(d), lw=1.2, alpha=0.8)
             ax.plot(ts, res['dq_pred'][:,d], '--', color=cmap9(d), lw=1.2, alpha=0.8)
-        ax.set_title(f'Ep {samples[i]["ep_idx"]}  Δq  RMSE={res["rmse_dq"].mean():.4f}',
+        ax.set_title(f'Ep {samp["ep_idx"]} @t={t_s}  Δq  RMSE={res["rmse_dq"].mean():.4f}',
                      fontsize=9)
         ax.set_ylabel('Δq [rad]', fontsize=8)
         ax.spines[['top','right']].set_visible(False)
@@ -254,8 +266,10 @@ def plot_ensemble_reward(model: KoopmanCVAE, samples: list, out_dir: Path,
         z_seq = enc['o_seq'][0]                      # (L, m)
         u_seq = model.action_encoder(a[0])            # (L, d_u)
 
-        # 분석 구간: cond_len ~ cond_len+horizon
-        t0 = cond_len
+        # 분석 구간: 랜덤 시작점 (rollout_quality와 동일하게 맞추거나 독립적으로)
+        rng_r = np.random.default_rng(seed=samp['ep_idx'])
+        max_t0 = max(1, L - cond_len - horizon - 1)
+        t0 = cond_len + int(rng_r.integers(0, max_t0))
         t1 = min(t0 + horizon, L - 1)
         H  = t1 - t0
 
@@ -380,7 +394,10 @@ def plot_policy_prior_rollout(model: KoopmanCVAE, samples: list, out_dir: Path,
         z_seq = enc['o_seq'][0]      # (L, m)  posterior latents
         u_seq = model.action_encoder(a[0])  # (L, d_u)
 
-        t0 = cond_len
+        # Random start within episode
+        rng_p = np.random.default_rng(seed=samp['ep_idx'] + 1000)
+        max_t0p = max(1, L - cond_len - H - 1)
+        t0 = cond_len + int(rng_p.integers(0, max_t0p))
         t1 = t0 + H
 
         z_start   = z_seq[t0]                    # (m,)  starting latent

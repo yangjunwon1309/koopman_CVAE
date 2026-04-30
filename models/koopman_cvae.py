@@ -433,82 +433,84 @@ class RewardCategoricalHead(nn.Module):
 
 class RewardEnsembleHead(nn.Module):
     """
-    N independent reward heads over the same bin grid as QHead.
+    N independent reward heads, each predicting step reward ∈ {0, 1}
+    via sigmoid + BCE.
 
-    Each member i predicts logits r̂_i(o_t, u_t) → B logits.
+    Why sigmoid instead of Two-Hot for step reward:
+      - Step reward is sparse impulse {0,1}, not a continuous distribution.
+      - Two-Hot assumes the target lives on a continuous bin grid [0,5].
+        With >96% r=0 transitions, the model learns "always predict bin 0"
+        → collapse to a constant output.
+      - Sigmoid BCE directly models P(r=1|o,u) ∈ (0,1), matching the
+        binary nature of Kitchen subtask completion.
+      - Two-Hot is appropriate for Q values (TD target is continuous [0,5]).
+
     MOPO-style penalized reward:
-        R̂_pen(o, u) = mean_i[E[r̂_i]] - beta * std_i[E[r̂_i]]
+        R̂_pen(o, u) = mean_i[σ(r̂_i)] - beta * std_i[σ(r̂_i)]
 
-    Used to build H-step TD target:
-        y_t = Σ_{k=0}^{H-1} γ^k · R̂_pen(ẑ_{t+k}, û_{t+k})
-            + γ^H · Q̄(ẑ_{t+H}, π(ẑ_{t+H}))
-
-    where ẑ_{t+k} is obtained by rolling out Koopman dynamics
-    with policy prior actions:  û_k = π(ẑ_{t+k}),  ẑ_{t+k+1} = Ā·ẑ_{t+k} + B̄·û_k
-
-    Zero-init on each member's last layer (uniform initial distribution).
+    Each member outputs a scalar logit → sigmoid → probability of r=1.
     """
 
     def __init__(self, cfg: 'KoopmanCVAEConfig'):
         super().__init__()
         in_dim = cfg.koopman_dim + cfg.action_latent
-        B      = cfg.num_bins
         N      = cfg.reward_ensemble_n
 
         self.N    = N
         self.beta = cfg.mopo_beta
+
+        # Each member: MLP → scalar logit (single output)
         self.nets = nn.ModuleList([
-            make_mlp(in_dim, B, cfg.mlp_hidden, 2, cfg.dropout)
+            make_mlp(in_dim, 1, cfg.mlp_hidden, 2, cfg.dropout)
             for _ in range(N)
         ])
-        # Zero-init each member's last layer
+        # Zero-init last layer → initial sigmoid output = 0.5 (neutral)
         for net in self.nets:
             nn.init.zeros_(net[-1].weight)
             nn.init.zeros_(net[-1].bias)
 
-        self.register_buffer('bins', torch.linspace(cfg.v_min, cfg.v_max, B))
-
-    def forward(self, o: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+    def forward_logits(self, o: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
         """
-        o: (..., d_o)
-        u: (..., d_u)
-        → logits: (N, ..., B)
+        Raw logits (before sigmoid).
+        → (N, ..., 1)
         """
         x = torch.cat([o, u], dim=-1)
-        return torch.stack([net(x) for net in self.nets], dim=0)  # (N, ..., B)
+        return torch.stack([net(x) for net in self.nets], dim=0)  # (N, ..., 1)
 
+    def member_probs(self, o: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+        """
+        P(r=1|o,u) per member → (N, ...) after squeezing last dim.
+        """
+        return torch.sigmoid(self.forward_logits(o, u)).squeeze(-1)  # (N, ...)
+
+    # Alias for analyze_v5.py compatibility
     def member_values(self, o: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
-        """
-        Returns expected reward per ensemble member.
-        → (N, ...) scalar per member
-        """
-        logits = self.forward(o, u)              # (N, ..., B)
-        return two_hot_decode(logits, self.bins) # (N, ...)
+        return self.member_probs(o, u)
 
     def penalized_reward(self, o: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
         """
-        MOPO-style: mean_i[r̂_i] - beta * std_i[r̂_i]
-        → (...,) scalar
+        MOPO-style: mean_i[P(r=1)] - beta * std_i[P(r=1)]
+        → (...,) scalar ∈ (-beta, 1)
+        Clamp to [0,1] for use as reward signal.
         """
-        vals = self.member_values(o, u)          # (N, ...)
-        mu   = vals.mean(0)                      # (...,)
-        sigma = vals.std(0)                      # (...,)
-        return mu - self.beta * sigma
+        probs = self.member_probs(o, u)          # (N, ...)
+        mu    = probs.mean(0)                    # (...,)
+        sigma = probs.std(0)                     # (...,)
+        return (mu - self.beta * sigma).clamp(0.0, 1.0)
 
     def ensemble_loss(self, o: torch.Tensor, u: torch.Tensor,
                       r_targets: torch.Tensor) -> torch.Tensor:
         """
-        CE loss averaged over all N members.
-        Each member is trained independently on the same step reward target.
+        BCE loss averaged over all N members.
+        Each member trained independently on the same binary target.
 
-        r_targets: (...,) step reward {0,1}
+        r_targets: (...,) float, step reward ∈ {0.0, 1.0}
         """
-        logits = self.forward(o, u)              # (N, ..., B)
-        label  = two_hot_encode(r_targets, self.bins)  # (..., B)
-        # expand label to (N, ..., B)
-        label_exp = label.unsqueeze(0).expand_as(logits)
-        log_p  = F.log_softmax(logits, dim=-1)
-        return -(label_exp * log_p).sum(-1).mean()
+        logits = self.forward_logits(o, u)              # (N, ..., 1)
+        logits = logits.squeeze(-1)                     # (N, ...)
+        # expand target to match N
+        t_exp  = r_targets.unsqueeze(0).expand_as(logits)  # (N, ...)
+        return F.binary_cross_entropy_with_logits(logits, t_exp)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -935,11 +937,18 @@ class KoopmanCVAE(nn.Module):
             u_in      = u_seq[:, :-1]      # (B, T-1, d_u)
             r_targets = rewards[:, :-1]    # (B, T-1)  step reward {0,1} at t
 
-            reward_logits = self.reward_head(o_in, u_in)   # (B, T-1, B_bins)
-            loss_reward   = reward_categorical_loss(
-                reward_logits, r_targets,
-                self.reward_head.bins,
-            )
+            if cfg.use_ensemble_reward:
+                # sigmoid BCE ensemble loss
+                loss_reward = self.reward_ensemble_head.ensemble_loss(
+                    o_in, u_in, r_targets,
+                )
+            else:
+                # original single categorical head (Two-Hot)
+                reward_logits = self.reward_head(o_in, u_in)   # (B, T-1, B_bins)
+                loss_reward   = reward_categorical_loss(
+                    reward_logits, r_targets,
+                    self.reward_head.bins,
+                )
 
         # ── v5 Q Head + H-step Bellman TD Loss ──────────────────────────────
         #

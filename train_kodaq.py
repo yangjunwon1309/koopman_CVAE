@@ -130,6 +130,8 @@ class Trainer:
         self.phase2_epoch       = args.phase2_epoch
         self.phase3_epoch       = args.phase3_epoch
         self.freeze_world_model = getattr(args, 'freeze_world_model', False)
+        # Two-stage resume: 'wm' = WM fine-tune only, 'heads' = Q/R/pi only
+        self.resume_stage       = getattr(args, 'resume_stage', None)
 
         self.use_wandb = (
             _WANDB_AVAILABLE
@@ -185,7 +187,10 @@ class Trainer:
 
     def _frozen_params(self):
         """Yield parameters of world model modules (frozen in resume mode)."""
-        wm_modules = [
+        yield from self._wm_params()
+
+    def _wm_modules(self):
+        return [
             self.model.action_encoder,
             self.model.posterior,
             self.model.recurrent,
@@ -193,8 +198,32 @@ class Trainer:
             self.model.koopman,
             self.model.decoder,
         ]
-        for mod in wm_modules:
+
+    def _wm_params(self):
+        """Yield world-model parameters."""
+        for mod in self._wm_modules():
             yield from mod.parameters()
+
+    def _head_modules(self):
+        return [
+            self.model.reward_head,
+            self.model.reward_ensemble_head,
+            self.model.q_head,
+            self.model.policy_prior,
+        ]
+
+    def _head_params(self):
+        """Yield reward/Q/policy head parameters."""
+        for mod in self._head_modules():
+            yield from mod.parameters()
+
+    def _set_wm_requires_grad(self, flag: bool):
+        for p in self._wm_params():
+            p.requires_grad_(flag)
+
+    def _set_head_requires_grad(self, flag: bool):
+        for p in self._head_params():
+            p.requires_grad_(flag)
 
     def train_epoch(self, loader) -> Dict:
         self.model.train()
@@ -238,6 +267,74 @@ class Trainer:
 
     # ── Main loop ────────────────────────────────────────────────────────────
 
+    def _run_loop(self, train_loader, val_loader,
+                  n_epochs: int, epoch_offset: int,
+                  stage_tag: str, t0: float) -> float:
+        """
+        Inner training loop for one stage.
+        epoch_offset: global epoch counter offset (for wandb step continuity).
+        Returns best val loss.
+        """
+        best_val = float('inf')
+        for local_ep in range(1, n_epochs + 1):
+            global_ep = epoch_offset + local_ep
+            self._maybe_update_phase(global_ep)
+            t_ep = time.time()
+
+            metrics = self.train_epoch(train_loader)
+            self.scheduler.step()
+            if self.use_wandb:
+                wandb.log({f'{stage_tag}/{k}': v for k, v in metrics.items()},
+                          step=global_ep)
+
+            val_metrics = {}
+            if val_loader and local_ep % self.args.eval_freq == 0:
+                val_metrics = self.eval_epoch(val_loader)
+                if self.use_wandb:
+                    wandb.log({f'{stage_tag}_val/{k}': v
+                               for k, v in val_metrics.items()}, step=global_ep)
+                val_loss = val_metrics.get('loss', float('inf'))
+                if val_loss < best_val:
+                    best_val = val_loss
+                    self.save_checkpoint(f'best_{stage_tag}.pt')
+
+            phase   = self.model.cfg.phase
+            ep_sec  = time.time() - t_ep
+            tot_min = (time.time() - t0) / 60.0
+            line = (f"[{stage_tag}|Ph{phase}] Ep {local_ep:4d}/{n_epochs}"
+                    f"  {ep_sec:.1f}s  ({tot_min:.0f}m)")
+
+            for k in ['loss', 'loss_wm', 'loss_rec', 'loss_dyn',
+                      'loss_skill', 'loss_reg']:
+                if metrics.get(k, 0.0) != 0.0:
+                    line += f"  {k.replace('loss_','')[:4]}={metrics[k]:.4f}"
+            for k in ['loss_reward', 'loss_q', 'loss_pi']:
+                if k in metrics:
+                    line += f"  {k.replace('loss_','')[:3]}={metrics[k]:.4f}"
+            if 'rho' in metrics:
+                line += f"  rho={metrics['rho']:.3f}"
+            if 'q_scale' in metrics:
+                line += f"  Qs={metrics['q_scale']:.2f}"
+            if val_metrics:
+                line += f"  | val={val_metrics.get('loss', 0):.4f}"
+            print(line, flush=True)
+
+            if local_ep % self.args.save_freq == 0:
+                self.save_checkpoint(f'epoch_{stage_tag}_{local_ep:04d}.pt')
+
+        self.save_checkpoint(f'final_{stage_tag}.pt')
+        return best_val
+
+    def _rebuild_optimizer(self, param_iter, lr: float):
+        """Replace optimizer + scheduler with new ones for a fresh stage."""
+        params = list(param_iter)
+        self.optimizer = torch.optim.AdamW(
+            params, lr=lr, weight_decay=self.args.weight_decay
+        )
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=self.args.resume_epochs_heads
+        )
+
     def train(self, train_loader, val_loader=None):
         if self.use_wandb:
             wandb.init(project=self.args.wandb_project,
@@ -246,66 +343,106 @@ class Trainer:
             print(f"[wandb] project={self.args.wandb_project}  "
                   f"run={wandb.run.name}  url={wandb.run.url}",
                   flush=True)
-        best_val = float('inf')
-        t0       = time.time()
+        t0 = time.time()
 
-        for epoch in range(1, self.args.epochs + 1):
-            self._maybe_update_phase(epoch)
-            t_ep = time.time()
+        # ── Two-stage resume ──────────────────────────────────────────────────
+        if self.resume_stage is not None:
+            self._train_two_stage(train_loader, val_loader, t0)
+        else:
+            # ── Normal (non-resume) single loop ──────────────────────────────
+            self.args.epochs = getattr(self.args, 'epochs', 400)
+            best = self._run_loop(train_loader, val_loader,
+                                  n_epochs=self.args.epochs,
+                                  epoch_offset=0,
+                                  stage_tag='train', t0=t0)
+            print(f"\nDone. best_val={best:.4f}  "
+                  f"time={(time.time()-t0)/60:.1f}m", flush=True)
 
-            # train
-            metrics = self.train_epoch(train_loader)
-            self.scheduler.step()
-            if self.use_wandb:
-                wandb.log({f'train/{k}': v for k, v in metrics.items()},
-                          step=epoch)
-
-            # eval
-            val_metrics = {}
-            if val_loader and epoch % self.args.eval_freq == 0:
-                val_metrics = self.eval_epoch(val_loader)
-                if self.use_wandb:
-                    wandb.log({f'val/{k}': v for k, v in val_metrics.items()},
-                              step=epoch)
-                val_loss = val_metrics.get('loss', float('inf'))
-                if val_loss < best_val:
-                    best_val = val_loss
-                    self.save_checkpoint('best.pt')
-
-            # console log
-            phase   = self.model.cfg.phase
-            ep_sec  = time.time() - t_ep
-            tot_min = (time.time() - t0) / 60.0
-
-            line = (f"[Ph{phase}] Ep {epoch:4d}/{self.args.epochs}"
-                    f"  {ep_sec:.1f}s  ({tot_min:.0f}m)")
-
-            for k in ['loss', 'loss_wm', 'loss_rec', 'loss_dyn',
-                      'loss_skill', 'loss_reg']:
-                if metrics.get(k, 0.0) != 0.0:
-                    line += f"  {k.replace('loss_','')[:4]}={metrics[k]:.4f}"
-
-            for k in ['loss_reward', 'loss_q', 'loss_pi']:
-                if k in metrics:
-                    line += f"  {k.replace('loss_','')[:3]}={metrics[k]:.4f}"
-
-            if 'rho' in metrics:
-                line += f"  rho={metrics['rho']:.3f}"
-            if 'q_scale' in metrics:
-                line += f"  Qs={metrics['q_scale']:.2f}"
-            if val_metrics:
-                line += f"  | val={val_metrics.get('loss', 0):.4f}"
-
-            print(line, flush=True)
-
-            if epoch % self.args.save_freq == 0:
-                self.save_checkpoint(f'epoch_{epoch:04d}.pt')
-
-        self.save_checkpoint('final.pt')
-        print(f"\nDone. best_val={best_val:.4f}  "
-              f"time={(time.time()-t0)/60:.1f}m", flush=True)
         if self.use_wandb:
             wandb.finish()
+
+    def _train_two_stage(self, train_loader, val_loader, t0: float):
+        """
+        Stage 1 — WM fine-tune (resume_epochs_wm epochs):
+          - ALL WM params unfrozen
+          - Head params frozen  (lambda_reward/q/pi forced to 0 in model cfg)
+          - lr = resume_lr_wm
+
+        Stage 2 — Head training (resume_epochs_heads epochs):
+          - WM params frozen
+          - Only reward_ensemble_head / q_head / policy_prior trainable
+          - lambda_reward/q/pi restored from args
+          - lr = resume_lr_heads  (typically smaller)
+          - optimizer rebuilt fresh (no momentum from stage 1)
+        """
+        n_wm    = self.args.resume_epochs_wm
+        n_heads = self.args.resume_epochs_heads
+        lr_wm   = self.args.resume_lr_wm
+        lr_heads = self.args.resume_lr_heads
+
+        # ── Stage 1: WM fine-tune ─────────────────────────────────────────────
+        print(f"\n{'='*60}", flush=True)
+        print(f"[Stage 1] WM fine-tune  {n_wm} epochs  lr={lr_wm}", flush=True)
+        print(f"  WM unfrozen,  heads frozen,  lambda_R/Q/pi = 0", flush=True)
+        print(f"{'='*60}", flush=True)
+
+        # Unfreeze WM, freeze heads
+        self._set_wm_requires_grad(True)
+        self._set_head_requires_grad(False)
+
+        # Zero out head loss weights so WM loss is sole signal
+        saved_lR  = self.model.cfg.lambda_reward
+        saved_lQ  = self.model.cfg.lambda_q
+        saved_lpi = self.model.cfg.lambda_pi
+        self.model.cfg.lambda_reward = 0.0
+        self.model.cfg.lambda_q      = 0.0
+        self.model.cfg.lambda_pi     = 0.0
+        # Phase 3 for full WM loss (L_rec + L_dyn + L_skill + L_reg)
+        self.model.cfg.phase = 3
+        self.phase2_epoch = 0
+        self.phase3_epoch = 0
+
+        # Rebuild optimizer for WM params only
+        self._rebuild_optimizer(self._wm_params(), lr=lr_wm)
+        # Override scheduler T_max for stage 1
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=n_wm
+        )
+        self.freeze_world_model = False  # grad zeroing off for stage 1
+
+        self._run_loop(train_loader, val_loader,
+                       n_epochs=n_wm, epoch_offset=0,
+                       stage_tag='wm', t0=t0)
+
+        # ── Stage 2: Head training ────────────────────────────────────────────
+        print(f"\n{'='*60}", flush=True)
+        print(f"[Stage 2] Head training  {n_heads} epochs  lr={lr_heads}", flush=True)
+        print(f"  WM frozen,  heads trainable,  lambda_R={saved_lR} ", flush=True)
+        print(f"  lambda_Q={saved_lQ}  lambda_pi={saved_lpi}", flush=True)
+        print(f"{'='*60}", flush=True)
+
+        # Freeze WM, unfreeze heads
+        self._set_wm_requires_grad(False)
+        self._set_head_requires_grad(True)
+
+        # Restore head loss weights
+        self.model.cfg.lambda_reward = saved_lR
+        self.model.cfg.lambda_q      = saved_lQ
+        self.model.cfg.lambda_pi     = saved_lpi
+        # Phase stays 3 (all WM losses computed but lambda=0 for R/Q/pi in wm)
+        # For head stage we still need phase>=2 for policy prior activation
+        self.model.cfg.phase = 3
+
+        # Fresh optimizer for head params only (no stale momentum from stage 1)
+        self._rebuild_optimizer(self._head_params(), lr=lr_heads)
+        self.freeze_world_model = True   # zero WM grads if any leak through
+
+        self._run_loop(train_loader, val_loader,
+                       n_epochs=n_heads, epoch_offset=n_wm,
+                       stage_tag='heads', t0=t0)
+
+        print(f"\nTwo-stage resume done.  "
+              f"time={(time.time()-t0)/60:.1f}m", flush=True)
 
     # ── Checkpoint ───────────────────────────────────────────────────────────
 
@@ -398,22 +535,31 @@ def parse_args():
     p.add_argument('--num_workers',   type=int,   default=2)
     p.add_argument('--val_ratio',     type=float, default=0.1)
 
-    # ── resume (world model freeze fine-tuning) ─────────────────────────
-    p.add_argument('--resume_ckpt',      type=str, default=None,
-                   help='Path to final.pt checkpoint to resume from. '
-                        'Loads world model weights; resets Q/reward/policy heads.')
+    # ── resume (two-stage fine-tuning) ──────────────────────────────────
+    p.add_argument('--resume_ckpt',        type=str,   default=None,
+                   help='Checkpoint to resume from (v4 or v5 final.pt).')
     p.add_argument('--freeze_world_model', action='store_true',
-                   help='Freeze world model (encoder/GRU/Koopman/decoder). '
-                        'Only reward_ensemble_head, q_head, policy_prior are trained.')
-    p.add_argument('--resume_epochs',    type=int, default=100,
-                   help='Number of epochs for resume fine-tuning.')
-    p.add_argument('--resume_lr',        type=float, default=1e-4,
-                   help='Learning rate for resume (default: 1/3 of original lr).')
-    p.add_argument('--td_horizon',       type=int, default=4,
+                   help='Freeze WM in stage 2 (auto-set when using two-stage).')
+
+    # Two-stage resume epochs + lr
+    p.add_argument('--resume_epochs_wm',   type=int,   default=100,
+                   help='Stage 1: WM fine-tune epochs.')
+    p.add_argument('--resume_epochs_heads', type=int,  default=100,
+                   help='Stage 2: reward/Q/policy head training epochs.')
+    p.add_argument('--resume_lr_wm',       type=float, default=3e-5,
+                   help='Stage 1 learning rate (WM fine-tune).')
+    p.add_argument('--resume_lr_heads',    type=float, default=1e-4,
+                   help='Stage 2 learning rate (head training).')
+
+    # Legacy single-stage compat (still works)
+    p.add_argument('--resume_epochs',      type=int,   default=100)
+    p.add_argument('--resume_lr',          type=float, default=1e-4)
+
+    p.add_argument('--td_horizon',         type=int,   default=4,
                    help='H-step rollout horizon for MOPO TD target (4 or 8).')
-    p.add_argument('--mopo_beta',        type=float, default=1.0,
-                   help='MOPO penalty coefficient: mean - beta*std.')
-    p.add_argument('--reward_ensemble_n', type=int, default=5,
+    p.add_argument('--mopo_beta',          type=float, default=1.0,
+                   help='MOPO penalty: mean - beta*std.')
+    p.add_argument('--reward_ensemble_n',  type=int,   default=5,
                    help='Number of reward ensemble members.')
 
     # wandb  (iql_koopman.py 패턴: project + run 두 개만)
@@ -573,16 +719,22 @@ if __name__ == '__main__':
             print(f"  Frozen {n_frozen:,} WM params (encoder/GRU/Koopman/decoder).",
                   flush=True)
 
-        # ── Override training schedule for resume ─────────────────────────
-        args.epochs       = args.resume_epochs
-        args.lr           = args.resume_lr
-        args.phase2_epoch = 1   # policy active from epoch 1
-        args.phase3_epoch = 1
-        print(f"  Schedule: {args.resume_epochs} epochs  lr={args.resume_lr}"
-              f"  H={cfg.td_horizon}  beta={cfg.mopo_beta}"
+        # ── Two-stage resume schedule ─────────────────────────────────────
+        args.resume_stage  = 'two_stage'
+        args.phase2_epoch  = 0    # phase 3 immediately in both stages
+        args.phase3_epoch  = 0
+        args.epochs        = args.resume_epochs_wm + args.resume_epochs_heads
+        args.lr            = args.resume_lr_wm
+        print(f"  Two-stage resume:", flush=True)
+        print(f"    Stage 1 (WM fine-tune):  {args.resume_epochs_wm} ep"
+              f"  lr={args.resume_lr_wm}", flush=True)
+        print(f"    Stage 2 (Head training): {args.resume_epochs_heads} ep"
+              f"  lr={args.resume_lr_heads}", flush=True)
+        print(f"    H={cfg.td_horizon}  beta={cfg.mopo_beta}"
               f"  N_ens={cfg.reward_ensemble_n}", flush=True)
     else:
         model = KoopmanCVAE(cfg)
+        args.resume_stage = None
 
     n_total = sum(p.numel() for p in model.parameters() if p.requires_grad)
     n_frozen_total = sum(p.numel() for p in model.parameters() if not p.requires_grad)
