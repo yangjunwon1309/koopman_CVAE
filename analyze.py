@@ -61,7 +61,7 @@ def load_model_v5(ckpt_path: str, device: str) -> KoopmanCVAE:
 
     # v5 필드 없으면 기본값 주입 (v4 ckpt 호환)
     v5_defaults = dict(
-        num_bins=101, v_min=0.0, v_max=5.0, num_q=2, tau=0.005,
+        num_bins=16, v_min=0.0, v_max=5.0, num_q=2, tau=0.005,
         gamma=0.99, entropy_coef=0.01, log_std_min=-5.0, log_std_max=2.0,
         lambda_reward=1.0, lambda_q=1.0, lambda_pi=0.1,
         reward_ensemble_n=5, td_horizon=4, mopo_beta=1.0,
@@ -244,7 +244,7 @@ def plot_ensemble_reward(model: KoopmanCVAE, samples: list, out_dir: Path,
 
     beta = cfg.mopo_beta
     N    = cfg.reward_ensemble_n
-    bins = model.reward_ensemble_head.bins
+    # RewardEnsembleHead는 sigmoid BCE 기반 — bins 없음
 
     n = len(samples)
     ts = np.arange(horizon)
@@ -300,8 +300,9 @@ def plot_ensemble_reward(model: KoopmanCVAE, samples: list, out_dir: Path,
         ax.fill_between(ts_ep, mu_np - std_np, mu_np + std_np,
                         color='#1E88E5', alpha=0.25, label='±std')
         ax.plot(ts_ep, mu_np, color='#1E88E5', lw=2.0, label='Mean')
-        ax.set_title(f'Ep {samp["ep_idx"]}  Ensemble members (N={N})', fontsize=9)
-        ax.set_ylabel('Reward prediction', fontsize=8)
+        ax.set_title(f'Ep {samp["ep_idx"]}  Ensemble members (N={N})\n'
+                     f'(sigmoid P(r=1|o,u), 각 member + mean ± std)', fontsize=9)
+        ax.set_ylabel('P(r=1) prediction', fontsize=8)
         ax.set_xlabel('step', fontsize=8)
         ax.legend(fontsize=7, loc='upper right')
         ax.spines[['top','right']].set_visible(False)
@@ -316,8 +317,8 @@ def plot_ensemble_reward(model: KoopmanCVAE, samples: list, out_dir: Path,
         ax.plot(ts_ep, pen_np, color='#E53935', lw=2.0, label=f'Penalized (β={beta})')
         ax.fill_between(ts_ep, pen_np, mu_np,
                         color='#E53935', alpha=0.15, label='Penalty region')
-        ax.set_title(f'MOPO penalized: mean - β·std', fontsize=9)
-        ax.set_ylabel('Penalized reward', fontsize=8)
+        ax.set_title(f'MOPO penalized: mean - β·std  (β={beta})', fontsize=9)
+        ax.set_ylabel('Penalized P(r=1)', fontsize=8)
         ax.set_xlabel('step', fontsize=8)
         ax.legend(fontsize=7, loc='upper right')
         ax.spines[['top','right']].set_visible(False)
