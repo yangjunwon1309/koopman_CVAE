@@ -127,8 +127,9 @@ class Trainer:
         self.save_dir     = Path(args.save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
 
-        self.phase2_epoch = args.phase2_epoch
-        self.phase3_epoch = args.phase3_epoch
+        self.phase2_epoch       = args.phase2_epoch
+        self.phase3_epoch       = args.phase3_epoch
+        self.freeze_world_model = getattr(args, 'freeze_world_model', False)
 
         self.use_wandb = (
             _WANDB_AVAILABLE
@@ -182,6 +183,19 @@ class Trainer:
                     v.item() if isinstance(v, torch.Tensor) else float(v)
                 )
 
+    def _frozen_params(self):
+        """Yield parameters of world model modules (frozen in resume mode)."""
+        wm_modules = [
+            self.model.action_encoder,
+            self.model.posterior,
+            self.model.recurrent,
+            self.model.skill_prior,
+            self.model.koopman,
+            self.model.decoder,
+        ]
+        for mod in wm_modules:
+            yield from mod.parameters()
+
     def train_epoch(self, loader) -> Dict:
         self.model.train()
         self.model.q_head_target.eval()   # target Q stays in eval always
@@ -193,6 +207,14 @@ class Trainer:
 
             self.optimizer.zero_grad()
             loss.backward()
+
+            # When world model is frozen, zero out gradients of frozen params
+            # so grad_norm clipping is not skewed by zero grads.
+            if self.freeze_world_model:
+                for p in self._frozen_params():
+                    if p.grad is not None:
+                        p.grad.zero_()
+
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
 
@@ -376,6 +398,24 @@ def parse_args():
     p.add_argument('--num_workers',   type=int,   default=2)
     p.add_argument('--val_ratio',     type=float, default=0.1)
 
+    # ── resume (world model freeze fine-tuning) ─────────────────────────
+    p.add_argument('--resume_ckpt',      type=str, default=None,
+                   help='Path to final.pt checkpoint to resume from. '
+                        'Loads world model weights; resets Q/reward/policy heads.')
+    p.add_argument('--freeze_world_model', action='store_true',
+                   help='Freeze world model (encoder/GRU/Koopman/decoder). '
+                        'Only reward_ensemble_head, q_head, policy_prior are trained.')
+    p.add_argument('--resume_epochs',    type=int, default=100,
+                   help='Number of epochs for resume fine-tuning.')
+    p.add_argument('--resume_lr',        type=float, default=1e-4,
+                   help='Learning rate for resume (default: 1/3 of original lr).')
+    p.add_argument('--td_horizon',       type=int, default=4,
+                   help='H-step rollout horizon for MOPO TD target (4 or 8).')
+    p.add_argument('--mopo_beta',        type=float, default=1.0,
+                   help='MOPO penalty coefficient: mean - beta*std.')
+    p.add_argument('--reward_ensemble_n', type=int, default=5,
+                   help='Number of reward ensemble members.')
+
     # wandb  (iql_koopman.py 패턴: project + run 두 개만)
     p.add_argument('--wandb_project', type=str, default=None,
                    help='wandb project name. None=disabled.')
@@ -431,21 +471,139 @@ if __name__ == '__main__':
     print(f"  wandb: {args.wandb_project or 'off'}")
     print("=" * 65, flush=True)
 
-    model   = KoopmanCVAE(cfg)
+    # ── Resume: load WM from checkpoint, reset Q/reward_ens/policy ─────────────
+    is_resume = (args.resume_ckpt is not None)
+    if is_resume:
+        print(f"\n[Resume] Loading checkpoint: {args.resume_ckpt}", flush=True)
+        ckpt = torch.load(args.resume_ckpt, map_location='cpu')
+
+        # ── Rebuild cfg from checkpoint ────────────────────────────────────
+        # ckpt['cfg'] may be a v4 KoopmanCVAEConfig (missing v5 fields).
+        # Strategy: import v5 KoopmanCVAEConfig, copy all fields that exist
+        # in the checkpoint cfg, then fill in v5 defaults + arg overrides.
+        ckpt_cfg_raw = ckpt['cfg']
+
+        # Start from v5 default config
+        from models.koopman_cvae import KoopmanCVAEConfig as V5Config
+        resume_cfg = V5Config()
+
+        # Copy all architecture fields that exist in ckpt cfg (v4 fields)
+        v4_fields = [
+            'dim_delta_e', 'dim_delta_p', 'dim_q', 'dim_qdot',
+            'action_dim', 'state_dim',
+            'koopman_dim', 'gru_hidden', 'action_latent', 'num_skills',
+            'mlp_hidden', 'enc_layers', 'dec_layers', 'dropout',
+            'lambda1', 'lambda2', 'lambda3', 'lambda4',
+            'alpha_delta_e', 'alpha_delta_p', 'alpha_q', 'alpha_qdot',
+            'dt_control', 'multistep_dyn', 'dyn_horizon', 'dyn_alpha',
+        ]
+        for f in v4_fields:
+            if hasattr(ckpt_cfg_raw, f):
+                setattr(resume_cfg, f, getattr(ckpt_cfg_raw, f))
+
+        # Apply v5 + resume-specific overrides from args
+        resume_cfg.use_ensemble_reward = True
+        resume_cfg.td_horizon          = args.td_horizon
+        resume_cfg.mopo_beta           = args.mopo_beta
+        resume_cfg.reward_ensemble_n   = args.reward_ensemble_n
+        resume_cfg.num_bins            = args.num_bins
+        resume_cfg.v_min               = 0.0
+        resume_cfg.v_max               = args.v_max
+        resume_cfg.num_q               = args.num_q
+        resume_cfg.tau                 = args.tau
+        resume_cfg.gamma               = args.gamma
+        resume_cfg.entropy_coef        = args.entropy_coef
+        resume_cfg.log_std_min         = args.log_std_min
+        resume_cfg.log_std_max         = args.log_std_max
+        resume_cfg.lambda_reward       = args.lambda_reward
+        resume_cfg.lambda_q            = args.lambda_q
+        resume_cfg.lambda_pi           = args.lambda_pi
+        resume_cfg.phase               = 3   # resume always in phase 3
+        cfg = resume_cfg
+
+        print(f"  cfg rebuilt: koopman_dim={cfg.koopman_dim}"
+              f"  gru_hidden={cfg.gru_hidden}"
+              f"  num_skills={cfg.num_skills}", flush=True)
+
+        # ── Build v5 model with resumed cfg ───────────────────────────────
+        model = KoopmanCVAE(cfg)
+
+        # ── Load WM weights, skip v5-only heads ───────────────────────────
+        # v4 state dict keys: action_encoder.*, posterior.*, recurrent.*,
+        #                     skill_prior.*, koopman.*, decoder.*
+        # v5 adds:            reward_head.*, reward_ensemble_head.*,
+        #                     q_head.*, q_head_target.*, _detach_q_head.*,
+        #                     policy_prior.*
+        full_sd = ckpt['model_state']
+        resume_heads = {
+            'reward_head', 'reward_ensemble_head',
+            'q_head', 'q_head_target', '_detach_q_head',
+            'policy_prior',
+        }
+        # Also exclude v4-only subkeys inside decoder (e.g. decoder.head_reward)
+        # which don't exist in v5 decoder.
+        filtered_sd = {}
+        for k, v in full_sd.items():
+            top = k.split('.')[0]
+            if top in resume_heads:
+                continue
+            # v4 decoder had head_reward; v5 decoder does not
+            if k.startswith('decoder.head_reward'):
+                continue
+            filtered_sd[k] = v
+
+        missing, unexpected = model.load_state_dict(filtered_sd, strict=False)
+        wm_loaded = [k for k in filtered_sd if k.split('.')[0] not in resume_heads]
+        print(f"  WM weights loaded: {len(filtered_sd)} tensors", flush=True)
+        print(f"  Missing (new v5 heads, expected): {len(missing)}", flush=True)
+        if unexpected:
+            print(f"  Unexpected (check): {unexpected[:5]}", flush=True)
+
+        # ── Freeze world model parameters ─────────────────────────────────
+        if args.freeze_world_model:
+            wm_mods = [
+                model.action_encoder, model.posterior, model.recurrent,
+                model.skill_prior, model.koopman, model.decoder,
+            ]
+            n_frozen = 0
+            for mod in wm_mods:
+                for p in mod.parameters():
+                    p.requires_grad_(False)
+                    n_frozen += p.numel()
+            print(f"  Frozen {n_frozen:,} WM params (encoder/GRU/Koopman/decoder).",
+                  flush=True)
+
+        # ── Override training schedule for resume ─────────────────────────
+        args.epochs       = args.resume_epochs
+        args.lr           = args.resume_lr
+        args.phase2_epoch = 1   # policy active from epoch 1
+        args.phase3_epoch = 1
+        print(f"  Schedule: {args.resume_epochs} epochs  lr={args.resume_lr}"
+              f"  H={cfg.td_horizon}  beta={cfg.mopo_beta}"
+              f"  N_ens={cfg.reward_ensemble_n}", flush=True)
+    else:
+        model = KoopmanCVAE(cfg)
+
     n_total = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"\nTotal params: {n_total:,}")
-    for nm, mod in [
-        ('posterior',    model.posterior),
-        ('recurrent',    model.recurrent),
-        ('skill_prior',  model.skill_prior),
-        ('koopman',      model.koopman),
-        ('decoder',      model.decoder),
-        ('action_enc',   model.action_encoder),
-        ('reward_head',  model.reward_head),
-        ('q_head',       model.q_head),
-        ('policy_prior', model.policy_prior),
-    ]:
-        print(f"  {nm:<14}: {sum(p.numel() for p in mod.parameters()):,}")
+    n_frozen_total = sum(p.numel() for p in model.parameters() if not p.requires_grad)
+    print(f"\nTrainable params: {n_total:,}  Frozen: {n_frozen_total:,}")
+    head_list = [
+        ('posterior',          model.posterior),
+        ('recurrent',          model.recurrent),
+        ('skill_prior',        model.skill_prior),
+        ('koopman',            model.koopman),
+        ('decoder',            model.decoder),
+        ('action_enc',         model.action_encoder),
+        ('reward_head',        model.reward_head),
+        ('reward_ens_head',    model.reward_ensemble_head),
+        ('q_head',             model.q_head),
+        ('policy_prior',       model.policy_prior),
+    ]
+    for nm, mod in head_list:
+        n_req = sum(p.numel() for p in mod.parameters() if p.requires_grad)
+        n_frz = sum(p.numel() for p in mod.parameters() if not p.requires_grad)
+        flag  = ' [FROZEN]' if n_frz > 0 and n_req == 0 else ''
+        print(f"  {nm:<18}: {n_req:>8,} trainable{flag}")
     print(flush=True)
 
     dataset = load_dataset(args, cfg)

@@ -1,23 +1,4 @@
 """
-losses.py — KODAQ Full RSSM-Koopman Loss Functions
-====================================================
-
-Document → Implementation mapping:
-
-  L_rec   : Reconstruction of x_t = [Δe_t, Δp_t, q_t, q̇_t]
-             4 independent MLP heads, weighted by signal magnitude (α_j)
-  L_dyn   : Koopman Consistency — L2 regression (NOT KL)
-             ||μ_φ(x_{t+1}, h_{t+1}) - (Ā(w)·o_t + B̄(w)·u_t)||²
-  L_skill : Cross-entropy vs EXTRACT labels ĉ_t
-             -log p_θ(c_t = ĉ_t | h_t)
-  L_reg   : Posterior-prior alignment (stop-gradient on prior)
-             ||μ_φ(x_t, h_t) - sg(Ā(w_{t-1})·o_{t-1} + B̄(w_{t-1})·u_{t-1})||²
-
-All functions are pure (no nn.Module state).
-koopman_cvae.py delegates all loss computation here.
-"""
-
-"""
 losses.py — KODAQ v5 Loss Functions
 =====================================
 
@@ -240,17 +221,17 @@ def two_hot_decode(logits: torch.Tensor, bins: torch.Tensor) -> torch.Tensor:
 
 def reward_categorical_loss(
     logits:  torch.Tensor,   # (..., B)  reward head output
-    targets: torch.Tensor,   # (...,)    accumulated reward scalar ∈ [0,4]
-    bins:    torch.Tensor,   # (B,)
+    targets: torch.Tensor,   # (...,)    step reward ∈ {0, 1}
+    bins:    torch.Tensor,   # (B,)      covers [v_min, v_max]
 ) -> torch.Tensor:
     """
-    L_R = CE(reward_logits, TwoHot(R_t))
+    L_R = CE(reward_logits, TwoHot(r_t))
 
-    targets are accumulated episode reward ∈ [0, 4].
-    Two-Hot encodes the target before computing CE.
+    targets are step rewards ∈ {0, 1}.
+    bins cover [0, v_max] where v_max ≥ 1, so no clamping needed:
+    two_hot_encode handles boundary values via searchsorted clamp internally.
     """
-    label = two_hot_encode(targets.clamp(0.0, 4.0), bins)  # (..., B)
-    # CE with soft labels: -sum(label * log_softmax(logits))
+    label = two_hot_encode(targets, bins)   # (..., B)
     log_p = F.log_softmax(logits, dim=-1)
     return -(label * log_p).sum(-1).mean()
 
@@ -261,33 +242,32 @@ def reward_categorical_loss(
 
 def q_categorical_loss(
     q_logits:        torch.Tensor,   # (B_batch, T-1, num_q, num_bins)
-    reward_seq:      torch.Tensor,   # (B_batch, T-1)   accumulated reward at t
-    q_target_scalar: torch.Tensor,   # (B_batch, T-1)   Q̄(o_{t+1}, π(o_{t+1}))
-    bins:            torch.Tensor,   # (num_bins,)
+    reward_seq:      torch.Tensor,   # (B_batch, T-1)   step reward (used in 1-step mode)
+    q_target_scalar: torch.Tensor,   # (B_batch, T-1)   pre-computed TD target scalar
+    bins:            torch.Tensor,   # (num_bins,)       covers [v_min, v_max]
     gamma:           float = 0.99,
 ) -> torch.Tensor:
     """
-    Bellman TD target:
-        y_t = r_t + γ · Q̄(o_{t+1}, π(o_{t+1}))   (scalar, clamped to [0,4])
+    TD target = reward_seq + gamma * q_target_scalar  (element-wise)
 
-    Loss:
-        L_Q = CE(Q(o_t, u_t), TwoHot(y_t))
+    1-step mode:  reward_seq = r_t,  q_target_scalar = Q_bar(o_{t+1}, pi)
+                  gamma = cfg.gamma  (e.g. 0.99)
 
-    q_logits:        raw logits from Q head ensemble
-    q_target_scalar: scalar expected value from target Q network, stop-gradient
+    H-step mode:  reward_seq = zeros,  q_target_scalar = pre-computed H-step return
+                  gamma = 1.0  (discount already folded into the return)
+
+    No clamp: caller is responsible for ensuring target is within [v_min, v_max].
     """
     with torch.no_grad():
-        td_target = (reward_seq + gamma * q_target_scalar).clamp(0.0, 4.0)  # (B, T-1)
-        label     = two_hot_encode(td_target, bins.to(td_target.device))    # (B, T-1, num_bins)
+        td_target = reward_seq + gamma * q_target_scalar      # (B, T-1)
+        label     = two_hot_encode(td_target, bins.to(td_target.device))  # (B, T-1, B)
 
     # q_logits: (B, T-1, num_q, num_bins)
     num_q = q_logits.shape[2]
-
-    # Expand label to match num_q
-    label_expanded = label.unsqueeze(2).expand_as(q_logits)  # (B, T-1, num_q, num_bins)
+    label_expanded = label.unsqueeze(2).expand_as(q_logits)   # (B, T-1, num_q, B)
 
     log_p = F.log_softmax(q_logits, dim=-1)
-    loss  = -(label_expanded * log_p).sum(-1).mean()         # scalar
+    loss  = -(label_expanded * log_p).sum(-1).mean()
     return loss
 
 

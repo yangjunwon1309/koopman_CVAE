@@ -47,31 +47,31 @@ Module separation:
   losses.py   : all loss functions (pure functions, no nn.Module state)
   koopman_cvae.py : nn.Module classes + forward/loss delegation
 """
+
 """
 koopman_cvae.py — KODAQ v5
 ============================
 
 v5 changes over v4:
-  1. RewardCategoricalHead   : [0,4] → 16 bins, Two-Hot CE (replaces BCE head)
-  2. QHead                   : same bin grid, Bellman TD target, ensemble of num_q
-  3. PolicyPrior             : Gaussian π(u|o), trained with TD-MPC2 policy loss
-  4. Target Q network        : EMA copy of QHead (soft update, τ=0.005)
-  5. MovingPercentileScale   : rho normalization for entropy/Q balance
-  6. Zero-init on last layer : reward head & Q head last Linear weight=0
-  7. Joint loss              : L_total = L_wm + λ_R·L_R + λ_Q·L_Q + λ_π·L_π
+  1. RewardCategoricalHead : step reward {0,1}, Two-Hot CE, bins [0, 5], B=16
+  2. QHead                 : Bellman TD target, Two-Hot CE, bins [0, 5], ensemble
+  3. PolicyPrior           : Gaussian pi(u|o), TD-MPC2 policy loss
+  4. Target Q network      : EMA copy of QHead (tau=0.005)
+  5. MovingPercentileScale : rho normalization for entropy/Q balance
+  6. Zero-init last layer  : reward head & Q head (uniform initial distribution)
+  7. Joint loss            : L_total = L_wm + lam_R*L_R + lam_Q*L_Q + lam_pi*L_pi
+
+Bin design [v_min=0, v_max=5], B=16 bins:
+  - reward head: predicts step r_t in {0,1} — always within [0,5], no clamp
+  - Q head     : predicts TD target y_t = r_t + gamma*Q_bar
+                 worst case: 1 + 0.99*4 = 4.96 < 5.0 — no clamp needed
+
+rewards input = step reward {0, 1} per timestep (NOT accumulated).
 
 World model components (v4, unchanged):
   ActionEncoder, PosteriorEncoder, RecurrentTransition,
   SkillPrior, SkillKoopmanOperator, MultiHeadDecoder
-
-Forward contract:
-  x_batch      : (B, T, x_dim)
-  actions      : (B, T, da)
-  skill_labels : (B, T) int64
-  rewards      : (B, T) float   ← accumulated episode reward ∈ [0,4]
-  mask         : (B, T) bool    (optional)
 """
-
 """
 koopman_cvae.py — KODAQ v5
 ============================
@@ -167,11 +167,15 @@ class KoopmanCVAEConfig:
 
     # ── v5 Q / Reward head ────────────────────────────────────────────────────
     num_bins:      int   = 16     # B: bin count for Two-Hot distribution
-    v_min:         float = 0.0    # bin range min  (step reward ≥ 0)
-    v_max:         float = 5.0    # bin range max  — must cover TD target:
-                                  #   y_t = r_step(∈{0,1}) + γ·Q̄(∈[0,4])
-                                  #   worst case: 1 + 0.99·4 ≈ 4.96 < 5.0  ✓
-    num_q:         int   = 2      # Q ensemble size (pessimism via random subsampling)
+    v_min:         float = 0.0    # bin range min
+    v_max:         float = 5.0    # bin range max — covers H-step TD target
+    num_q:         int   = 2      # Q ensemble size
+
+    # ── v5.1 Reward Ensemble Head (MOPO-style) ────────────────────────────────
+    reward_ensemble_n:   int   = 5      # N: reward ensemble members
+    td_horizon:          int   = 4      # H: rollout steps for H-step TD (4 or 8)
+    mopo_beta:           float = 1.0    # beta: MOPO penalty (mean - beta*std)
+    use_ensemble_reward: bool  = False  # False=single head, True=ensemble
     tau:           float = 0.005  # EMA rate for target Q update
     gamma:         float = 0.99   # discount
 
@@ -424,6 +428,90 @@ class RewardCategoricalHead(nn.Module):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# v5.1 NEW: Reward Ensemble Head  (MOPO-style pessimistic reward)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class RewardEnsembleHead(nn.Module):
+    """
+    N independent reward heads over the same bin grid as QHead.
+
+    Each member i predicts logits r̂_i(o_t, u_t) → B logits.
+    MOPO-style penalized reward:
+        R̂_pen(o, u) = mean_i[E[r̂_i]] - beta * std_i[E[r̂_i]]
+
+    Used to build H-step TD target:
+        y_t = Σ_{k=0}^{H-1} γ^k · R̂_pen(ẑ_{t+k}, û_{t+k})
+            + γ^H · Q̄(ẑ_{t+H}, π(ẑ_{t+H}))
+
+    where ẑ_{t+k} is obtained by rolling out Koopman dynamics
+    with policy prior actions:  û_k = π(ẑ_{t+k}),  ẑ_{t+k+1} = Ā·ẑ_{t+k} + B̄·û_k
+
+    Zero-init on each member's last layer (uniform initial distribution).
+    """
+
+    def __init__(self, cfg: 'KoopmanCVAEConfig'):
+        super().__init__()
+        in_dim = cfg.koopman_dim + cfg.action_latent
+        B      = cfg.num_bins
+        N      = cfg.reward_ensemble_n
+
+        self.N    = N
+        self.beta = cfg.mopo_beta
+        self.nets = nn.ModuleList([
+            make_mlp(in_dim, B, cfg.mlp_hidden, 2, cfg.dropout)
+            for _ in range(N)
+        ])
+        # Zero-init each member's last layer
+        for net in self.nets:
+            nn.init.zeros_(net[-1].weight)
+            nn.init.zeros_(net[-1].bias)
+
+        self.register_buffer('bins', torch.linspace(cfg.v_min, cfg.v_max, B))
+
+    def forward(self, o: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+        """
+        o: (..., d_o)
+        u: (..., d_u)
+        → logits: (N, ..., B)
+        """
+        x = torch.cat([o, u], dim=-1)
+        return torch.stack([net(x) for net in self.nets], dim=0)  # (N, ..., B)
+
+    def member_values(self, o: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+        """
+        Returns expected reward per ensemble member.
+        → (N, ...) scalar per member
+        """
+        logits = self.forward(o, u)              # (N, ..., B)
+        return two_hot_decode(logits, self.bins) # (N, ...)
+
+    def penalized_reward(self, o: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+        """
+        MOPO-style: mean_i[r̂_i] - beta * std_i[r̂_i]
+        → (...,) scalar
+        """
+        vals = self.member_values(o, u)          # (N, ...)
+        mu   = vals.mean(0)                      # (...,)
+        sigma = vals.std(0)                      # (...,)
+        return mu - self.beta * sigma
+
+    def ensemble_loss(self, o: torch.Tensor, u: torch.Tensor,
+                      r_targets: torch.Tensor) -> torch.Tensor:
+        """
+        CE loss averaged over all N members.
+        Each member is trained independently on the same step reward target.
+
+        r_targets: (...,) step reward {0,1}
+        """
+        logits = self.forward(o, u)              # (N, ..., B)
+        label  = two_hot_encode(r_targets, self.bins)  # (..., B)
+        # expand label to (N, ..., B)
+        label_exp = label.unsqueeze(0).expand_as(logits)
+        log_p  = F.log_softmax(logits, dim=-1)
+        return -(label_exp * log_p).sum(-1).mean()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # v5 NEW: Q Head (Ensemble)
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -608,9 +696,10 @@ class KoopmanCVAE(nn.Module):
         self.decoder        = MultiHeadDecoder(cfg)
 
         # ── v5 NEW modules ────────────────────────────────────────────────
-        self.reward_head  = RewardCategoricalHead(cfg)
-        self.q_head       = QHead(cfg)
-        self.policy_prior = PolicyPrior(cfg)
+        self.reward_head         = RewardCategoricalHead(cfg)
+        self.reward_ensemble_head = RewardEnsembleHead(cfg)   # v5.1
+        self.q_head              = QHead(cfg)
+        self.policy_prior        = PolicyPrior(cfg)
 
         # ── Q network: three versions (TD-MPC2 §H pattern) ───────────────
         #
@@ -852,45 +941,106 @@ class KoopmanCVAE(nn.Module):
                 self.reward_head.bins,
             )
 
-        # ── v5 Q Head + Bellman TD Loss ───────────────────────────────────
-        # TD target: y_t = r_t + gamma * Q_bar(o_{t+1}, pi(o_{t+1}))
-        # r_t   : step reward at t  (∈ {0,1})
-        # Q_bar : target Q expected value (∈ [0, v_max])
-        # y_t   : ∈ [0, 1 + gamma*v_max] ⊂ [0, v_max=5]  — no clamp needed
+        # ── v5 Q Head + H-step Bellman TD Loss ──────────────────────────────
+        #
+        # Mode A (use_ensemble_reward=False): original 1-step TD
+        #   y_t = r_t + gamma * Q_bar(o_{t+1}, pi(o_{t+1}))
+        #
+        # Mode B (use_ensemble_reward=True):  H-step MOPO-penalized TD
+        #   ẑ_{t+0} = o_t
+        #   û_{t+k} = pi(ẑ_{t+k})                  (policy prior, no grad)
+        #   ẑ_{t+k+1} = Ā(w)·ẑ_{t+k} + B̄(w)·û_{t+k}  (Koopman linear rollout)
+        #   R̂_pen_k  = mean_i[r̂_i(ẑ_{t+k}, û_{t+k})] - beta*std_i[...]
+        #   y_t = Σ_{k=0}^{H-1} gamma^k · R̂_pen_k
+        #       + gamma^H · Q̄(ẑ_{t+H}, pi(ẑ_{t+H}))
+        #
+        # Koopman rollout is used (not learned MLP dynamics):
+        #   - linear, no compounding nonlinear error
+        #   - world model freeze-safe: A_bar/B_bar are from frozen koopman
+        #
         loss_q = torch.tensor(0.0, device=device)
         if rewards is not None:
-            o_t   = o_seq[:, :-1]      # (B, T-1, d_o)  current latent
-            u_t   = u_seq[:, :-1]      # (B, T-1, d_u)  current encoded action
-            o_tp1 = o_seq[:, 1:]       # (B, T-1, d_o)  next latent
-            r_t   = rewards[:, :-1]    # (B, T-1)  step reward at t, matching o_t
+            o_t = o_seq[:, :-1]    # (B, T-1, d_o)
+            u_t = u_seq[:, :-1]    # (B, T-1, d_u)
+            r_t = rewards[:, :-1]  # (B, T-1)  step reward at t
 
-            # Next action from policy prior (stop-gradient on target)
             with torch.no_grad():
-                u_pi_next, _, _, _ = self.policy_prior(o_tp1)   # (B, T-1, d_u)
-                # Target Q: pessimistic (min of 2 random)
-                q_target_scalar = self.q_head_target.expected_value(
-                    o_tp1, u_pi_next, return_type='min'
-                )  # (B, T-1)
+                if cfg.use_ensemble_reward and cfg.td_horizon > 1:
+                    # ── Mode B: H-step MOPO rollout ───────────────────────
+                    H   = cfg.td_horizon
+                    gm  = cfg.gamma
+                    B_b = o_t.shape[0]
+                    T1  = o_t.shape[1]
 
-            # Online Q logits: all num_q networks  (num_q, B, T-1, B_bins)
-            q_logits_all = self.q_head(o_t, u_t)            # (num_q, B, T-1, B_bins)
-            # Rearrange to (B, T-1, num_q, B_bins) for loss fn
-            q_logits_bt = q_logits_all.permute(1, 2, 0, 3)  # (B, T-1, num_q, B_bins)
+                    # Skill weights for Koopman: use current h (from forward pass)
+                    # We re-derive A_bar/B_bar at t=0 positions using stored seqs
+                    # A_bar_seq: (B, T-1, m, m),  B_bar_seq: (B, T-1, m, d_u)
+                    # For rollout we use the A_bar at each starting t — then
+                    # subsequent steps use the same A_bar (frozen world model).
+                    # Simpler: use a single A_bar/B_bar per sequence from t
+                    # (sufficient since world model is frozen in resume mode).
+
+                    G      = torch.zeros(B_b, T1, device=device)
+                    z_roll = o_t.clone()   # (B, T-1, d_o)  — starting latent
+
+                    for k in range(H):
+                        # Policy action at current rollout latent
+                        u_roll, _, _, _ = self.policy_prior(z_roll)  # (B, T-1, d_u)
+
+                        # MOPO penalized reward from ensemble
+                        R_pen = self.reward_ensemble_head.penalized_reward(
+                            z_roll, u_roll
+                        )  # (B, T-1)
+                        G = G + (gm ** k) * R_pen
+
+                        # Koopman linear step: ẑ_{k+1} = Ā·ẑ_k + B̄·û_k
+                        # Use A_bar_seq[:, 0] as representative (frozen WM)
+                        # For a proper rollout use the t-indexed A_bar
+                        if k < H - 1:
+                            # A_bar_seq: (B, T-1, m, m)
+                            A_k = A_bar_seq[:, :T1]   # (B, T-1, m, m)
+                            B_k = B_bar_seq[:, :T1]   # (B, T-1, m, d_u)
+                            # z_{k+1} = A·z_k + B·u_k
+                            z_roll = (
+                                (A_k @ z_roll.unsqueeze(-1)).squeeze(-1)
+                                + (B_k @ u_roll.unsqueeze(-1)).squeeze(-1)
+                            )   # (B, T-1, d_o)
+
+                    # Terminal bootstrap: Q_bar(ẑ_H, pi(ẑ_H))
+                    u_term, _, _, _ = self.policy_prior(z_roll)
+                    q_terminal = self.q_head_target.expected_value(
+                        z_roll, u_term, return_type='min'
+                    )   # (B, T-1)
+                    q_target_scalar = G + (gm ** H) * q_terminal
+
+                else:
+                    # ── Mode A: original 1-step TD ────────────────────────
+                    o_tp1 = o_seq[:, 1:]          # (B, T-1, d_o)
+                    u_pi_next, _, _, _ = self.policy_prior(o_tp1)
+                    q_target_scalar = (
+                        r_t + cfg.gamma
+                        * self.q_head_target.expected_value(
+                            o_tp1, u_pi_next, return_type='min'
+                        )
+                    )   # (B, T-1)
+
+            # Online Q: all num_q networks
+            q_logits_all = self.q_head(o_t, u_t)            # (num_q, B, T-1, B)
+            q_logits_bt  = q_logits_all.permute(1, 2, 0, 3) # (B, T-1, num_q, B)
 
             loss_q = q_categorical_loss(
                 q_logits=q_logits_bt,
-                reward_seq=r_t,
+                reward_seq=torch.zeros_like(r_t),  # reward already folded into target
                 q_target_scalar=q_target_scalar,
                 bins=self.q_head.bins,
-                gamma=cfg.gamma,
+                gamma=1.0,   # discount already applied above
             )
 
-            # Update moving percentile scale with current Q values
+            # Update moving percentile scale
             with torch.no_grad():
                 q_scalar_all = two_hot_decode(
-                    q_logits_all.mean(0),   # avg over ensemble → (B, T-1, B_bins)
-                    self.q_head.bins,
-                )  # (B, T-1)
+                    q_logits_all.mean(0), self.q_head.bins,
+                )   # (B, T-1)
                 self.scale_tracker.update(q_scalar_all)
 
         # ── v5 Policy Prior Loss ──────────────────────────────────────────
