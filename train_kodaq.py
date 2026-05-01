@@ -159,14 +159,15 @@ class Trainer:
             else:
                 x_seq, actions, skill_labels = batch
                 rewards = None
-            mask = None
+            mask       = None
+            goal_z_seq = None      # tuple/list batch는 goal_z 없음
         else:
             x_seq        = batch['x_seq']
             actions      = batch['actions']
             skill_labels = batch['skill_labels']
             mask         = batch.get('mask', None)
-            rewards      = batch.get('rewards', None)   # step reward {0,1}
-            goal_z_seq   = batch.get('goal_z_seq', None)  # (B, T, m) LQR goal
+            rewards      = batch.get('rewards', None)
+            goal_z_seq   = batch.get('goal_z_seq', None)
 
         x_seq        = x_seq.to(self.device)
         actions      = actions.to(self.device)
