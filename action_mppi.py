@@ -409,63 +409,156 @@ class KODAQMPPIPlanner:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# GIF / render utilities  (제공된 코드 통합)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def save_gif(frames: list, path: str, fps: int = 10):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    try:
+        from PIL import Image
+        imgs = [Image.fromarray(f.astype(np.uint8)) for f in frames]
+        imgs[0].save(path, save_all=True, append_images=imgs[1:],
+                     duration=int(1000 / fps), loop=0)
+        print(f"    GIF: {path}  ({len(frames)} frames)")
+    except ImportError:
+        # Fallback: contact sheet PNG
+        n    = min(len(frames), 12)
+        step = max(1, len(frames) // n)
+        fig, axes = plt.subplots(1, n, figsize=(2 * n, 2))
+        for i, ax in enumerate(np.array(axes).flatten()):
+            ax.imshow(frames[min(i * step, len(frames) - 1)])
+            ax.axis('off')
+        plt.tight_layout()
+        strip = path.replace('.gif', '_strip.png')
+        plt.savefig(strip, dpi=80)
+        plt.close()
+        print(f"    Strip: {strip}")
+
+
+def render_frame(
+    env,
+    w:           int   = 512,
+    h:           int   = 512,
+    crop_center: bool  = True,
+    crop_ratio:  float = 0.55,
+    upscale:     int   = 2,
+) -> np.ndarray:
+    """환경 프레임 렌더링 + 중앙 crop + 업스케일."""
+    try:
+        f = env.render(mode='rgb_array', width=w, height=h)
+        if f is None:
+            f = env.unwrapped.sim.render(w, h, camera_name='main_cam')
+    except Exception:
+        try:
+            f = env.unwrapped.sim.render(w, h)
+        except Exception:
+            f = np.zeros((h, w, 3), dtype=np.uint8)
+
+    if not crop_center or f is None:
+        return f
+
+    H_f, W_f = f.shape[:2]
+    ch = int(H_f * crop_ratio)
+    cw = int(W_f * crop_ratio)
+    y0 = (H_f - ch) // 2
+    x0 = (W_f - cw) // 2
+    cropped = f[y0:y0 + ch, x0:x0 + cw]
+
+    if upscale > 1:
+        try:
+            from PIL import Image as _PIL
+            img = _PIL.fromarray(cropped.astype(np.uint8))
+            img = img.resize((cw * upscale, ch * upscale), _PIL.LANCZOS)
+            cropped = np.array(img)
+        except ImportError:
+            cropped = np.repeat(np.repeat(cropped, upscale, 0), upscale, 1)
+    return cropped
+
+
+def inspect_info(info: dict):
+    """D4RL kitchen-mixed task completion 정보 추출."""
+    if 'score' in info:
+        return int(round(float(info['score']) * 4)), []
+    if 'num_success'      in info: return int(info['num_success']), []
+    if 'completed_tasks'  in info: return len(info['completed_tasks']), list(info['completed_tasks'])
+    if 'goal_achieved'    in info: return int(info['goal_achieved']), []
+    return 0, []
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Online evaluation loop
 # ──────────────────────────────────────────────────────────────────────────────
 
 def run_mppi_episode(
-    model:    KoopmanCVAE,
-    planner:  KODAQMPPIPlanner,
+    model:       KoopmanCVAE,
+    planner:     KODAQMPPIPlanner,
     env,
-    x_encoder,       # function: obs (60,) → x_seq (2108,)
-    device:   str = 'cuda',
-    max_steps: int = 280,
-    use_mppi: bool = True,
-    render:   bool = False,
+    x_encoder,
+    device:      str  = 'cuda',
+    max_steps:   int  = 280,
+    use_mppi:    bool = True,
+    record_gif:  bool = False,
+    gif_fps:     int  = 15,
+    gif_path:    Optional[str] = None,
+    render_w:    int  = 512,
+    render_h:    int  = 512,
 ) -> Dict:
     """
-    단일 에피소드 실행.
+    단일 에피소드 실행 + 선택적 GIF 저장.
 
-    x_encoder: D4RL obs (60-dim) → KODAQ x (2108-dim)
-    실제로는 R3M feature + delta_p + q + qdot 계산 필요.
-    여기서는 간단히 obs slice로 x를 구성 (x_dim = 2108은 사전 처리 필요).
-
-    Returns: episode result dict.
+    x_encoder : obs (60,) → x (2108,)
+    record_gif: True이면 매 step 렌더링하고 gif_path에 저장
     """
-    dev    = torch.device(device)
+    dev = torch.device(device)
     model.eval()
     planner.reset()
 
-    obs      = env.reset()
-    h        = model.recurrent.init_hidden(1, dev)
-    total_r  = 0.0
-    step     = 0
-    done     = False
-    rewards  = []
-    q_vals   = []
-    r_preds  = []
+    obs     = env.reset()
+    obs_ref = obs.copy()   # episode-start reference for delta_p
+    h       = model.recurrent.init_hidden(1, dev)
+
+    total_r      = 0.0
+    step         = 0
+    done         = False
+    rewards      = []
+    q_vals       = []
+    r_preds      = []
+    frames       = []
+    task_events  = []    # (step, n_tasks, completed_list)
+    n_tasks_done = 0
 
     while not done and step < max_steps:
-        # obs → x (2108-dim)
-        x = torch.FloatTensor(x_encoder(obs)).unsqueeze(0).to(dev)  # (1, x_dim)
+        # ── Render frame ──────────────────────────────────────────────────
+        if record_gif:
+            frame = render_frame(env, w=render_w, h=render_h)
+            if frame is not None:
+                frames.append(frame)
 
-        # Act
+        # ── obs → x ───────────────────────────────────────────────────────
+        x = torch.FloatTensor(x_encoder(obs, obs_ref)).unsqueeze(0).to(dev)
+
+        # ── Act ───────────────────────────────────────────────────────────
         if use_mppi:
             a_np, info = planner.act(x, h)
         else:
             a_np, info = planner.act_greedy(x, h)
 
-        # Environment step
-        obs_next, reward, done, _ = env.step(a_np)
-        if render:
-            env.render()
+        # ── Env step ──────────────────────────────────────────────────────
+        obs_next, reward, done, env_info = env.step(a_np)
 
-        # Update h with posterior + recurrent
+        # Task completion detection
+        n_now, completed = inspect_info(env_info)
+        if n_now > n_tasks_done:
+            task_events.append((step, n_now, completed))
+            n_tasks_done = n_now
+
+        # ── Update h ──────────────────────────────────────────────────────
         with torch.no_grad():
             o, _, _ = model.posterior.sample(x, h)
-            a_t = torch.FloatTensor(a_np).unsqueeze(0).to(dev)
-            h   = model.recurrent(h, o, a_t)
+            a_t     = torch.FloatTensor(a_np).unsqueeze(0).to(dev)
+            h       = model.recurrent(h, o, a_t)
 
-        total_r  += reward
+        total_r += reward
         rewards.append(reward)
         if 'q_val'  in info: q_vals.append(info['q_val'])
         if 'r_pred' in info: r_preds.append(info['r_pred'])
@@ -473,14 +566,92 @@ def run_mppi_episode(
         obs  = obs_next
         step += 1
 
+    # ── Last frame ────────────────────────────────────────────────────────
+    if record_gif:
+        frame = render_frame(env, w=render_w, h=render_h)
+        if frame is not None:
+            frames.append(frame)
+
+    # ── Save GIF ──────────────────────────────────────────────────────────
+    if record_gif and frames and gif_path:
+        save_gif(frames, gif_path, fps=gif_fps)
+
     return {
         'total_reward': total_r,
         'steps':        step,
         'rewards':      np.array(rewards),
-        'q_vals':       np.array(q_vals) if q_vals else None,
-        'r_preds':      np.array(r_preds) if r_preds else None,
-        'n_tasks':      int(total_r),   # Kitchen: +1 per subtask
+        'q_vals':       np.array(q_vals)   if q_vals   else None,
+        'r_preds':      np.array(r_preds)  if r_preds  else None,
+        'n_tasks':      n_tasks_done,
+        'task_events':  task_events,
+        'frames':       frames if record_gif else [],
     }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Diagnostic plot
+# ──────────────────────────────────────────────────────────────────────────────
+
+def plot_episode_diagnostics(results: list, out_dir: Path):
+    """
+    Q value / reward prediction / cumulative reward 시계열 플롯.
+    에피소드별 subplot.
+    """
+    n   = len(results)
+    fig, axes = plt.subplots(n, 3, figsize=(15, 3.5 * n), squeeze=False)
+
+    for i, res in enumerate(results):
+        ts = np.arange(res['steps'])
+
+        # Cumulative reward
+        ax = axes[i, 0]
+        cum_r = np.cumsum(res['rewards'])
+        ax.plot(ts, cum_r, color='#43A047', lw=2.0)
+        for ev_t, n_task, _ in res.get('task_events', []):
+            ax.axvline(ev_t, color='#E53935', lw=1.5, ls='--', alpha=0.8)
+            ax.text(ev_t, cum_r[min(ev_t, len(cum_r)-1)],
+                    f' task{n_task}', fontsize=7, color='#E53935')
+        ax.set_title(f"Ep {i+1}  reward={res['total_reward']:.1f}"
+                     f"  tasks={res['n_tasks']}", fontsize=9)
+        ax.set_xlabel('step'); ax.set_ylabel('cumulative reward')
+        ax.spines[['top','right']].set_visible(False)
+
+        # Q value
+        ax = axes[i, 1]
+        if res['q_vals'] is not None and len(res['q_vals']) > 0:
+            ax.plot(ts[:len(res['q_vals'])], res['q_vals'],
+                    color='#1E88E5', lw=1.5, alpha=0.8)
+            ax.set_ylabel('Q(z, u)', fontsize=8)
+            ax.set_title(f"Q mean={res['q_vals'].mean():.3f}", fontsize=9)
+        else:
+            ax.set_title("Q (no data)", fontsize=9)
+        ax.set_xlabel('step')
+        ax.spines[['top','right']].set_visible(False)
+
+        # Reward prediction
+        ax = axes[i, 2]
+        if res['r_preds'] is not None and len(res['r_preds']) > 0:
+            ax.plot(ts[:len(res['r_preds'])], res['r_preds'],
+                    color='#FB8C00', lw=1.5, alpha=0.8, label='R̂_pen')
+            ax.bar(ts[:len(res['rewards'])],
+                   res['rewards'], color='#43A047', alpha=0.3,
+                   width=1.0, label='GT r')
+            ax.set_ylabel('reward', fontsize=8)
+            ax.set_title(f"Reward pred mean={res['r_preds'].mean():.4f}",
+                         fontsize=9)
+            ax.legend(fontsize=7)
+        else:
+            ax.set_title("Reward pred (no data)", fontsize=9)
+        ax.set_xlabel('step')
+        ax.spines[['top','right']].set_visible(False)
+
+    fig.suptitle('KODAQ v5 MPPI Episode Diagnostics',
+                 fontsize=12, fontweight='bold')
+    plt.tight_layout()
+    path = str(out_dir / 'mppi_diagnostics.png')
+    plt.savefig(path, dpi=130, bbox_inches='tight')
+    plt.close()
+    print(f"Saved: {path}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -490,27 +661,36 @@ def run_mppi_episode(
 def main():
     import argparse
     p = argparse.ArgumentParser()
-    p.add_argument('--ckpt',         required=True)
-    p.add_argument('--env',          default='kitchen-mixed-v0')
-    p.add_argument('--n_ep',         type=int,   default=10)
-    p.add_argument('--horizon',      type=int,   default=5)
-    p.add_argument('--num_samples',  type=int,   default=512)
-    p.add_argument('--num_pi_trajs', type=int,   default=24)
-    p.add_argument('--num_elites',   type=int,   default=64)
-    p.add_argument('--temperature',  type=float, default=0.5)
-    p.add_argument('--iterations',   type=int,   default=6)
-    p.add_argument('--init_std',     type=float, default=2.0)
-    p.add_argument('--greedy',       action='store_true',
+    p.add_argument('--ckpt',          required=True)
+    p.add_argument('--env',           default='kitchen-mixed-v0')
+    p.add_argument('--n_ep',          type=int,   default=10)
+    p.add_argument('--horizon',       type=int,   default=5)
+    p.add_argument('--num_samples',   type=int,   default=512)
+    p.add_argument('--num_pi_trajs',  type=int,   default=24)
+    p.add_argument('--num_elites',    type=int,   default=64)
+    p.add_argument('--temperature',   type=float, default=0.5)
+    p.add_argument('--iterations',    type=int,   default=6)
+    p.add_argument('--init_std',      type=float, default=2.0)
+    p.add_argument('--greedy',        action='store_true',
                    help='Use greedy policy prior instead of MPPI')
-    p.add_argument('--device',       default='cuda' if torch.cuda.is_available() else 'cpu')
-    p.add_argument('--out_dir',      default='checkpoints/kodaq_v5_lqr/mppi_eval')
+    p.add_argument('--gif',           action='store_true',
+                   help='Record GIF for each episode')
+    p.add_argument('--gif_fps',       type=int,   default=15)
+    p.add_argument('--gif_every',     type=int,   default=1,
+                   help='Record GIF every N episodes (1=all, 2=every other, ...)')
+    p.add_argument('--render_w',      type=int,   default=512)
+    p.add_argument('--render_h',      type=int,   default=512)
+    p.add_argument('--device',        default='cuda' if torch.cuda.is_available() else 'cpu')
+    p.add_argument('--out_dir',       default='checkpoints/kodaq_v5_lqr/mppi_eval')
     args = p.parse_args()
 
     import os, sys
     sys.path.insert(0, os.path.expanduser('~/koopman_CVAE'))
+    os.environ.setdefault('MUJOCO_GL', 'egl')
+
     from models.koopman_cvae import KoopmanCVAE
 
-    # Load model
+    # ── Load model ────────────────────────────────────────────────────────────
     ckpt  = torch.load(args.ckpt, map_location=args.device)
     cfg_m = ckpt['cfg']
     v5_defaults = dict(
@@ -527,7 +707,7 @@ def main():
     model.load_state_dict(ckpt['model_state'], strict=False)
     model.eval().to(args.device)
 
-    # MPPI planner
+    # ── MPPI planner ──────────────────────────────────────────────────────────
     mppi_cfg = MPPIConfig(
         horizon=args.horizon,
         num_samples=args.num_samples,
@@ -539,70 +719,85 @@ def main():
     )
     planner = KODAQMPPIPlanner(model, mppi_cfg)
 
-    # Env
+    # ── Env ───────────────────────────────────────────────────────────────────
     import d4rl, gym
     env = gym.make(args.env)
 
-    # x_encoder: for eval we use a simple obs→x placeholder
-    # In production, this should use R3M + proper delta computation
-    def x_encoder_placeholder(obs):
-        """
-        Placeholder: obs (60,) → x (2108,)
-        delta_e=0 (R3M feature unavailable in simple eval)
-        delta_p = obs[18:60] - obs_ref[18:60]  (relative to episode start)
-        q       = obs[0:9]
-        qdot    = obs[9:18]
-        """
-        # NOTE: proper implementation requires R3M features
-        # This placeholder zeros out delta_e
+    # ── x_encoder ─────────────────────────────────────────────────────────────
+    # obs (60,) + obs_ref (60,) → x (2108,)
+    # delta_e = 0 (R3M unavailable; zeros)
+    # delta_p = obs[18:60] - obs_ref[18:60]
+    # q       = obs[0:9]
+    # qdot    = obs[9:18]
+    def x_encoder(obs: np.ndarray, obs_ref: np.ndarray) -> np.ndarray:
         delta_e = np.zeros(2048, dtype=np.float32)
-        delta_p = obs[18:60].astype(np.float32)
+        delta_p = (obs[18:60] - obs_ref[18:60]).astype(np.float32)
         q       = obs[0:9].astype(np.float32)
         qdot    = obs[9:18].astype(np.float32)
         return np.concatenate([delta_e, delta_p, q, qdot])
 
-    # Run episodes
-    from pathlib import Path
-    Path(args.out_dir).mkdir(parents=True, exist_ok=True)
+    # ── Output dir ────────────────────────────────────────────────────────────
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    gif_dir = out_dir / 'gifs'
+    if args.gif:
+        gif_dir.mkdir(exist_ok=True)
 
-    results  = []
-    n_tasks_list = []
-    print(f"\n{'='*55}")
+    # ── Run episodes ──────────────────────────────────────────────────────────
+    results = []
+    print(f"\n{'='*57}")
     print(f"KODAQ v5 MPPI Eval  n_ep={args.n_ep}  "
           f"{'greedy' if args.greedy else 'MPPI'}")
     print(f"  H={args.horizon}  N={args.num_samples}  "
           f"elites={args.num_elites}  T={args.temperature}")
-    print(f"{'='*55}")
+    print(f"  GIF={'on (every '+str(args.gif_every)+' ep)' if args.gif else 'off'}")
+    print(f"{'='*57}")
 
     for ep in range(args.n_ep):
+        record = args.gif and (ep % args.gif_every == 0)
+        gif_path = str(gif_dir / f'ep{ep+1:03d}.gif') if record else None
+
         res = run_mppi_episode(
             model, planner, env,
-            x_encoder=x_encoder_placeholder,
+            x_encoder=x_encoder,
             device=args.device,
             use_mppi=not args.greedy,
+            record_gif=record,
+            gif_fps=args.gif_fps,
+            gif_path=gif_path,
+            render_w=args.render_w,
+            render_h=args.render_h,
         )
         results.append(res)
-        n_tasks_list.append(res['n_tasks'])
+
+        task_str = ''
+        if res['task_events']:
+            task_str = '  events=' + str([(t, n) for t, n, _ in res['task_events']])
         print(f"Ep {ep+1:3d}/{args.n_ep}  "
               f"reward={res['total_reward']:.1f}  "
               f"tasks={res['n_tasks']}  "
-              f"steps={res['steps']}", flush=True)
+              f"steps={res['steps']}"
+              f"{task_str}", flush=True)
 
-    # Summary
-    rewards = [r['total_reward'] for r in results]
-    tasks   = [r['n_tasks']      for r in results]
-    print(f"\n{'='*55}")
+    # ── Summary ───────────────────────────────────────────────────────────────
+    rewards  = [r['total_reward'] for r in results]
+    tasks    = [r['n_tasks']      for r in results]
+    n_solved = sum(1 for t in tasks if t >= 1)
+
+    print(f"\n{'='*57}")
     print(f"Summary ({args.n_ep} episodes)")
-    print(f"  Reward: {np.mean(rewards):.2f} ± {np.std(rewards):.2f}"
-          f"  (max={max(rewards):.1f}  min={min(rewards):.1f})")
-    print(f"  Tasks:  {np.mean(tasks):.2f} ± {np.std(tasks):.2f}"
-          f"  (max={max(tasks)})")
-    print(f"{'='*55}")
+    print(f"  Reward : {np.mean(rewards):.2f} ± {np.std(rewards):.2f}"
+          f"  max={max(rewards):.1f}  min={min(rewards):.1f}")
+    print(f"  Tasks  : {np.mean(tasks):.2f} ± {np.std(tasks):.2f}"
+          f"  max={max(tasks)}  (≥1 task: {n_solved}/{args.n_ep})")
+    print(f"{'='*57}")
 
-    # Save
-    np.save(f"{args.out_dir}/mppi_rewards.npy", np.array(rewards))
-    np.save(f"{args.out_dir}/mppi_tasks.npy",   np.array(tasks))
-    print(f"Saved → {args.out_dir}/")
+    # ── Save ──────────────────────────────────────────────────────────────────
+    np.save(str(out_dir / 'mppi_rewards.npy'), np.array(rewards))
+    np.save(str(out_dir / 'mppi_tasks.npy'),   np.array(tasks))
+
+    plot_episode_diagnostics(results, out_dir)
+    print(f"\nAll outputs → {out_dir}/")
 
 
 if __name__ == '__main__':
