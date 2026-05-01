@@ -150,19 +150,34 @@ def plot_rollout_quality(model: KoopmanCVAE, samples: list, out_dir: Path,
         if L < cond_len + horizon + 2:
             results.append(None); continue
 
-        # Random start: pick a conditioning window anywhere in the episode
-        # (not always from t=0) so we sample different dynamics regions.
+        # ── 전체 에피소드 h, o를 먼저 encode (t=0부터 쌓음) ──────────────
+        enc    = model.encode_sequence(x, a)   # h_seq: (1, L, d_h)
+        h_seq  = enc['h_seq']   # (1, L, d_h)  — h_t: h AFTER processing x_t
+        # o_seq[t] = posterior(x_t, h_{t-1}).  h_seq[t] = recurrent(h_{t-1}, o_t, a_t)
+        # rollout()의 warm-up loop 시작 시 필요한 건 h_{t_start-1}
+        # h_seq[:, t] = h after step t → h before step t+1
+        # t_start=0 이면 h_init=0 (init_hidden)
+
+        # Random start
         max_start = L - cond_len - horizon - 1
         t_start   = int(rng.integers(0, max(1, max_start)))
         t_cond_e  = t_start + cond_len
         t_pred_e  = t_cond_e + horizon
+
+        # h_init: hidden state just BEFORE t_start
+        # h_seq[:, t] is h after processing step t (i.e. input to step t+1)
+        # → h before t_start = h_seq[:, t_start-1] if t_start > 0 else zeros
+        if t_start > 0:
+            h_init = h_seq[:, t_start - 1].to(x.device)  # (1, d_h)
+        else:
+            h_init = model.recurrent.init_hidden(1, x.device)
 
         x_cond = x[:, t_start:t_cond_e]
         a_cond = a[:, t_start:t_cond_e]
         a_plan = a[:, t_cond_e:t_pred_e]
         x_true = x[0, t_cond_e:t_pred_e].cpu().numpy()
 
-        pred    = model.rollout(x_cond, a_cond, a_plan)
+        pred    = model.rollout(x_cond, a_cond, a_plan, h_init=h_init)
         dq_pred = pred['q'][0].cpu().numpy()
         dq_true = x_true[:, dq_sl]
         dp_pred = pred['delta_p'][0].cpu().numpy()

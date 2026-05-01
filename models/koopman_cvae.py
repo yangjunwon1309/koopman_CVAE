@@ -1,78 +1,4 @@
 """
-koopman_cvae.py — KODAQ Full RSSM-Koopman
-==========================================
-
-Document → Implementation mapping (KODAQ §3):
-
-  Input x_t = [Δe_t (2048), Δp_t (42), q_t (9), q̇_t (9)] ∈ ℝ^{2108}
-    Δe_t = R3M(s_t) - R3M(s_1)   episode-first difference
-    Δp_t = p^obj_t - p^obj_1     object state difference
-
-  State Variables:
-    o_t ∈ ℝ^{d_o}  : lifted (Koopman) state
-    h_t ∈ ℝ^{d_h}  : GRU hidden (temporal history)
-    c_t ∈ {1..K}    : discrete skill label (from EXTRACT)
-    u_t ∈ ℝ^{d_u}  : encoded action
-
-  Generative model (§3.2):
-    h_{t+1}  = GRU(h_t, o_t, a_t)
-    p(c_t|h_t) = Cat(softmax(W_c h_t))
-    p(o_{t+1}|o_t,a_t,h_t) = N(Ā(w)·o_t + B̄(w)·u_t, σ²I)
-    Ā(w) = U · exp(Σ_k w_k log Λ_k) · U⁻¹   [log-space interpolation]
-    B̄(w) = U · (Σ_k w_k G_k)
-
-  Recognition model (§3.3):
-    q_φ(o_t|x_t,h_t) = N(μ_φ(x_t,h_t), diag(σ_φ²(x_t,h_t)))
-
-  Decoder (§3.4):
-    p(x_t|o_t) = p(Δe_t|o_t) · p(Δp_t|o_t) · p(q_t|o_t) · p(q̇_t|o_t)
-    4 independent MLP heads, MSE loss
-
-  Action encoder:
-    u_t = ψ_θ(a_t)   (MLP)
-
-  Loss (§4):
-    L = L_rec - λ1·L_dyn - λ2·L_skill - λ3·L_reg
-    Phase 1: L_rec only
-    Phase 2: + λ1·L_dyn + λ2·L_skill
-    Phase 3: + λ3·L_reg
-
-Architecture notes:
-  - A_k, B_k initialized near identity (A_k = I + ε, B_k = ε) per §6
-  - μ_k initialized from EXTRACT cluster centroids (external call)
-  - U shared across skills (Assumption 2)
-  - Stability: tanh(r^(k)_i)·e^{iθ^(k)_i} guarantees |λ^(k)_i| ≤ 1 (Assumption 3)
-
-Module separation:
-  losses.py   : all loss functions (pure functions, no nn.Module state)
-  koopman_cvae.py : nn.Module classes + forward/loss delegation
-"""
-
-"""
-koopman_cvae.py — KODAQ v5
-============================
-
-v5 changes over v4:
-  1. RewardCategoricalHead : step reward {0,1}, Two-Hot CE, bins [0, 5], B=16
-  2. QHead                 : Bellman TD target, Two-Hot CE, bins [0, 5], ensemble
-  3. PolicyPrior           : Gaussian pi(u|o), TD-MPC2 policy loss
-  4. Target Q network      : EMA copy of QHead (tau=0.005)
-  5. MovingPercentileScale : rho normalization for entropy/Q balance
-  6. Zero-init last layer  : reward head & Q head (uniform initial distribution)
-  7. Joint loss            : L_total = L_wm + lam_R*L_R + lam_Q*L_Q + lam_pi*L_pi
-
-Bin design [v_min=0, v_max=5], B=16 bins:
-  - reward head: predicts step r_t in {0,1} — always within [0,5], no clamp
-  - Q head     : predicts TD target y_t = r_t + gamma*Q_bar
-                 worst case: 1 + 0.99*4 = 4.96 < 5.0 — no clamp needed
-
-rewards input = step reward {0, 1} per timestep (NOT accumulated).
-
-World model components (v4, unchanged):
-  ActionEncoder, PosteriorEncoder, RecurrentTransition,
-  SkillPrior, SkillKoopmanOperator, MultiHeadDecoder
-"""
-"""
 koopman_cvae.py — KODAQ v5
 ============================
 
@@ -1164,11 +1090,21 @@ class KoopmanCVAE(nn.Module):
         return action.squeeze(0)
 
     @torch.no_grad()
-    def rollout(self, x_cond, a_cond, a_plan):
+    def rollout(self, x_cond, a_cond, a_plan, h_init=None, o_init=None):
+        """
+        Koopman rollout from a conditioning window.
+
+        h_init, o_init: pre-computed hidden state and latent at the START of
+        x_cond. If provided (recommended for mid-episode rollout), x_cond
+        warm-up begins from these states instead of h=0.
+
+        If None: h starts from zeros (correct only at episode start t=0).
+        """
         B      = x_cond.shape[0]
         device = x_cond.device
-        h      = self.recurrent.init_hidden(B, device)
-        o      = None
+        h      = h_init if h_init is not None else self.recurrent.init_hidden(B, device)
+        o      = o_init  # may be None, will be set on first posterior sample
+
         for t in range(x_cond.shape[1]):
             o, _, _ = self.posterior.sample(x_cond[:, t], h)
             h = self.recurrent(h, o, a_cond[:, t])
