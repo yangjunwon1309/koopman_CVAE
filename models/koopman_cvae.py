@@ -102,6 +102,10 @@ class KoopmanCVAEConfig:
     td_horizon:          int   = 4      # H: rollout steps for H-step TD (4 or 8)
     mopo_beta:           float = 1.0    # beta: MOPO penalty (mean - beta*std)
     use_ensemble_reward: bool  = False  # False=single head, True=ensemble
+
+    # ── v5.2 LQR policy prior for Q target ───────────────────────────────────
+    use_lqr_policy:  bool  = False  # True=LQR rollout for Q target
+    lqr_horizon:     int   = 4      # H for LQR Q target (≤ td_horizon)
     tau:           float = 0.005  # EMA rate for target Q update
     gamma:         float = 0.99   # discount
 
@@ -657,6 +661,10 @@ class KoopmanCVAE(nn.Module):
         for p in self._detach_q_head.parameters():
             p.requires_grad_(False)
 
+        # LQR planner (set externally via model.set_lqr_planner())
+        # Not a nn.Module — not saved in state_dict
+        self._lqr_planner = None   # type: Optional['KODAQLQRPlanner']
+
         # Moving percentile tracker (non-parameter, saved in checkpoint manually)
         self.scale_tracker = MovingPercentileScale(decay=0.99)
 
@@ -678,6 +686,20 @@ class KoopmanCVAE(nn.Module):
             print("[KoopmanCVAE v5] Initialized U from centroid SVD.")
 
     # ── Target Q soft update (call after each optimizer step) ────────────────
+
+    def set_lqr_planner(self, planner):
+        """
+        LQR planner를 외부에서 주입.
+        train_kodaq.py에서 resume 시 호출:
+            from lqr_koopman import KODAQLQRPlanner, LQRConfig
+            planner = KODAQLQRPlanner(model, LQRConfig(...))
+            planner.precompute_gains()
+            model.set_lqr_planner(planner)
+        """
+        self._lqr_planner = planner
+        print(f"[KoopmanCVAE] LQR planner set. "
+              f"use_lqr_policy={self.cfg.use_lqr_policy}  "
+              f"lqr_horizon={self.cfg.lqr_horizon}")
 
     @torch.no_grad()
     def soft_update_target_Q(self):
@@ -714,7 +736,8 @@ class KoopmanCVAE(nn.Module):
         actions:      torch.Tensor,
         skill_labels: Optional[torch.Tensor] = None,
         mask:         Optional[torch.Tensor] = None,
-        rewards:      Optional[torch.Tensor] = None,  # (B, T) step reward {0, 1}
+        rewards:      Optional[torch.Tensor] = None,   # (B, T) step reward {0,1}
+        goal_z_seq:   Optional[torch.Tensor] = None,   # (B, T, m) LQR goal latent
     ) -> Dict[str, torch.Tensor]:
 
         B, T, _ = x_batch.shape
@@ -781,6 +804,8 @@ class KoopmanCVAE(nn.Module):
             skill_labels=skill_labels,
             mask=mask,
             rewards=rewards,
+            goal_z_seq=goal_z_seq,
+            h_seq=h_seq,
         )
 
         return {
@@ -792,6 +817,7 @@ class KoopmanCVAE(nn.Module):
             'skill_logits': skill_logits,
             'recon':        recon,
         }
+
 
     # ── Loss computation ─────────────────────────────────────────────────────
 
@@ -808,7 +834,9 @@ class KoopmanCVAE(nn.Module):
         skill_logits: torch.Tensor,          # (B, T, K)
         skill_labels: Optional[torch.Tensor],
         mask:         Optional[torch.Tensor],
-        rewards:      Optional[torch.Tensor],  # (B, T) accumulated
+        rewards:      Optional[torch.Tensor],  # (B, T) step reward {0,1}
+        goal_z_seq:   Optional[torch.Tensor] = None,  # (B, T, m) pre-computed goal z*
+        h_seq:        Optional[torch.Tensor] = None,  # (B, T, d_h) for LQR
     ) -> Dict[str, torch.Tensor]:
 
         cfg    = self.cfg
@@ -946,6 +974,43 @@ class KoopmanCVAE(nn.Module):
                     q_terminal = self.q_head_target.expected_value(
                         z_roll, u_term, return_type='min'
                     )   # (B, T-1)
+                    q_target_scalar = G + (gm ** H) * q_terminal
+
+                elif (cfg.use_lqr_policy
+                        and self._lqr_planner is not None
+                        and goal_z_seq is not None
+                        and h_seq is not None):
+                    # ── Mode D: LQR H-step rollout ───────────────────────
+                    # u_k = Σ_j w_j·(M_j·z*_t - L_j·ẑ_k)  (skill-weighted)
+                    # ẑ_{k+1} = Ā·ẑ_k + B̄·u_k
+                    # R̂_pen_k = ensemble_head.penalized_reward(ẑ_k, u_k)
+                    # y_t = Σ γ^k·R̂_pen_k + γ^H·Q̄(ẑ_H, u_H)
+                    H   = cfg.lqr_horizon
+                    gm  = cfg.gamma
+
+                    u_lqr_seq, z_roll_seq = self._lqr_planner.lqr_rollout_batch(
+                        o_seq=o_seq,
+                        h_seq=h_seq,
+                        goal_z_seq=goal_z_seq,
+                        H=H,
+                        gamma=gm,
+                    )
+                    # u_lqr_seq:  (B, T-1, H, d_u)
+                    # z_roll_seq: (B, T-1, H+1, m)
+
+                    G = torch.zeros(B_b, T1, device=device)
+                    for k in range(H):
+                        z_k = z_roll_seq[:, :, k]    # (B, T-1, m)
+                        u_k = u_lqr_seq[:, :, k]     # (B, T-1, d_u)
+                        R_pen = self.reward_ensemble_head.penalized_reward(
+                            z_k, u_k)                # (B, T-1)
+                        G = G + (gm ** k) * R_pen
+
+                    # Terminal bootstrap
+                    z_H   = z_roll_seq[:, :, H]      # (B, T-1, m)
+                    u_H   = u_lqr_seq[:, :, -1]      # (B, T-1, d_u)
+                    q_terminal = self.q_head_target.expected_value(
+                        z_H, u_H, return_type='min')  # (B, T-1)
                     q_target_scalar = G + (gm ** H) * q_terminal
 
                 else:

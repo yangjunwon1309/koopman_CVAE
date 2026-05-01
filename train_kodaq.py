@@ -166,14 +166,16 @@ class Trainer:
             skill_labels = batch['skill_labels']
             mask         = batch.get('mask', None)
             rewards      = batch.get('rewards', None)   # step reward {0,1}
+            goal_z_seq   = batch.get('goal_z_seq', None)  # (B, T, m) LQR goal
 
         x_seq        = x_seq.to(self.device)
         actions      = actions.to(self.device)
         skill_labels = skill_labels.to(self.device)
-        if mask    is not None: mask    = mask.to(self.device)
-        if rewards is not None: rewards = rewards.to(self.device)
+        if mask       is not None: mask       = mask.to(self.device)
+        if rewards    is not None: rewards    = rewards.to(self.device)
+        if goal_z_seq is not None: goal_z_seq = goal_z_seq.to(self.device)
 
-        return self.model(x_seq, actions, skill_labels, mask, rewards)
+        return self.model(x_seq, actions, skill_labels, mask, rewards, goal_z_seq)
 
     # ── Epoch helpers ────────────────────────────────────────────────────────
 
@@ -555,7 +557,18 @@ def parse_args():
     p.add_argument('--resume_epochs',      type=int,   default=100)
     p.add_argument('--resume_lr',          type=float, default=1e-4)
 
-    p.add_argument('--td_horizon',         type=int,   default=4,
+    p.add_argument('--use_lqr_policy',      action='store_true',
+                   help='Use LQR rollout for Q target (Mode D). '
+                        'Requires --goal_z_path and --u_bounds_path.')
+    p.add_argument('--lqr_horizon',          type=int,   default=4,
+                   help='H-step LQR rollout for Q target.')
+    p.add_argument('--goal_z_path',          type=str,   default=None,
+                   help='Path to pre-computed goal_latent_map.npz.')
+    p.add_argument('--u_bounds_path',        type=str,   default=None,
+                   help='Path to u_bounds.npz from survey.')
+    p.add_argument('--lqr_Q_scale',          type=float, default=1.0)
+    p.add_argument('--lqr_R_scale',          type=float, default=10.0)
+    p.add_argument('--td_horizon',           type=int,   default=4,
                    help='H-step rollout horizon for MOPO TD target (4 or 8).')
     p.add_argument('--mopo_beta',          type=float, default=1.0,
                    help='MOPO penalty: mean - beta*std.')
@@ -661,6 +674,8 @@ if __name__ == '__main__':
         resume_cfg.entropy_coef        = args.entropy_coef
         resume_cfg.log_std_min         = args.log_std_min
         resume_cfg.log_std_max         = args.log_std_max
+        resume_cfg.use_lqr_policy    = args.use_lqr_policy
+        resume_cfg.lqr_horizon       = args.lqr_horizon
         resume_cfg.lambda_reward       = args.lambda_reward
         resume_cfg.lambda_q            = args.lambda_q
         resume_cfg.lambda_pi           = args.lambda_pi
@@ -735,6 +750,28 @@ if __name__ == '__main__':
     else:
         model = KoopmanCVAE(cfg)
         args.resume_stage = None
+
+    # ── LQR planner setup (Mode D) ────────────────────────────────────────
+    if getattr(args, 'use_lqr_policy', False):
+        if args.goal_z_path is None:
+            print("[WARNING] --use_lqr_policy requires --goal_z_path. "
+                  "Falling back to policy prior.")
+            if is_resume: resume_cfg.use_lqr_policy = False
+            else: cfg.use_lqr_policy = False
+        else:
+            from lqr_koopman import KODAQLQRPlanner, LQRConfig,                 KODAQLQRPlanner as _Planner
+            lqr_cfg = LQRConfig(
+                Q_scale=args.lqr_Q_scale,
+                R_scale=args.lqr_R_scale,
+            )
+            lqr_planner = KODAQLQRPlanner(model, lqr_cfg)
+            if args.u_bounds_path and Path(args.u_bounds_path).exists():
+                lqr_planner.load_u_bounds(args.u_bounds_path)
+            lqr_planner.precompute_gains()
+            model.set_lqr_planner(lqr_planner)
+            print(f"[LQR] Planner ready.  "
+                  f"goal_z_path={args.goal_z_path}  "
+                  f"lqr_horizon={args.lqr_horizon}", flush=True)
 
     n_total = sum(p.numel() for p in model.parameters() if p.requires_grad)
     n_frozen_total = sum(p.numel() for p in model.parameters() if not p.requires_grad)
