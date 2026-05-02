@@ -307,16 +307,28 @@ class Trainer:
             phase   = self.model.cfg.phase
             ep_sec  = time.time() - t_ep
             tot_min = (time.time() - t0) / 60.0
-            line = (f"[{stage_tag}|Ph{phase}] Ep {local_ep:4d}/{n_epochs}"
+
+            # Goal proposal phase tag
+            warmup_ep = getattr(self.model.cfg, 'warmup_goal_epochs', 0)
+            use_goal  = getattr(self.model.cfg, 'use_goal_proposal', False)
+            if use_goal:
+                gp_tag = 'B' if global_ep >= warmup_ep else 'A'
+            else:
+                gp_tag = '-'
+
+            line = (f"[{stage_tag}|Ph{phase}|G{gp_tag}] Ep {local_ep:4d}/{n_epochs}"
                     f"  {ep_sec:.1f}s  ({tot_min:.0f}m)")
 
             for k in ['loss', 'loss_wm', 'loss_rec', 'loss_dyn',
                       'loss_skill', 'loss_reg']:
                 if metrics.get(k, 0.0) != 0.0:
                     line += f"  {k.replace('loss_','')[:4]}={metrics[k]:.4f}"
-            for k in ['loss_reward', 'loss_q', 'loss_pi', 'loss_goal']:
+            for k in ['loss_reward', 'loss_q', 'loss_pi']:
                 if k in metrics and metrics.get(k, 0.0) != 0.0:
                     line += f"  {k.replace('loss_','')[:4]}={metrics[k]:.4f}"
+            # loss_goal: always show when use_goal_proposal (even if 0 in Phase A)
+            if use_goal and 'loss_goal' in metrics:
+                line += f"  goal={metrics['loss_goal']:.4f}"
             if 'rho' in metrics:
                 line += f"  rho={metrics['rho']:.3f}"
             if 'q_scale' in metrics:
@@ -324,6 +336,11 @@ class Trainer:
             if val_metrics:
                 line += f"  | val={val_metrics.get('loss', 0):.4f}"
             print(line, flush=True)
+
+            # Phase transition notice
+            if use_goal and global_ep == warmup_ep:
+                print(f"  >>> [Goal Proposal] Phase A→B: π_goal Q-maximize ACTIVATED "
+                      f"(ep {global_ep})", flush=True)
 
             if local_ep % self.args.save_freq == 0:
                 self.save_checkpoint(f'epoch_{stage_tag}_{local_ep:04d}.pt')
