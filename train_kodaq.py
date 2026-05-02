@@ -283,6 +283,8 @@ class Trainer:
         for local_ep in range(1, n_epochs + 1):
             global_ep = epoch_offset + local_ep
             self._maybe_update_phase(global_ep)
+            # Notify model of current epoch for warmup gating
+            self.model.set_current_epoch(global_ep)
             t_ep = time.time()
 
             metrics = self.train_epoch(train_loader)
@@ -563,6 +565,10 @@ def parse_args():
                    help='Train pi_goal for goal-conditioned LQR.')
     p.add_argument('--goal_kl_weight',       type=float, default=0.1)
     p.add_argument('--lambda_goal',          type=float, default=0.1)
+    p.add_argument('--warmup_goal_epochs',   type=int,   default=30,
+                   help='Epochs before pi_goal is activated (KL-only warmup).')
+    p.add_argument('--warmup_qs_threshold',  type=float, default=1.5,
+                   help='Min Qs scale required to activate pi_goal.')
     p.add_argument('--no_recon_delta_e',     action='store_true',
                    help='Disable R3M feature recon to free encoder capacity.')
     p.add_argument('--use_lqr_policy',      action='store_true',
@@ -687,6 +693,8 @@ if __name__ == '__main__':
         resume_cfg.use_goal_proposal   = args.use_goal_proposal
         resume_cfg.goal_kl_weight      = args.goal_kl_weight
         resume_cfg.lambda_goal         = args.lambda_goal
+        resume_cfg.warmup_goal_epochs  = args.warmup_goal_epochs
+        resume_cfg.warmup_qs_threshold = args.warmup_qs_threshold
         resume_cfg.recon_delta_e       = not args.no_recon_delta_e
         resume_cfg.lambda_reward       = args.lambda_reward
         resume_cfg.lambda_q            = args.lambda_q

@@ -108,10 +108,12 @@ class KoopmanCVAEConfig:
     lqr_horizon:     int   = 4      # H for LQR Q target (≤ td_horizon)
 
     # ── v5.3 Goal Proposal Policy ─────────────────────────────────────────────
-    use_goal_proposal: bool  = False  # True=learn π_goal
-    goal_latent_dim:   int   = 128    # z_g dimension (= koopman_dim)
-    goal_kl_weight:    float = 0.1    # β: KL(π_goal || N(z_g^seg))
-    lambda_goal:       float = 0.1    # L_goal loss weight
+    use_goal_proposal:  bool  = False  # True=learn π_goal
+    goal_latent_dim:    int   = 128    # z_g dimension (= koopman_dim)
+    goal_kl_weight:     float = 0.1    # β: KL(π_goal || N(z_g^seg))
+    lambda_goal:        float = 0.1    # L_goal loss weight
+    warmup_goal_epochs: int   = 30     # epochs before π_goal is activated
+    warmup_qs_threshold: float = 1.5   # min Qs scale before π_goal activates
 
     # ── v5.3 delta_e reconstruction toggle ───────────────────────────────────
     recon_delta_e:   bool  = True   # False=skip R3M feature recon
@@ -783,7 +785,16 @@ class KoopmanCVAE(nn.Module):
         self._lqr_planner = planner
         print(f"[KoopmanCVAE] LQR planner set. "
               f"use_lqr_policy={self.cfg.use_lqr_policy}  "
-              f"lqr_horizon={self.cfg.lqr_horizon}")
+              f"use_goal_proposal={self.cfg.use_goal_proposal}")
+
+    def set_current_epoch(self, epoch: int):
+        """
+        Trainer가 매 epoch 시작 시 호출.
+        warmup_goal_epochs 판단에 사용.
+        Phase A (epoch < warmup): π_goal은 KL만 학습 (z_g^seg 모방)
+        Phase B (epoch >= warmup AND Qs > threshold): π_goal Q-maximize 활성화
+        """
+        self.cfg._current_epoch = epoch
 
     @torch.no_grad()
     def soft_update_target_Q(self):
@@ -1167,52 +1178,77 @@ class KoopmanCVAE(nn.Module):
 
         # ── v5.3 Goal Proposal Loss ───────────────────────────────────────
         # L_goal = -E[Q_target(z_t, u_lqr(ẑ_g))] + β·KL(π_goal||N(z_g^seg))
-        # gradient: π_goal → ẑ_g → u_lqr = M·ẑ_g - L·z_t
-        #           M, L are fixed (detached DARE gains)
-        #           Q_target: stop-gradient (EMA target Q)
-        loss_goal = torch.tensor(0.0, device=device)
+        #
+        # Warmup guard (cfg.warmup_goal_epochs):
+        #   - Phase A (epoch < warmup): use z_g = z_g^seg directly (no π_goal)
+        #     → Q learns with stable LQR actions toward real goals
+        #     → loss_goal = 0 (no π_goal gradient)
+        #   - Phase B (epoch >= warmup, Qs > warmup_qs_threshold):
+        #     → π_goal activated, learns to propose goals that maximize Q
+        #
+        # This prevents early π_goal exploit before Q has meaningful signal.
+        loss_goal      = torch.tensor(0.0, device=device)
+        goal_phase_str = 'off'
+
         if (cfg.use_goal_proposal
                 and self._lqr_planner is not None
                 and goal_z_seq is not None
                 and h_seq is not None
                 and cfg.phase >= 2):
-            o_in_g   = o_seq[:, :-1].detach()       # (B, T-1, m)
-            h_in_g   = h_seq[:, :-1].detach()        # (B, T-1, d_h)
-            z_g_seg  = goal_z_seq[:, :-1].detach()   # (B, T-1, m) prior mean
 
-            # Sample ẑ_g ~ π_goal(z_t, h_t)
+            o_in_g  = o_seq[:, :-1].detach()      # (B, T-1, m)
+            h_in_g  = h_seq[:, :-1].detach()       # (B, T-1, d_h)
+            z_g_seg = goal_z_seq[:, :-1].detach()  # (B, T-1, m) prior mean
+
             B_b, T1, _ = o_in_g.shape
-            o_flat  = o_in_g.reshape(B_b * T1, -1)
-            h_flat  = h_in_g.reshape(B_b * T1, -1)
-            zg_flat, mu_g_flat, lv_g_flat = self.goal_proposal(o_flat, h_flat)
-            # zg_flat: (B*T1, m)
+            o_flat      = o_in_g.reshape(B_b * T1, -1)
+            h_flat      = h_in_g.reshape(B_b * T1, -1)
+            zg_seg_flat = z_g_seg.reshape(B_b * T1, -1)
 
-            # LQR action: u = M·ẑ_g - L·z_t
-            # M, L come from planner's pre-computed gains (weighted by skill)
-            # Use skill-weighted M, L  (batch einsum, M/L detached)
             if self._lqr_planner._L_tensor is not None:
                 w_flat = self.skill_prior.soft_weights(h_flat)  # (B*T1, K)
-                # Skill-weighted L, M
                 L_w = torch.einsum('bk,kdm->bdm',
                                     w_flat,
-                                    self._lqr_planner._L_tensor.detach())  # (B*T1, d_u, m)
+                                    self._lqr_planner._L_tensor.detach())
                 M_w = torch.einsum('bk,kdm->bdm',
                                     w_flat,
-                                    self._lqr_planner._M_tensor.detach())  # (B*T1, d_u, m)
-                # u_lqr = M·ẑ_g - L·z_t  (gradient through zg_flat only)
-                u_lqr_g = ((M_w @ zg_flat.unsqueeze(-1)).squeeze(-1)
-                           - (L_w @ o_flat.detach().unsqueeze(-1)).squeeze(-1))  # (B*T1, d_u)
+                                    self._lqr_planner._M_tensor.detach())
 
-                # Q_target(z_t, u_lqr) — stop-gradient Q
-                q_goal = self.q_head_target.expected_value(
-                    o_flat, u_lqr_g, return_type='min')  # (B*T1,)
+                # ── Decide which goal to use ───────────────────────────────
+                qs_ready = self.scale_tracker.scale > cfg.warmup_qs_threshold
+                ep_ready = (getattr(cfg, '_current_epoch', 0)
+                            >= cfg.warmup_goal_epochs)
 
-                # KL(π_goal || N(z_g_seg, I))
-                zg_seg_flat = z_g_seg.reshape(B_b * T1, -1)
-                kl_goal = self.goal_proposal.kl_to_prior(
-                    mu_g_flat, lv_g_flat, zg_seg_flat)
+                if qs_ready and ep_ready:
+                    # Phase B: π_goal proposes z_g, gradient flows back
+                    goal_phase_str  = 'active'
+                    zg_flat, mu_g_flat, lv_g_flat = self.goal_proposal(
+                        o_flat, h_flat)
+                    u_lqr_g = ((M_w @ zg_flat.unsqueeze(-1)).squeeze(-1)
+                               - (L_w @ o_flat.unsqueeze(-1)).squeeze(-1))
 
-                loss_goal = -q_goal.mean() + cfg.goal_kl_weight * kl_goal
+                    q_goal  = self.q_head_target.expected_value(
+                        o_flat, u_lqr_g, return_type='min')
+                    kl_goal = self.goal_proposal.kl_to_prior(
+                        mu_g_flat, lv_g_flat, zg_seg_flat)
+                    loss_goal = -q_goal.mean() + cfg.goal_kl_weight * kl_goal
+
+                else:
+                    # Phase A warmup: z_g = z_g^seg (fixed transition point)
+                    # No gradient to π_goal; Q learns stable LQR signal.
+                    goal_phase_str = f'warmup(Qs={self.scale_tracker.scale:.2f})'
+                    with torch.no_grad():
+                        u_lqr_fixed = ((M_w @ zg_seg_flat.unsqueeze(-1)).squeeze(-1)
+                                       - (L_w @ o_flat.unsqueeze(-1)).squeeze(-1))
+                    # Use fixed u_lqr to build a Q target for the Q head loss
+                    # (handled in Mode D above; here loss_goal stays 0)
+                    # Optionally: pre-train π_goal to output z_g^seg
+                    # via supervised loss (imitation of the oracle goal)
+                    _, mu_g_flat, lv_g_flat = self.goal_proposal(o_flat, h_flat)
+                    loss_goal = cfg.goal_kl_weight * self.goal_proposal.kl_to_prior(
+                        mu_g_flat, lv_g_flat, zg_seg_flat)
+                    # Pure KL only during warmup: π_goal learns to mimic z_g^seg
+                    # before being released to optimize Q
 
         # ── Total loss ────────────────────────────────────────────────────
         loss_total = (
