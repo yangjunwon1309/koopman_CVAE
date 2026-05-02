@@ -42,7 +42,6 @@ import torch
 import torch.nn.functional as F
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
-from pathlib import Path
 
 from models.koopman_cvae import KoopmanCVAE
 from models.losses import blend_koopman, two_hot_decode
@@ -60,27 +59,35 @@ class MPPIConfig:
     num_elites:     int   = 64     # top-k for weight computation
     horizon:        int   = 5      # planning horizon H
 
+    # ── Goal-conditioned sampling ─────────────────────────────────────────────
+    # num_goal_samples개의 z_g를 π_goal에서 샘플,
+    # 각 z_g당 trajs_per_goal개의 LQR rollout 생성
+    # 전체 goal trajs = num_goal_samples * trajs_per_goal
+    # 나머지 = num_pi_trajs (policy prior) + gaussian noise
+    goal_ratio:        float = 0.0   # 0=disabled, >0 = fraction of N for goal trajs
+    # num_goal_samples * trajs_per_goal ≈ goal_ratio * num_samples
+    num_goal_samples:  int   = 10    # μ_goal 샘플 수
+    # trajs_per_goal = (goal_ratio * num_samples) // num_goal_samples
+
     # ── MPPI hyperparameters ──────────────────────────────────────────────────
-    temperature:    float = 0.5    # softmax temperature (higher=explore, lower=exploit)
-    init_std:       float = 2.0    # initial std of action distribution
-    min_std:        float = 0.05   # minimum std (prevents collapse)
-    max_std:        float = 2.0    # maximum std
+    temperature:    float = 0.5    # softmax temperature
+    init_std:       float = 2.0    # initial std
+    min_std:        float = 0.05
+    max_std:        float = 2.0
 
     # ── Discount ──────────────────────────────────────────────────────────────
     gamma:          float = 0.99
 
     # ── Action decoder ────────────────────────────────────────────────────────
-    action_inv_steps: int  = 30    # gradient steps for u → a inversion
+    action_inv_steps: int   = 30
     action_inv_lr:    float = 0.05
 
-    # ── Iterations per step ───────────────────────────────────────────────────
-    iterations:     int   = 6      # MPPI CEM iterations
-    # TD-MPC2: iterations += 2 * int(action_dim >= 20)
-    # latent dim d_u=64 이므로 +2 적용
+    # ── Iterations ────────────────────────────────────────────────────────────
+    iterations:     int   = 6
     iterations_large_action: int = 2
 
     # ── Momentum ──────────────────────────────────────────────────────────────
-    momentum:       float = 0.1    # prev_mean에 대한 warm-start 비율 (0=no momentum)
+    momentum:       float = 0.1
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -183,6 +190,81 @@ class KODAQMPPIPlanner:
 
         return G   # (N,)
 
+    # ── Goal-conditioned trajectory sampling ─────────────────────────────────
+
+    @torch.no_grad()
+    def _sample_goal_trajs(
+        self,
+        z0: torch.Tensor,   # (1, m)
+        h0: torch.Tensor,   # (1, d_h)
+        w0: torch.Tensor,   # (1, K)
+        H:  int,
+        n_goals:      int,  # num_goal_samples
+        trajs_per_goal: int,
+    ) -> torch.Tensor:
+        """
+        π_goal로 n_goals개 z_g 샘플 → 각 z_g에 대해 trajs_per_goal개 LQR rollout.
+        Total: n_goals * trajs_per_goal trajectories → (H, n_goals*trajs_per_goal, d_u)
+
+        u_k = M·z_g - L·z_k  (M, L: skill-weighted, fixed)
+        z_{k+1} = Ā·z_k + B̄·u_k
+        """
+        planner = self.model._lqr_planner
+        if planner is None or planner._L_tensor is None:
+            return None
+
+        model   = self.model
+        koop    = model.koopman
+        log_lam = koop.get_log_lambdas()
+        dev     = self.device
+        N_total = n_goals * trajs_per_goal
+
+        # ── Sample n_goals goal latents ───────────────────────────────────
+        z_rep  = z0.expand(n_goals, -1)   # (n_goals, m)
+        h_rep  = h0.expand(n_goals, -1)   # (n_goals, d_h)
+        z_g_samples, _, _ = model.goal_proposal(z_rep, h_rep)  # (n_goals, m)
+
+        # ── Expand to N_total: each z_g repeated trajs_per_goal times ─────
+        z_g_exp = z_g_samples.unsqueeze(1).expand(
+            n_goals, trajs_per_goal, -1
+        ).reshape(N_total, -1)   # (N_total, m)
+
+        # Skill weights (same for all, since all start at z0)
+        w_exp = w0.expand(N_total, -1)   # (N_total, K)
+
+        # Gain matrices (skill-weighted, fixed)
+        L_w = torch.einsum('bk,kdm->bdm',
+                            w_exp,
+                            planner._L_tensor.detach())  # (N_total, d_u, m)
+        M_w = torch.einsum('bk,kdm->bdm',
+                            w_exp,
+                            planner._M_tensor.detach())  # (N_total, d_u, m)
+
+        # ── H-step LQR rollout ────────────────────────────────────────────
+        z_cur  = z0.expand(N_total, -1).clone()   # (N_total, m)
+        u_seq  = []
+
+        for k in range(H):
+            # u_k = M·z_g - L·z_k  (z_g fixed per trajectory)
+            u_k = ((M_w @ z_g_exp.unsqueeze(-1)).squeeze(-1)
+                   - (L_w @ z_cur.unsqueeze(-1)).squeeze(-1))  # (N_total, d_u)
+
+            # clip to surveyed bounds
+            if planner.cfg.use_u_bounds and planner.u_min is not None:
+                u_min_t = torch.FloatTensor(planner.u_min).to(dev)
+                u_max_t = torch.FloatTensor(planner.u_max).to(dev)
+                u_k = u_k.clamp(u_min_t, u_max_t)
+
+            u_seq.append(u_k)
+
+            # Koopman step
+            A_bar, B_bar, _, _ = blend_koopman(
+                log_lam, koop.theta_k, koop.G_k, koop.U, w_exp)
+            z_cur = ((A_bar @ z_cur.unsqueeze(-1)).squeeze(-1)
+                     + (B_bar @ u_k.unsqueeze(-1)).squeeze(-1))
+
+        return torch.stack(u_seq, dim=0)   # (H, N_total, d_u)
+
     # ── Policy prior trajectory sampling ─────────────────────────────────────
 
     @torch.no_grad()
@@ -229,12 +311,16 @@ class KODAQMPPIPlanner:
         self,
         z0: torch.Tensor,   # (1, m)  current latent
         w0: torch.Tensor,   # (1, K)  current skill weights
+        h0: Optional[torch.Tensor] = None,  # (1, d_h) for goal proposal
     ) -> torch.Tensor:
         """
         MPPI planning → optimal mean (H, d_u).
 
-        Returns: mean[0] as the action to execute this step.
-        Full mean is stored as prev_mean for next step.
+        Sample composition (N=512, goal_ratio=0.95, num_goal_samples=10 예시):
+          goal trajs:   10 × 48 = 480  (π_goal → LQR rollout)
+          pi trajs:     24              (policy prior rollout)
+          gaussian:      8              (mean ± std)
+          total:        512
         """
         cfg  = self.cfg
         H    = cfg.horizon
@@ -244,61 +330,83 @@ class KODAQMPPIPlanner:
 
         # ── Init mean ─────────────────────────────────────────────────────────
         if self.prev_mean is not None:
-            # Receding horizon warm-start: shift by 1, append zero
             mean = torch.cat([
                 self.prev_mean[1:],
                 torch.zeros(1, d_u, device=dev)
-            ], dim=0)   # (H, d_u)
+            ], dim=0)
             if cfg.momentum > 0:
                 mean = (1 - cfg.momentum) * mean
         else:
-            mean = torch.zeros(H, d_u, device=dev)   # cold start = 0
+            mean = torch.zeros(H, d_u, device=dev)
 
         std = cfg.init_std * torch.ones(H, d_u, device=dev)
 
-        # ── Policy prior trajectories (warm-start) ────────────────────────────
+        # ── Compute sample budget ─────────────────────────────────────────────
+        has_goal = (cfg.goal_ratio > 0
+                    and h0 is not None
+                    and hasattr(self.model, 'goal_proposal')
+                    and self.model._lqr_planner is not None)
+
+        if has_goal:
+            n_goal_total   = int(cfg.goal_ratio * N)
+            n_goals        = cfg.num_goal_samples
+            trajs_per_goal = max(1, n_goal_total // n_goals)
+            n_goal_total   = n_goals * trajs_per_goal   # actual
+            n_pi           = cfg.num_pi_trajs
+            n_gauss        = max(0, N - n_goal_total - n_pi)
+        else:
+            n_goal_total   = 0
+            n_pi           = cfg.num_pi_trajs
+            n_gauss        = N - n_pi
+
+        # ── Policy prior trajectories ─────────────────────────────────────────
         pi_trajs = self._sample_pi_trajs(z0, w0, H)   # (H, n_pi, d_u)
 
         # ── MPPI iterations ───────────────────────────────────────────────────
         for it in range(self._n_iter):
 
-            # Sample Gaussian perturbations around current mean
-            n_gauss = N - cfg.num_pi_trajs
-            eps     = torch.randn(H, n_gauss, d_u, device=dev)
-            gauss_trajs = mean.unsqueeze(1) + std.unsqueeze(1) * eps
-            # (H, n_gauss, d_u) — no clamp: latent u is unbounded
-            # (clipping is done in reward_ensemble_head / Q head which are trained
-            #  on encoder-mapped actions; soft signal discourages OOD values)
+            traj_list = [pi_trajs]   # always include pi_trajs
 
-            # Concatenate: pi_trajs first, then gaussian
-            u_plans = torch.cat([pi_trajs, gauss_trajs], dim=1)  # (H, N, d_u)
+            # Goal-conditioned trajs
+            if has_goal:
+                goal_trajs = self._sample_goal_trajs(
+                    z0, h0, w0, H,
+                    n_goals=n_goals,
+                    trajs_per_goal=trajs_per_goal,
+                )
+                if goal_trajs is not None:
+                    traj_list.append(goal_trajs)
 
-            # Estimate value for all N trajectories
-            values = self.estimate_value(z0, u_plans, w0)   # (N,)
-            values = values.nan_to_num_(0.0)
+            # Gaussian noise trajs
+            if n_gauss > 0:
+                eps         = torch.randn(H, n_gauss, d_u, device=dev)
+                gauss_trajs = mean.unsqueeze(1) + std.unsqueeze(1) * eps
+                traj_list.append(gauss_trajs)
 
-            # ── Elite selection ────────────────────────────────────────────
-            elite_idx    = torch.topk(values, cfg.num_elites, dim=0).indices
-            elite_values = values[elite_idx]               # (num_elites,)
-            elite_trajs  = u_plans[:, elite_idx, :]        # (H, num_elites, d_u)
+            u_plans = torch.cat(traj_list, dim=1)   # (H, N_actual, d_u)
 
-            # ── Softmax weights (TD-MPC2) ──────────────────────────────────
+            # Value estimation
+            values = self.estimate_value(z0, u_plans, w0).nan_to_num_(0.0)
+
+            # Elite selection
+            n_elite      = min(cfg.num_elites, u_plans.shape[1])
+            elite_idx    = torch.topk(values, n_elite, dim=0).indices
+            elite_values = values[elite_idx]
+            elite_trajs  = u_plans[:, elite_idx, :]
+
+            # Softmax weights
             score = torch.softmax(
                 elite_values / cfg.temperature, dim=0
-            ).unsqueeze(0).unsqueeze(-1)   # (1, num_elites, 1)
+            ).unsqueeze(0).unsqueeze(-1)
 
-            # ── Weighted mean & std update ─────────────────────────────────
-            mean = (score * elite_trajs).sum(dim=1)   # (H, d_u)
+            # Mean & std update
+            mean = (score * elite_trajs).sum(dim=1)
+            diff = elite_trajs - mean.unsqueeze(1)
+            var  = (score * diff.pow(2)).sum(dim=1)
+            std  = var.sqrt().clamp(cfg.min_std, cfg.max_std)
 
-            # Weighted std
-            diff    = elite_trajs - mean.unsqueeze(1)   # (H, num_elites, d_u)
-            var     = (score * diff.pow(2)).sum(dim=1)  # (H, d_u)
-            std     = var.sqrt().clamp(cfg.min_std, cfg.max_std)
-
-        # Store for next step (receding horizon)
         self.prev_mean = mean.clone()
-
-        return mean   # (H, d_u)
+        return mean
 
     # ── Action decoding: u → a ────────────────────────────────────────────────
 
@@ -367,8 +475,8 @@ class KODAQMPPIPlanner:
         # Encode
         z, w, _ = self._encode_step(obs_x, h)
 
-        # MPPI plan
-        mean = self.plan(z, w)   # (H, d_u)
+        # MPPI plan (pass h for goal proposal)
+        mean = self.plan(z, w, h0=h)   # (H, d_u)
 
         # Decode first action
         u0 = mean[0]             # (d_u,)
@@ -665,15 +773,19 @@ def main():
     p.add_argument('--ckpt',          required=True)
     p.add_argument('--env',           default='kitchen-mixed-v0')
     p.add_argument('--n_ep',          type=int,   default=10)
-    p.add_argument('--horizon',       type=int,   default=5)
+    p.add_argument('--horizon',       type=int,   default=1)
     p.add_argument('--num_samples',   type=int,   default=512)
     p.add_argument('--num_pi_trajs',  type=int,   default=24)
     p.add_argument('--num_elites',    type=int,   default=64)
     p.add_argument('--temperature',   type=float, default=0.5)
-    p.add_argument('--iterations',    type=int,   default=6)
+    p.add_argument('--iterations',    type=int,   default=20)
     p.add_argument('--init_std',      type=float, default=2.0)
     p.add_argument('--greedy',        action='store_true',
                    help='Use greedy policy prior instead of MPPI')
+    p.add_argument('--goal_ratio',    type=float, default=0.0,
+                   help='Fraction of N samples from π_goal LQR (0=disabled, 0.95=recommended)')
+    p.add_argument('--num_goal_samples', type=int, default=10,
+                   help='Number of z_g samples from π_goal per MPPI step')
     p.add_argument('--gif',           action='store_true',
                    help='Record GIF for each episode')
     p.add_argument('--gif_fps',       type=int,   default=15)
@@ -717,6 +829,8 @@ def main():
         temperature=args.temperature,
         iterations=args.iterations,
         init_std=args.init_std,
+        goal_ratio=args.goal_ratio,
+        num_goal_samples=args.num_goal_samples,
     )
     planner = KODAQMPPIPlanner(model, mppi_cfg)
 

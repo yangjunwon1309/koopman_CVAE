@@ -106,7 +106,7 @@ class Trainer:
         'loss_reg', 'loss_stab',
         'loss_rec_delta_e', 'loss_rec_delta_p', 'loss_rec_q', 'loss_rec_qdot',
         # v5 new head losses
-        'loss_reward', 'loss_q', 'loss_pi',
+        'loss_reward', 'loss_q', 'loss_pi', 'loss_goal',
         # v5 diagnostics
         'rho', 'q_scale',
     ]
@@ -213,6 +213,7 @@ class Trainer:
             self.model.reward_ensemble_head,
             self.model.q_head,
             self.model.policy_prior,
+            self.model.goal_proposal,
         ]
 
     def _head_params(self):
@@ -311,9 +312,9 @@ class Trainer:
                       'loss_skill', 'loss_reg']:
                 if metrics.get(k, 0.0) != 0.0:
                     line += f"  {k.replace('loss_','')[:4]}={metrics[k]:.4f}"
-            for k in ['loss_reward', 'loss_q', 'loss_pi']:
-                if k in metrics:
-                    line += f"  {k.replace('loss_','')[:3]}={metrics[k]:.4f}"
+            for k in ['loss_reward', 'loss_q', 'loss_pi', 'loss_goal']:
+                if k in metrics and metrics.get(k, 0.0) != 0.0:
+                    line += f"  {k.replace('loss_','')[:4]}={metrics[k]:.4f}"
             if 'rho' in metrics:
                 line += f"  rho={metrics['rho']:.3f}"
             if 'q_scale' in metrics:
@@ -558,6 +559,12 @@ def parse_args():
     p.add_argument('--resume_epochs',      type=int,   default=100)
     p.add_argument('--resume_lr',          type=float, default=1e-4)
 
+    p.add_argument('--use_goal_proposal',    action='store_true',
+                   help='Train pi_goal for goal-conditioned LQR.')
+    p.add_argument('--goal_kl_weight',       type=float, default=0.1)
+    p.add_argument('--lambda_goal',          type=float, default=0.1)
+    p.add_argument('--no_recon_delta_e',     action='store_true',
+                   help='Disable R3M feature recon to free encoder capacity.')
     p.add_argument('--use_lqr_policy',      action='store_true',
                    help='Use LQR rollout for Q target (Mode D). '
                         'Requires --goal_z_path and --u_bounds_path.')
@@ -675,12 +682,16 @@ if __name__ == '__main__':
         resume_cfg.entropy_coef        = args.entropy_coef
         resume_cfg.log_std_min         = args.log_std_min
         resume_cfg.log_std_max         = args.log_std_max
-        resume_cfg.use_lqr_policy    = args.use_lqr_policy
-        resume_cfg.lqr_horizon       = args.lqr_horizon
+        resume_cfg.use_lqr_policy      = args.use_lqr_policy
+        resume_cfg.lqr_horizon         = args.lqr_horizon
+        resume_cfg.use_goal_proposal   = args.use_goal_proposal
+        resume_cfg.goal_kl_weight      = args.goal_kl_weight
+        resume_cfg.lambda_goal         = args.lambda_goal
+        resume_cfg.recon_delta_e       = not args.no_recon_delta_e
         resume_cfg.lambda_reward       = args.lambda_reward
         resume_cfg.lambda_q            = args.lambda_q
         resume_cfg.lambda_pi           = args.lambda_pi
-        resume_cfg.phase               = 3   # resume always in phase 3
+        resume_cfg.phase               = 3
         cfg = resume_cfg
 
         print(f"  cfg rebuilt: koopman_dim={cfg.koopman_dim}"

@@ -106,6 +106,15 @@ class KoopmanCVAEConfig:
     # ── v5.2 LQR policy prior for Q target ───────────────────────────────────
     use_lqr_policy:  bool  = False  # True=LQR rollout for Q target
     lqr_horizon:     int   = 4      # H for LQR Q target (≤ td_horizon)
+
+    # ── v5.3 Goal Proposal Policy ─────────────────────────────────────────────
+    use_goal_proposal: bool  = False  # True=learn π_goal
+    goal_latent_dim:   int   = 128    # z_g dimension (= koopman_dim)
+    goal_kl_weight:    float = 0.1    # β: KL(π_goal || N(z_g^seg))
+    lambda_goal:       float = 0.1    # L_goal loss weight
+
+    # ── v5.3 delta_e reconstruction toggle ───────────────────────────────────
+    recon_delta_e:   bool  = True   # False=skip R3M feature recon
     tau:           float = 0.005  # EMA rate for target Q update
     gamma:         float = 0.99   # discount
 
@@ -134,12 +143,14 @@ class KoopmanCVAEConfig:
 
     @property
     def rec_weights(self) -> dict:
-        return {
-            'delta_e': self.alpha_delta_e,
+        w = {
             'delta_p': self.alpha_delta_p,
             'q':       self.alpha_q,
             'qdot':    self.alpha_qdot,
         }
+        if self.recon_delta_e:
+            w['delta_e'] = self.alpha_delta_e
+        return w
 
     @property
     def x_slices(self) -> dict:
@@ -589,6 +600,76 @@ class PolicyPrior(nn.Module):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# v5.3 NEW: Goal Proposal Policy  π_goal(z_g | z_t, h_t)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class GoalProposalPolicy(nn.Module):
+    """
+    π_goal(z_g | z_t, h_t) — Gaussian goal latent proposal.
+
+    Samples a goal latent ẑ_g given current state (z_t, h_t).
+    Used to condition LQR:
+        u_lqr = M·ẑ_g - L·z_t   (M fixed/detached, gradient through ẑ_g only)
+
+    Training loss:
+        L_goal = -E_{ẑ_g}[Q_target(z_t, u_lqr)] + β·KL(π_goal || N(z_g^seg, I))
+
+    KL term keeps ẑ_g near the pre-computed segment-end goal z_g^seg,
+    preventing collapse toward degenerate goals that exploit Q errors.
+
+    Architecture: (z_t, h_t) → MLP → (μ_g, log_σ_g)  → reparameterize → ẑ_g
+    """
+
+    def __init__(self, cfg: 'KoopmanCVAEConfig'):
+        super().__init__()
+        in_dim = cfg.koopman_dim + cfg.gru_hidden
+        out_dim = cfg.goal_latent_dim   # = koopman_dim
+
+        self.net      = make_mlp(in_dim, cfg.mlp_hidden, cfg.mlp_hidden,
+                                  2, cfg.dropout, activate_last=True)
+        self.mu_head  = nn.Linear(cfg.mlp_hidden, out_dim)
+        self.lv_head  = nn.Linear(cfg.mlp_hidden, out_dim)
+
+        nn.init.orthogonal_(self.mu_head.weight, gain=0.01)
+        nn.init.zeros_(self.mu_head.bias)
+        nn.init.orthogonal_(self.lv_head.weight, gain=0.01)
+        nn.init.constant_(self.lv_head.bias, -2.0)  # init to small variance
+
+    def forward(
+        self,
+        z: torch.Tensor,   # (..., koopman_dim)
+        h: torch.Tensor,   # (..., gru_hidden)
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Returns:
+          z_g_sample: (..., goal_latent_dim)  reparameterized sample
+          mu_g:       (..., goal_latent_dim)
+          logvar_g:   (..., goal_latent_dim)
+        """
+        feat    = self.net(torch.cat([z, h], dim=-1))
+        mu_g    = self.mu_head(feat)
+        logvar_g = self.lv_head(feat).clamp(-10, 2)
+        eps     = torch.randn_like(mu_g)
+        z_g     = mu_g + eps * torch.exp(0.5 * logvar_g)
+        return z_g, mu_g, logvar_g
+
+    def kl_to_prior(
+        self,
+        mu_g:     torch.Tensor,   # (..., d)  proposal mean
+        logvar_g: torch.Tensor,   # (..., d)  proposal log-variance
+        z_g_seg:  torch.Tensor,   # (..., d)  segment-end goal latent (prior mean)
+    ) -> torch.Tensor:
+        """
+        KL(N(mu_g, exp(logvar_g)) || N(z_g_seg, I))
+        = 0.5 * sum[ exp(logvar_g) + (mu_g - z_g_seg)^2 - 1 - logvar_g ]
+        Summed over latent dim, averaged over batch.
+        """
+        var = logvar_g.exp()
+        kl  = 0.5 * (var + (mu_g - z_g_seg).pow(2) - 1.0 - logvar_g)
+        return kl.sum(-1).mean()   # scalar
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Main Model: KODAQ v5
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -664,6 +745,9 @@ class KoopmanCVAE(nn.Module):
         # LQR planner (set externally via model.set_lqr_planner())
         # Not a nn.Module — not saved in state_dict
         self._lqr_planner = None   # type: Optional['KODAQLQRPlanner']
+
+        # ── v5.3 Goal Proposal Policy ─────────────────────────────────────
+        self.goal_proposal = GoalProposalPolicy(cfg)
 
         # Moving percentile tracker (non-parameter, saved in checkpoint manually)
         self.scale_tracker = MovingPercentileScale(decay=0.99)
@@ -843,13 +927,16 @@ class KoopmanCVAE(nn.Module):
         slices = cfg.x_slices
         device = x_batch.device
 
-        # ── L_rec: v4 reconstruction (MSE + symlog) ───────────────────────
+        # ── L_rec: reconstruction (MSE + symlog) ────────────────────────
+        # delta_e (R3M 2048-dim) is optionally excluded via cfg.recon_delta_e.
+        # When disabled: encoder focuses capacity on q/p dynamics.
         targets = {
-            'delta_e': symlog(x_batch[..., slices['delta_e']]),
             'delta_p': symlog(x_batch[..., slices['delta_p']]),
             'q':       symlog(x_batch[..., slices['q']]),
             'qdot':    symlog(x_batch[..., slices['qdot']]),
         }
+        if cfg.recon_delta_e:
+            targets['delta_e'] = symlog(x_batch[..., slices['delta_e']])
         loss_rec, rec_per_head = reconstruction_loss(recon, targets, cfg.rec_weights)
 
         # ── L_dyn: Koopman consistency ────────────────────────────────────
@@ -1078,12 +1165,62 @@ class KoopmanCVAE(nn.Module):
                 entropy_coef=cfg.entropy_coef,
             )
 
+        # ── v5.3 Goal Proposal Loss ───────────────────────────────────────
+        # L_goal = -E[Q_target(z_t, u_lqr(ẑ_g))] + β·KL(π_goal||N(z_g^seg))
+        # gradient: π_goal → ẑ_g → u_lqr = M·ẑ_g - L·z_t
+        #           M, L are fixed (detached DARE gains)
+        #           Q_target: stop-gradient (EMA target Q)
+        loss_goal = torch.tensor(0.0, device=device)
+        if (cfg.use_goal_proposal
+                and self._lqr_planner is not None
+                and goal_z_seq is not None
+                and h_seq is not None
+                and cfg.phase >= 2):
+            o_in_g   = o_seq[:, :-1].detach()       # (B, T-1, m)
+            h_in_g   = h_seq[:, :-1].detach()        # (B, T-1, d_h)
+            z_g_seg  = goal_z_seq[:, :-1].detach()   # (B, T-1, m) prior mean
+
+            # Sample ẑ_g ~ π_goal(z_t, h_t)
+            B_b, T1, _ = o_in_g.shape
+            o_flat  = o_in_g.reshape(B_b * T1, -1)
+            h_flat  = h_in_g.reshape(B_b * T1, -1)
+            zg_flat, mu_g_flat, lv_g_flat = self.goal_proposal(o_flat, h_flat)
+            # zg_flat: (B*T1, m)
+
+            # LQR action: u = M·ẑ_g - L·z_t
+            # M, L come from planner's pre-computed gains (weighted by skill)
+            # Use skill-weighted M, L  (batch einsum, M/L detached)
+            if self._lqr_planner._L_tensor is not None:
+                w_flat = self.skill_prior.soft_weights(h_flat)  # (B*T1, K)
+                # Skill-weighted L, M
+                L_w = torch.einsum('bk,kdm->bdm',
+                                    w_flat,
+                                    self._lqr_planner._L_tensor.detach())  # (B*T1, d_u, m)
+                M_w = torch.einsum('bk,kdm->bdm',
+                                    w_flat,
+                                    self._lqr_planner._M_tensor.detach())  # (B*T1, d_u, m)
+                # u_lqr = M·ẑ_g - L·z_t  (gradient through zg_flat only)
+                u_lqr_g = ((M_w @ zg_flat.unsqueeze(-1)).squeeze(-1)
+                           - (L_w @ o_flat.detach().unsqueeze(-1)).squeeze(-1))  # (B*T1, d_u)
+
+                # Q_target(z_t, u_lqr) — stop-gradient Q
+                q_goal = self.q_head_target.expected_value(
+                    o_flat, u_lqr_g, return_type='min')  # (B*T1,)
+
+                # KL(π_goal || N(z_g_seg, I))
+                zg_seg_flat = z_g_seg.reshape(B_b * T1, -1)
+                kl_goal = self.goal_proposal.kl_to_prior(
+                    mu_g_flat, lv_g_flat, zg_seg_flat)
+
+                loss_goal = -q_goal.mean() + cfg.goal_kl_weight * kl_goal
+
         # ── Total loss ────────────────────────────────────────────────────
         loss_total = (
             loss_wm
             + cfg.lambda_reward * loss_reward
             + cfg.lambda_q      * loss_q
             + cfg.lambda_pi     * loss_pi
+            + cfg.lambda_goal   * loss_goal
         )
 
         return {
@@ -1103,6 +1240,7 @@ class KoopmanCVAE(nn.Module):
             'loss_reward':      loss_reward,
             'loss_q':           loss_q,
             'loss_pi':          loss_pi,
+            'loss_goal':        loss_goal,
             'rho':              torch.tensor(self.scale_tracker.rho, device=device),
             'q_scale':          torch.tensor(self.scale_tracker.scale, device=device),
         }
