@@ -343,12 +343,18 @@ class Trainer:
 
     def train(self, train_loader, val_loader=None):
         if self.use_wandb:
-            wandb.init(project=self.args.wandb_project,
-                       name=self.args.wandb_run or None,
-                       config=vars(self.args))
-            print(f"[wandb] project={self.args.wandb_project}  "
-                  f"run={wandb.run.name}  url={wandb.run.url}",
-                  flush=True)
+            try:
+                wandb.init(project=self.args.wandb_project,
+                           name=self.args.wandb_run or None,
+                           config=vars(self.args))
+                print(f"[wandb] project={self.args.wandb_project}  "
+                      f"run={wandb.run.name}  url={wandb.run.url}",
+                      flush=True)
+            except Exception as e:
+                print(f"[wandb] WARNING: init failed — {e}", flush=True)
+                print(f"[wandb] Hint: run 'wandb whoami' to verify entity. "
+                      f"Disabling wandb.", flush=True)
+                self.use_wandb = False
         t0 = time.time()
 
         # ── Two-stage resume ──────────────────────────────────────────────────
