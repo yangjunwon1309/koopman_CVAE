@@ -112,8 +112,9 @@ class KoopmanCVAEConfig:
     goal_latent_dim:    int   = 128    # z_g dimension (= koopman_dim)
     goal_kl_weight:     float = 0.1    # β: KL(π_goal || N(z_g^seg))
     lambda_goal:        float = 0.1    # L_goal loss weight
-    warmup_goal_epochs: int   = 30     # epochs before π_goal is activated
-    warmup_qs_threshold: float = 1.5   # min Qs scale before π_goal activates
+    # Phase A: epoch < warmup_goal_epochs  → z_g = z_g^seg (fixed, KL-only loss)
+    # Phase B: epoch >= warmup_goal_epochs → z_g ~ π_goal  (Q-maximize active)
+    warmup_goal_epochs: int   = 100    # Phase A→B boundary epoch
 
     # ── v5.3 delta_e reconstruction toggle ───────────────────────────────────
     recon_delta_e:   bool  = True   # False=skip R3M feature recon
@@ -754,6 +755,71 @@ class KoopmanCVAE(nn.Module):
         # Moving percentile tracker (non-parameter, saved in checkpoint manually)
         self.scale_tracker = MovingPercentileScale(decay=0.99)
 
+    # ── Goal latent computation from skill segments ─────────────────────────────
+
+    @torch.no_grad()
+    def compute_goal_z_from_skills(
+        self,
+        x_batch:      torch.Tensor,   # (B, T, x_dim)
+        skill_labels: torch.Tensor,   # (B, T) int64  skill index per step
+        h_seq:        torch.Tensor,   # (B, T, d_h)   hidden states
+    ) -> torch.Tensor:
+        """
+        Skill segment 전환 지점의 x_state를 goal로 사용해 goal_z_seq 계산.
+
+        각 timestep t가 속한 skill segment의 끝 timestep을 찾고,
+        그 timestep의 x를 posterior로 encode해서 z*를 얻습니다.
+
+        Segment 정의:
+          skill_labels[t] 값이 바뀌는 지점 = segment 경계
+          t가 속한 segment의 end = 다음 경계 - 1  (없으면 T-1)
+
+          예) labels = [0,0,0,1,1,2,2,2]
+              t=0: segment [0,2], goal = x[2]
+              t=3: segment [3,4], goal = x[4]
+              t=5: segment [5,7], goal = x[7]
+
+        Returns: goal_z_seq (B, T, m)  — same shape as o_seq
+        """
+        B, T, x_dim = x_batch.shape
+        m   = self.cfg.koopman_dim
+        dev = x_batch.device
+
+        goal_z_seq = torch.zeros(B, T, m, device=dev)
+
+        for b in range(B):
+            labels = skill_labels[b]   # (T,)
+
+            # Find segment end for each t
+            # seg_ends[t] = last timestep of the segment containing t
+            seg_ends = torch.zeros(T, dtype=torch.long, device=dev)
+            end = T - 1
+            for t in range(T - 1, -1, -1):
+                if t < T - 1 and labels[t] != labels[t + 1]:
+                    end = t   # this t is the last step of its segment
+                seg_ends[t] = end
+
+            # Encode goal for each unique segment end
+            unique_ends = seg_ends.unique()
+            for goal_t in unique_ends:
+                goal_t_int = goal_t.item()
+                # timesteps belonging to this goal
+                mask_t = (seg_ends == goal_t)   # (T,) bool
+
+                # x_goal = x_batch[b, goal_t]  (x_dim,)
+                x_goal = x_batch[b, goal_t_int].unsqueeze(0)   # (1, x_dim)
+
+                # For each t in this segment, encode with h_t
+                # (goal context depends on current hidden state)
+                t_indices = mask_t.nonzero(as_tuple=True)[0]   # (n_t,)
+                h_t = h_seq[b, t_indices]   # (n_t, d_h)
+                x_goal_rep = x_goal.expand(len(t_indices), -1)  # (n_t, x_dim)
+
+                mu_g, _ = self.posterior(x_goal_rep, h_t)   # (n_t, m)
+                goal_z_seq[b, t_indices] = mu_g
+
+        return goal_z_seq   # (B, T, m)
+
     # ── Phase control ────────────────────────────────────────────────────────
 
     def set_phase(self, phase: int):
@@ -791,8 +857,8 @@ class KoopmanCVAE(nn.Module):
         """
         Trainer가 매 epoch 시작 시 호출.
         warmup_goal_epochs 판단에 사용.
-        Phase A (epoch < warmup): π_goal은 KL만 학습 (z_g^seg 모방)
-        Phase B (epoch >= warmup AND Qs > threshold): π_goal Q-maximize 활성화
+        Phase A (epoch < warmup_goal_epochs): z_g = z_g^seg 고정, KL-only 학습
+        Phase B (epoch >= warmup_goal_epochs): z_g ~ π_goal, Q-maximize 활성화
         """
         self.cfg._current_epoch = epoch
 
@@ -881,6 +947,17 @@ class KoopmanCVAE(nn.Module):
         koopman_pred = torch.stack(koopman_pred_list,  dim=1)  # (B, T-1, d_o)
         A_bar_seq    = torch.stack(A_bar_list,         dim=1)  # (B, T-1, m, m)
         B_bar_seq    = torch.stack(B_bar_list,         dim=1)  # (B, T-1, m, d_u)
+
+        # ── Auto-compute goal_z_seq from skill segments (if not provided) ──
+        # goal_z_seq: (B, T, m) — segment-end goal latent for LQR/GoalProposal
+        # Source priority:
+        #   1. Passed in explicitly (from GoalZDatasetWrapper / external)
+        #   2. Computed on-the-fly from skill_labels + x_batch (preferred)
+        #   3. None → Mode D / GoalProposal disabled
+        if goal_z_seq is None and skill_labels is not None:
+            if (cfg.use_lqr_policy or cfg.use_goal_proposal):
+                goal_z_seq = self.compute_goal_z_from_skills(
+                    x_batch, skill_labels, h_seq)  # (B, T, m)
 
         # ── v4 Decoder ────────────────────────────────────────────────────
         recon = self.decoder(o_seq)   # dict, each (B, T, dim)
@@ -1078,38 +1155,65 @@ class KoopmanCVAE(nn.Module):
                         and self._lqr_planner is not None
                         and goal_z_seq is not None
                         and h_seq is not None):
-                    # ── Mode D: LQR H-step rollout ───────────────────────
-                    # u_k = Σ_j w_j·(M_j·z*_t - L_j·ẑ_k)  (skill-weighted)
-                    # ẑ_{k+1} = Ā·ẑ_k + B̄·u_k
-                    # R̂_pen_k = ensemble_head.penalized_reward(ẑ_k, u_k)
-                    # y_t = Σ γ^k·R̂_pen_k + γ^H·Q̄(ẑ_H, u_H)
+                    # ── Mode D: Real-action rollout for Q target ──────────
+                    # Q(o_t, u_t^data)를 real offline action으로 학습:
+                    #   y_t = Σ_{k=0}^{H-1} γ^k R̂_pen(ẑ_k, ψ(a_{t+k}))
+                    #         + γ^H Q̄(ẑ_H, ψ(a_{t+H}))
+                    #   ẑ_{k+1} = Ā·ẑ_k + B̄·ψ(a_{t+k})
+                    # LQR은 goal_proposal loss에서만 사용 (아래 참조).
                     H   = cfg.lqr_horizon
                     gm  = cfg.gamma
+                    B_b = o_t.shape[0]
+                    T1  = o_t.shape[1]
+                    d_u = u_seq.shape[-1]
+                    m_d = o_t.shape[-1]
 
-                    u_lqr_seq, z_roll_seq = self._lqr_planner.lqr_rollout_batch(
-                        o_seq=o_seq,
-                        h_seq=h_seq,
-                        goal_z_seq=goal_z_seq,
-                        H=H,
-                        gamma=gm,
-                    )
-                    # u_lqr_seq:  (B, T-1, H, d_u)
-                    # z_roll_seq: (B, T-1, H+1, m)
+                    # Blended Ā(w_t), B̄(w_t) — fixed at t
+                    koop    = self.koopman
+                    log_lam = koop.get_log_lambdas()
+                    w_t0    = self.skill_prior.soft_weights(
+                        h_seq[:, :T1].reshape(B_b * T1, -1)
+                    ).reshape(B_b, T1, -1)
+                    A_bar_r, B_bar_r, _, _ = blend_koopman(
+                        log_lam, koop.theta_k, koop.G_k, koop.U,
+                        w_t0.reshape(B_b * T1, -1))
+                    A_bar_r = A_bar_r.reshape(B_b, T1, m_d, m_d)
+                    B_bar_r = B_bar_r.reshape(B_b, T1, m_d, d_u)
 
-                    G = torch.zeros(B_b, T1, device=device)
+                    G      = torch.zeros(B_b, T1, device=device)
+                    z_roll = o_t.clone()
+
                     for k in range(H):
-                        z_k = z_roll_seq[:, :, k]    # (B, T-1, m)
-                        u_k = u_lqr_seq[:, :, k]     # (B, T-1, d_u)
-                        R_pen = self.reward_ensemble_head.penalized_reward(
-                            z_k, u_k)                # (B, T-1)
-                        G = G + (gm ** k) * R_pen
+                        # real encoded action at offset k
+                        if k + T1 <= u_seq.shape[1]:
+                            u_real_k = u_seq[:, k:k + T1]
+                        else:
+                            avail    = u_seq[:, k:]
+                            pad      = avail[:, -1:].expand(
+                                -1, T1 - avail.shape[1], -1)
+                            u_real_k = torch.cat([avail, pad], dim=1)
 
-                    # Terminal bootstrap
-                    z_H   = z_roll_seq[:, :, H]      # (B, T-1, m)
-                    u_H   = u_lqr_seq[:, :, -1]      # (B, T-1, d_u)
-                    q_terminal = self.q_head_target.expected_value(
-                        z_H, u_H, return_type='min')  # (B, T-1)
+                        R_pen = self.reward_ensemble_head.penalized_reward(
+                            z_roll, u_real_k)
+                        G = G + (gm ** k) * R_pen
+                        z_roll = (
+                            (A_bar_r @ z_roll.unsqueeze(-1)).squeeze(-1)
+                            + (B_bar_r @ u_real_k.unsqueeze(-1)).squeeze(-1)
+                        )
+
+                    # Terminal bootstrap with real action at offset H
+                    if H + T1 <= u_seq.shape[1]:
+                        u_real_H = u_seq[:, H:H + T1]
+                    else:
+                        avail    = u_seq[:, H:]
+                        pad      = avail[:, -1:].expand(
+                            -1, T1 - avail.shape[1], -1)
+                        u_real_H = torch.cat([avail, pad], dim=1)
+
+                    q_terminal      = self.q_head_target.expected_value(
+                        z_roll, u_real_H, return_type='min')
                     q_target_scalar = G + (gm ** H) * q_terminal
+
 
                 else:
                     # ── Mode A: original 1-step TD ────────────────────────
@@ -1179,14 +1283,12 @@ class KoopmanCVAE(nn.Module):
         # ── v5.3 Goal Proposal Loss ───────────────────────────────────────
         # L_goal = -E[Q_target(z_t, u_lqr(ẑ_g))] + β·KL(π_goal||N(z_g^seg))
         #
-        # Warmup guard (cfg.warmup_goal_epochs):
-        #   - Phase A (epoch < warmup): use z_g = z_g^seg directly (no π_goal)
-        #     → Q learns with stable LQR actions toward real goals
-        #     → loss_goal = 0 (no π_goal gradient)
-        #   - Phase B (epoch >= warmup, Qs > warmup_qs_threshold):
-        #     → π_goal activated, learns to propose goals that maximize Q
-        #
-        # This prevents early π_goal exploit before Q has meaningful signal.
+        # Warmup gate (epoch-based only):
+        #   Phase A (epoch < warmup_goal_epochs):
+        #     z_g = z_g^seg 고정 → Q가 stable LQR signal로 수렴
+        #     loss_goal = β·KL  (π_goal이 z_g^seg 분포 모방)
+        #   Phase B (epoch >= warmup_goal_epochs):
+        #     z_g ~ π_goal(z_t, h_t) → Q-maximize 활성화
         loss_goal      = torch.tensor(0.0, device=device)
         goal_phase_str = 'off'
 
@@ -1215,11 +1317,11 @@ class KoopmanCVAE(nn.Module):
                                     self._lqr_planner._M_tensor.detach())
 
                 # ── Decide which goal to use ───────────────────────────────
-                qs_ready = self.scale_tracker.scale > cfg.warmup_qs_threshold
+                # Simple epoch-based gate: no Qs threshold dependency
                 ep_ready = (getattr(cfg, '_current_epoch', 0)
                             >= cfg.warmup_goal_epochs)
 
-                if qs_ready and ep_ready:
+                if ep_ready:
                     # Phase B: π_goal proposes z_g, gradient flows back
                     goal_phase_str  = 'active'
                     zg_flat, mu_g_flat, lv_g_flat = self.goal_proposal(
