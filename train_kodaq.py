@@ -696,7 +696,7 @@ def parse_args():
     p.add_argument('--lqr_R_scale',          type=float, default=10.0)
     p.add_argument('--td_horizon',           type=int,   default=4,
                    help='H-step rollout horizon for MOPO TD target (4 or 8).')
-    p.add_argument('--mopo_beta',          type=float, default=1.0,
+    p.add_argument('--mopo_beta',          type=float, default=0.0,
                    help='MOPO penalty: mean - beta*std.')
     p.add_argument('--reward_ensemble_n',  type=int,   default=5,
                    help='Number of reward ensemble members.')

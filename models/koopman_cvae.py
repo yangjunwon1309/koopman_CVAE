@@ -100,7 +100,7 @@ class KoopmanCVAEConfig:
     # ── v5.1 Reward Ensemble Head (MOPO-style) ────────────────────────────────
     reward_ensemble_n:   int   = 5      # N: reward ensemble members
     td_horizon:          int   = 4      # H: rollout steps for H-step TD (4 or 8)
-    mopo_beta:           float = 1.0    # beta: MOPO penalty (mean - beta*std)
+    mopo_beta:           float = 0.0    # beta: MOPO penalty (mean - beta*std)
     use_ensemble_reward: bool  = False  # False=single head, True=ensemble
 
     # ── v5.2 LQR policy prior for Q target ───────────────────────────────────
