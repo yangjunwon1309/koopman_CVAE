@@ -233,12 +233,12 @@ class KODAQMPPIPlanner:
         w_exp = w0.expand(N_total, -1)   # (N_total, K)
 
         # Gain matrices (skill-weighted, fixed)
-        L_w = torch.einsum('bk,kdm->bdm',
+        L_w = torch.einsum('bk,kdm->bkdm',
                             w_exp,
-                            planner._L_tensor.detach())  # (N_total, d_u, m)
-        M_w = torch.einsum('bk,kdm->bdm',
+                            planner._L_tensor.to(dev).detach()).sum(1)  # (N_total, d_u, m)
+        M_w = torch.einsum('bk,kdm->bkdm',
                             w_exp,
-                            planner._M_tensor.detach())  # (N_total, d_u, m)
+                            planner._M_tensor.to(dev).detach()).sum(1)  # (N_total, d_u, m)
 
         # ── H-step LQR rollout ────────────────────────────────────────────
         z_cur  = z0.expand(N_total, -1).clone()   # (N_total, m)
@@ -773,12 +773,12 @@ def main():
     p.add_argument('--ckpt',          required=True)
     p.add_argument('--env',           default='kitchen-mixed-v0')
     p.add_argument('--n_ep',          type=int,   default=10)
-    p.add_argument('--horizon',       type=int,   default=1)
+    p.add_argument('--horizon',       type=int,   default=5)
     p.add_argument('--num_samples',   type=int,   default=512)
     p.add_argument('--num_pi_trajs',  type=int,   default=24)
     p.add_argument('--num_elites',    type=int,   default=64)
     p.add_argument('--temperature',   type=float, default=0.5)
-    p.add_argument('--iterations',    type=int,   default=20)
+    p.add_argument('--iterations',    type=int,   default=6)
     p.add_argument('--init_std',      type=float, default=2.0)
     p.add_argument('--greedy',        action='store_true',
                    help='Use greedy policy prior instead of MPPI')

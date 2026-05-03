@@ -1311,10 +1311,10 @@ class KoopmanCVAE(nn.Module):
                 w_flat = self.skill_prior.soft_weights(h_flat)  # (B*T1, K)
                 L_w = torch.einsum('bk,kdm->bdm',
                                     w_flat,
-                                    self._lqr_planner._L_tensor.detach())
+                                    self._lqr_planner._L_tensor.to(device).detach())
                 M_w = torch.einsum('bk,kdm->bdm',
                                     w_flat,
-                                    self._lqr_planner._M_tensor.detach())
+                                    self._lqr_planner._M_tensor.to(device).detach())
 
                 # ── Decide which goal to use ───────────────────────────────
                 # Simple epoch-based gate: no Qs threshold dependency
