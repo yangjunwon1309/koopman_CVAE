@@ -279,32 +279,93 @@ class KODAQLQRPlanner:
             B_bar.detach().cpu().numpy())
         return A_bar, B_bar, L, M
 
-    def precompute_gains(self):
+    def precompute_gains(self, H: int = 4):
         """
-        각 pure skill k에 대해 DARE 계산 → L_k, M_k 텐서로 저장.
-        build_goal_latent_map에서 호출.
-        K × (d_u, m) 텐서 두 개.
+        Finite-Horizon Riccati Backward Recursion for blended dynamics.
+
+        각 pure skill k에 대해 H-step finite horizon LQR gain 계산.
+        blended dynamics Ā(w), B̄(w) 기반이 맞으나, w는 배치마다 달라서
+        per-skill gain을 precompute하고 skill-weighted sum으로 근사합니다.
+
+        단, lqr_rollout_batch에서는 blended Ā,B̄를 직접 계산 후
+        단일 Riccati recursion을 적용합니다 (더 정확한 방법).
+
+        Riccati backward recursion (제공된 수식):
+          P_H = Q_f  (= Q_scale * I)
+          K_k = (R + B^T P_{k+1} B)^{-1} B^T P_{k+1}
+          P_k = Q + A^T P_{k+1} A - A^T P_{k+1} B (B^T P_{k+1} B + R)^{-1} B^T P_{k+1} A
+
+        최적 제어: u_k* = -K_k (A z_k - z*)
         """
         koop = self.model.koopman
         K    = self.m_cfg.num_skills
         d_u  = self.m_cfg.action_latent
         m    = self.m_cfg.koopman_dim
         dev  = self.device
+        self._lqr_H = H   # store for rollout
 
-        A_k = koop.get_A_k()   # (K, m, m)
-        B_k = koop.get_B_k()   # (K, m, d_u)
+        A_k_t = koop.get_A_k()   # (K, m, m)  tensor
+        B_k_t = koop.get_B_k()   # (K, m, d_u) tensor
 
+        # per-skill: list of K × [K_0,...,K_{H-1}]  each (d_u, m)
+        K_gains_list = []  # (K, H, d_u, m)
+
+        for k in range(K):
+            A_np = A_k_t[k].detach().cpu().numpy().astype(np.float64)
+            B_np = B_k_t[k].detach().cpu().numpy().astype(np.float64)
+            K_seq = self._finite_horizon_riccati(A_np, B_np, H)
+            K_gains_list.append(K_seq)   # (H, d_u, m)
+
+        # Stack: (K, H, d_u, m)
+        self._K_gains = torch.FloatTensor(
+            np.stack(K_gains_list, axis=0)).to(dev)
+        print(f"Finite-horizon Riccati: K={K}  H={H}  d_u={d_u}  m={m}")
+
+        # Also keep infinite-horizon DARE for single-step plan()
         L_list, M_list = [], []
         for k in range(K):
-            A_np = A_k[k].detach().cpu().numpy()
-            B_np = B_k[k].detach().cpu().numpy()
+            A_np = A_k_t[k].detach().cpu().numpy()
+            B_np = B_k_t[k].detach().cpu().numpy()
             _, L, M = solve_dare_safe(A_np, B_np, self.Q, self.R)
-            L_list.append(torch.FloatTensor(L))  # (d_u, m)
-            M_list.append(torch.FloatTensor(M))  # (d_u, m)
-
+            L_list.append(torch.FloatTensor(L))
+            M_list.append(torch.FloatTensor(M))
         self._L_tensor = torch.stack(L_list).to(dev)  # (K, d_u, m)
         self._M_tensor = torch.stack(M_list).to(dev)  # (K, d_u, m)
-        print(f"Precomputed DARE gains: K={K}  d_u={d_u}  m={m}")
+
+    def _finite_horizon_riccati(
+        self,
+        A: np.ndarray,   # (m, m)
+        B: np.ndarray,   # (m, d_u)
+        H: int,
+    ) -> np.ndarray:
+        """
+        Backward Riccati recursion → K_0,...,K_{H-1}  (H, d_u, m)
+
+        P_H = Q_f
+        for k = H-1 down to 0:
+            K_k = (R + B^T P_{k+1} B)^{-1} B^T P_{k+1}
+            P_k = Q + A^T P_{k+1} A
+                    - A^T P_{k+1} B (B^T P_{k+1} B + R)^{-1} B^T P_{k+1} A
+
+        u_k* = -K_k (A z_k - z*)
+        """
+        m   = A.shape[0]
+        d_u = B.shape[1]
+        Q   = self.Q.astype(np.float64)
+        R   = self.R.astype(np.float64)
+        Qf  = Q * 10.0   # Q_f: terminal cost weight (10× state cost)
+
+        P = Qf.copy()
+        K_seq = []
+        for _ in range(H):   # H steps: k=H-1 down to 0
+            BtP  = B.T @ P                           # (d_u, m)
+            BtPB = BtP @ B                           # (d_u, d_u)
+            S    = BtPB + R                          # (d_u, d_u)
+            K    = np.linalg.solve(S, BtP)           # (d_u, m)
+            P    = Q + A.T @ P @ A - A.T @ P @ B @ K  # (m, m)
+            K_seq.append(K)
+        K_seq.reverse()   # K_seq[0] = K_0 (first step)
+        return np.array(K_seq, dtype=np.float32)     # (H, d_u, m)
 
     def _lqr_u_batch(
         self,
@@ -467,75 +528,116 @@ class KODAQLQRPlanner:
     @torch.no_grad()
     def lqr_rollout_batch(
         self,
-        o_seq:      torch.Tensor,   # (B, T, m)  posterior latents
+        o_seq:      torch.Tensor,   # (B, T, m)
         h_seq:      torch.Tensor,   # (B, T, d_h)
-        goal_z_seq: torch.Tensor,   # (B, T, m)  pre-computed goal z*
-        H:          int = 4,        # rollout horizon
+        goal_z_seq: torch.Tensor,   # (B, T, m)  goal z* per timestep
+        H:          int = 4,
         gamma:      float = 0.99,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        H-step LQR rollout for offline Q target.
+        Finite-Horizon LQR rollout using blended dynamics Ā(w), B̄(w).
 
-        For each t in [0, T-H):
-          ẑ_{t+0} = o_seq[:, t]
-          w_k     = skill_weights(h_seq[:, t])
-          u_k     = Σ_j w_j·(M_j·goal_z[:, t] - L_j·ẑ_k)  (batched LQR)
-          ẑ_{k+1} = Ā(w)·ẑ_k + B̄(w)·u_k
+        For each starting timestep t:
+          1. Compute blended Ā(w_t), B̄(w_t) using skill weights at t
+          2. Run backward Riccati on THIS blended system → K_0,...,K_{H-1}
+          3. Roll forward:
+               u_k = -K_k (Ā·ẑ_k - z*)   [optimal control toward z*]
+               ẑ_{k+1} = Ā·ẑ_k + B̄·u_k
+
+        This uses a SINGLE (Ā,B̄) pair per trajectory (w fixed at t=0),
+        which is exact for the blended dynamics rather than interpolating
+        per-skill gains (L(Ā) ≠ Σ w_k L(A_k) in general).
 
         Returns:
-          u_lqr_seq:   (B, T-1, H, d_u)  LQR actions at each rollout step
-          z_roll_seq:  (B, T-1, H+1, m)  rollout latents
+          u_lqr_seq:  (B, T-1, H, d_u)
+          z_roll_seq: (B, T-1, H+1, m)
         """
+        if self._K_gains is None:
+            self.precompute_gains(H)
+
         model   = self.model
         koop    = model.koopman
         log_lam = koop.get_log_lambdas()
-        B, T, m = o_seq.shape
-        T1       = T - 1   # number of valid (o_t, o_{t+1}) pairs
+        B_b, T, m_dim = o_seq.shape
+        T1 = T - 1
+        dev = o_seq.device
 
-        u_lqr_list  = []   # per rollout step: list of (B, T1, d_u)
-        z_roll_list = []   # per rollout step: list of (B, T1, m)
+        # ── Skill weights at t (fixed for the entire H-step rollout) ──────────
+        h_t = h_seq[:, :T1]                              # (B, T1, d_h)
+        w_t = model.skill_prior.soft_weights(
+            h_t.reshape(B_b * T1, -1)
+        ).reshape(B_b, T1, -1)                           # (B, T1, K)
 
-        # Starting latents
-        z_cur = o_seq[:, :T1]   # (B, T1, m)
-        z_roll_list.append(z_cur)
+        # ── Blended Ā(w_t), B̄(w_t) ────────────────────────────────────────────
+        w_flat = w_t.reshape(B_b * T1, -1)               # (B*T1, K)
+        A_bar, B_bar, _, _ = blend_koopman(
+            log_lam, koop.theta_k, koop.G_k, koop.U, w_flat)
+        # A_bar: (B*T1, m, m),  B_bar: (B*T1, m, d_u)
+        A_bar = A_bar.reshape(B_b, T1, m_dim, m_dim)     # (B, T1, m, m)
+        B_bar = B_bar.reshape(B_b, T1, m_dim, -1)        # (B, T1, m, d_u)
+
+        # ── Finite-horizon Riccati on blended dynamics ────────────────────────
+        # Compute K_0,...,K_{H-1} for each (A_bar[b,t], B_bar[b,t])
+        # This is the key fix: one Riccati per blended system, not per skill.
+        #
+        # For efficiency: compute batched Riccati in torch
+        Q_mat = torch.eye(m_dim,  device=dev) * self.cfg.Q_scale
+        R_mat = torch.eye(B_bar.shape[-1], device=dev) * self.cfg.R_scale
+        Qf    = Q_mat * 10.0   # terminal cost
+
+        # Flatten batch for Riccati: (B*T1, m, m)
+        A_flat = A_bar.reshape(B_b * T1, m_dim, m_dim)   # (N, m, m)
+        B_flat = B_bar.reshape(B_b * T1, m_dim, -1)      # (N, m, d_u)
+        N      = B_b * T1
+        d_u    = B_flat.shape[-1]
+
+        # Backward Riccati
+        P = Qf.unsqueeze(0).expand(N, -1, -1).clone()    # (N, m, m)
+        K_list = []
+        for _ in range(H):
+            BtP  = B_flat.transpose(-2, -1) @ P          # (N, d_u, m)
+            BtPB = BtP @ B_flat                           # (N, d_u, d_u)
+            S    = BtPB + R_mat.unsqueeze(0)              # (N, d_u, d_u)
+            K    = torch.linalg.solve(S, BtP)            # (N, d_u, m)
+            AtP  = A_flat.transpose(-2, -1) @ P          # (N, m, m)
+            P    = (Q_mat.unsqueeze(0)
+                   + AtP @ A_flat
+                   - AtP @ B_flat @ K)                   # (N, m, m)
+            K_list.append(K)
+        K_list.reverse()   # K_list[0] = K_0
+
+        # K_gains: (H, N, d_u, m) → (H, B, T1, d_u, m)
+        K_gains = torch.stack(K_list, dim=0).reshape(
+            H, B_b, T1, d_u, m_dim)
+
+        # ── Forward rollout ───────────────────────────────────────────────────
+        z_star = goal_z_seq[:, :T1]                      # (B, T1, m)
+        z_cur  = o_seq[:, :T1].clone()                   # (B, T1, m)
+        u_lqr_list  = []
+        z_roll_list = [z_cur]
 
         for k in range(H):
-            # Skill weights at current rollout step
-            # For k=0: use h_seq[:, :T1]; for k>0: approximate with h_seq[:, :T1]
-            # (h doesn't change much over 4 steps, reusing h_t is a good approx)
-            h_cur = h_seq[:, :T1]   # (B, T1, d_h)
-            w_cur = model.skill_prior.soft_weights(
-                h_cur.reshape(B * T1, -1)
-            ).reshape(B, T1, -1)    # (B, T1, K)
+            Kk = K_gains[k]   # (B, T1, d_u, m)
 
-            # Goal latent at t (fixed per segment, already pre-computed)
-            z_star = goal_z_seq[:, :T1]   # (B, T1, m)
+            # Koopman predict from current z
+            Az = (A_bar @ z_cur.unsqueeze(-1)).squeeze(-1)  # (B, T1, m)
 
-            # Batched LQR action: flatten (B, T1) → batch dim
-            z_flat = z_cur.reshape(B * T1, m)
-            zs_flat = z_star.reshape(B * T1, m)
-            w_flat  = w_cur.reshape(B * T1, -1)
+            # u_k* = -K_k (Ā z_k - z*)
+            error = Az - z_star                            # (B, T1, m)
+            u_k   = -(Kk @ error.unsqueeze(-1)).squeeze(-1)  # (B, T1, d_u)
 
-            u_flat = self._lqr_u_batch(z_flat, zs_flat, w_flat)  # (B*T1, d_u)
-            u_cur  = u_flat.reshape(B, T1, -1)   # (B, T1, d_u)
-            u_lqr_list.append(u_cur)
+            # Clip to surveyed action encoder range
+            if self.cfg.use_u_bounds and self.u_min is not None:
+                u_min_t = torch.FloatTensor(self.u_min).to(dev)
+                u_max_t = torch.FloatTensor(self.u_max).to(dev)
+                u_k = u_k.clamp(u_min_t, u_max_t)
 
-            # Koopman step: ẑ_{k+1} = Ā(w)·ẑ_k + B̄(w)·u_k
-            A_bar, B_bar, _, _ = blend_koopman(
-                log_lam, koop.theta_k, koop.G_k, koop.U,
-                w_cur.reshape(B * T1, -1)
-            )
-            A_bar = A_bar.reshape(B, T1, m, m)   # (B, T1, m, m)
-            B_bar = B_bar.reshape(B, T1, m, -1)  # (B, T1, m, d_u)
+            u_lqr_list.append(u_k)
 
-            z_next = (
-                (A_bar @ z_cur.unsqueeze(-1)).squeeze(-1)
-                + (B_bar @ u_cur.unsqueeze(-1)).squeeze(-1)
-            )   # (B, T1, m)
-            z_cur = z_next
+            # ẑ_{k+1} = Ā·ẑ_k + B̄·u_k
+            z_cur = Az + (B_bar @ u_k.unsqueeze(-1)).squeeze(-1)
             z_roll_list.append(z_cur)
 
-        # Stack: (B, T1, H, d_u) and (B, T1, H+1, m)
         u_lqr_seq  = torch.stack(u_lqr_list,  dim=2)   # (B, T1, H, d_u)
         z_roll_seq = torch.stack(z_roll_list, dim=2)   # (B, T1, H+1, m)
         return u_lqr_seq, z_roll_seq

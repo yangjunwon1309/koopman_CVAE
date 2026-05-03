@@ -35,6 +35,7 @@ import time
 from pathlib import Path
 from typing import Dict, Optional
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader, random_split
 
@@ -51,6 +52,93 @@ try:
     _WANDB_AVAILABLE = True
 except ImportError:
     _WANDB_AVAILABLE = False
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Goal-Z Dataset Wrapper
+# ──────────────────────────────────────────────────────────────────────────────
+
+class GoalZDatasetWrapper(torch.utils.data.Dataset):
+    """
+    Wraps KODAQWindowDataset to inject goal_z_seq into each sample.
+
+    KODAQWindowDataset returns dict with 'x_seq', 'actions', etc.
+    and also stores the global timestep range of each window
+    via dataset.windows[i] = (global_start, global_end).
+
+    goal_latent_map.npz stores:
+      ep_starts: (N_ep,) int
+      str(ep_start): (L, m) float32  — goal_z per global timestep
+
+    We build a flat array goal_z_global[t] = z* at global timestep t,
+    then slice [global_start:global_end] per window.
+    """
+
+    def __init__(self, base_ds, goal_z_path: str, koopman_dim: int):
+        self.base_ds     = base_ds
+        self.koopman_dim = koopman_dim
+
+        # Load goal_z_map and build global flat array
+        data      = np.load(goal_z_path, allow_pickle=True)
+        ep_starts = data['ep_starts'].astype(int)
+
+        # Find total global timesteps needed
+        max_t = 0
+        for k in ep_starts:
+            arr = data[str(k)]
+            max_t = max(max_t, int(k) + arr.shape[0])
+
+        # Build flat array: goal_z_global[t] = z* at global t
+        self.goal_z_global = np.zeros((max_t, koopman_dim), dtype=np.float32)
+        for k in ep_starts:
+            arr = data[str(k)]   # (L, m)
+            t0  = int(k)
+            self.goal_z_global[t0:t0 + arr.shape[0]] = arr
+
+        print(f"  GoalZDatasetWrapper: global_steps={max_t}  "
+              f"ep_starts={len(ep_starts)}  m={koopman_dim}")
+
+    def __len__(self):
+        return len(self.base_ds)
+
+    def __getitem__(self, idx):
+        sample = self.base_ds[idx]
+
+        # Get global window range from base dataset
+        # KODAQWindowDataset stores windows as (global_start, global_end)
+        if hasattr(self.base_ds, 'windows'):
+            t0, t1 = self.base_ds.windows[idx]
+        elif hasattr(self.base_ds, 'dataset') and hasattr(self.base_ds.dataset, 'windows'):
+            # Subset wrapper (from random_split)
+            real_idx = self.base_ds.indices[idx]
+            t0, t1   = self.base_ds.dataset.windows[real_idx]
+        else:
+            # Fallback: no window info → return zeros (Mode D disabled)
+            seq_len = sample['x_seq'].shape[0] if isinstance(sample, dict) else sample[0].shape[0]
+            sample['goal_z_seq'] = torch.zeros(seq_len, self.koopman_dim)
+            return sample
+
+        # Slice goal_z for this window
+        t1_clip = min(t1, len(self.goal_z_global))
+        goal_z  = self.goal_z_global[t0:t1_clip]
+
+        # Pad if needed (window might slightly exceed pre-computed map)
+        seq_len = sample['x_seq'].shape[0] if isinstance(sample, dict) else sample[0].shape[0]
+        if len(goal_z) < seq_len:
+            pad = np.zeros((seq_len - len(goal_z), self.koopman_dim), dtype=np.float32)
+            goal_z = np.concatenate([goal_z, pad], axis=0)
+        else:
+            goal_z = goal_z[:seq_len]
+
+        if isinstance(sample, dict):
+            sample['goal_z_seq'] = torch.FloatTensor(goal_z)
+        else:
+            # tuple/list: append goal_z as extra element
+            sample = list(sample) + [torch.FloatTensor(goal_z)]
+
+        return sample
+
+
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -79,7 +167,7 @@ def load_dataset(args, cfg: KoopmanCVAEConfig):
             K=cfg.num_skills,
         )
     try:
-        return load_kodaq_dataset(
+        ds = load_kodaq_dataset(
             env_name=_resolve_d4rl_name(args.env),
             seq_len=args.seq_len,
             stride=args.stride,
@@ -90,6 +178,9 @@ def load_dataset(args, cfg: KoopmanCVAEConfig):
             device=args.device,
             mode='window',
         )
+        # goal_z_seq is computed on-the-fly from skill_labels inside model.forward()
+        # No external npz needed: skill_labels already in dataset (4-tuple)
+        return ds
     except Exception as e:
         print(f"Dataset load failed ({e}). Falling back to synthetic.")
         return make_synthetic_dataset(K=cfg.num_skills)
@@ -159,24 +250,23 @@ class Trainer:
             else:
                 x_seq, actions, skill_labels = batch
                 rewards = None
-            mask       = None
-            goal_z_seq = None      # tuple/list batch는 goal_z 없음
+            mask = None
         else:
             x_seq        = batch['x_seq']
             actions      = batch['actions']
             skill_labels = batch['skill_labels']
             mask         = batch.get('mask', None)
             rewards      = batch.get('rewards', None)
-            goal_z_seq   = batch.get('goal_z_seq', None)
 
         x_seq        = x_seq.to(self.device)
         actions      = actions.to(self.device)
         skill_labels = skill_labels.to(self.device)
-        if mask       is not None: mask       = mask.to(self.device)
-        if rewards    is not None: rewards    = rewards.to(self.device)
-        if goal_z_seq is not None: goal_z_seq = goal_z_seq.to(self.device)
+        if mask    is not None: mask    = mask.to(self.device)
+        if rewards is not None: rewards = rewards.to(self.device)
 
-        return self.model(x_seq, actions, skill_labels, mask, rewards, goal_z_seq)
+        # goal_z_seq is computed on-the-fly inside model.forward()
+        # from skill_labels + x_batch → no need to pass from dataset
+        return self.model(x_seq, actions, skill_labels, mask, rewards)
 
     # ── Epoch helpers ────────────────────────────────────────────────────────
 
@@ -813,7 +903,7 @@ if __name__ == '__main__':
             lqr_planner = KODAQLQRPlanner(model, lqr_cfg)
             if args.u_bounds_path and Path(args.u_bounds_path).exists():
                 lqr_planner.load_u_bounds(args.u_bounds_path)
-            lqr_planner.precompute_gains()
+            lqr_planner.precompute_gains(H=args.lqr_horizon)
             model.set_lqr_planner(lqr_planner)
             print(f"[LQR] Planner ready.  "
                   f"goal_z_path={args.goal_z_path}  "
