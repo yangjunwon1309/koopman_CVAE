@@ -616,7 +616,7 @@ def visualize_episodes(
     terminals:   np.ndarray,
     K:           int,
     out_path:    str,
-    n_ep:        int = 8,
+    n_ep:        int = 12,
 ):
     """Per-episode skill label timeline."""
     import matplotlib; matplotlib.use('Agg')
@@ -628,7 +628,10 @@ def visualize_episodes(
 
     ends   = list(np.where(terminals)[0])
     starts = [0] + [e + 1 for e in ends[:-1]]
-    eps    = list(zip(starts, ends))[:n_ep]
+    full_list = list(zip(starts, ends))
+    indices = np.random.choice(len(full_list), n_ep, replace=False)
+    eps = [full_list[i] for i in indices]
+    #eps    = list(zip(starts, ends))[:n_ep]
 
     fig, axes = plt.subplots(len(eps), 1, figsize=(14, 1.5 * len(eps)))
     if len(eps) == 1: axes = [axes]
