@@ -101,6 +101,7 @@ class PolicyWrapper:
         self.mode = mode; self.device = device
         self.H_lo = 1; self.n_skills = None
         self._pi_iql = None; self._trainer = None; self._cfg = None
+        self._model = None; self._inv_steps = 30; self._deterministic = True
         self._hi_timer = 0; self._sid = 0
 
     @classmethod
@@ -160,6 +161,51 @@ class PolicyWrapper:
         pw.H_lo = cfg.H_lo; pw.n_skills = n_skills
         return pw, model, wm
 
+    @classmethod
+    def load_prior(cls, world_ckpt, device, action_inv_steps=30,
+                   deterministic=True):
+        dev = device
+        print(f"\n[Prior] world: {world_ckpt}")
+        wc    = torch.load(world_ckpt, map_location=dev)
+        model = KoopmanCVAE(wc['cfg'])
+        model.load_state_dict(wc['model_state'])
+        model.eval().to(dev)
+        print(f"  m={model.cfg.koopman_dim}  u_dim={model.cfg.action_latent}  "
+              f"action_dim={model.cfg.action_dim}")
+        cfg_on = OnlineConfig()
+        wm     = KoopmanWorldModelWrapper(model, cfg_on.wm_lr, dev)
+        pw = cls('prior', device)
+        pw._model = model
+        pw.H_lo = 1
+        pw._inv_steps = action_inv_steps
+        pw._deterministic = deterministic
+        return pw, model, wm
+
+    @torch.no_grad()
+    def _prior_u(self, z_t):
+        if self._deterministic:
+            out = self._model.policy_prior.net(z_t)
+            mean, _ = out.chunk(2, dim=-1)
+            return torch.tanh(mean)
+        u, _, _, _ = self._model.policy_prior(z_t)
+        return u
+
+    def _decode_action(self, u):
+        model = self._model
+        da = model.cfg.action_dim
+        a = torch.zeros(u.shape[0], da, device=u.device, requires_grad=True)
+        opt = torch.optim.Adam([a], lr=0.05)
+        u_target = u.detach()
+        with torch.enable_grad():
+            for _ in range(self._inv_steps):
+                opt.zero_grad()
+                loss = torch.nn.functional.mse_loss(model.action_encoder(a), u_target)
+                loss.backward()
+                opt.step()
+                with torch.no_grad():
+                    a.clamp_(-1., 1.)
+        return a.detach()
+
     def reset(self):
         self._hi_timer = 0; self._sid = 0
 
@@ -171,6 +217,10 @@ class PolicyWrapper:
             mu, _ = self._pi_iql(z_t)
             a = torch.tanh(mu)   # (1, H_lo, 9)
             return a[0].cpu().numpy()  # (H_lo, 9)
+        elif self.mode == 'prior':
+            u = self._prior_u(z_t)
+            a = self._decode_action(u)
+            return a.cpu().numpy()      # (1, 9)
         else:
             trainer = self._trainer; cfg = self._cfg
             if self._hi_timer == 0:
@@ -482,9 +532,9 @@ def analyze_reward_distribution(results_with_extra, wm, out_path, device):
 
 def main():
     p=argparse.ArgumentParser()
-    p.add_argument('--mode',        choices=['iql','online'], default='online')
+    p.add_argument('--mode',        choices=['iql','online','prior'], default='online')
     p.add_argument('--world_ckpt',  required=True)
-    p.add_argument('--policy_ckpt', required=True)
+    p.add_argument('--policy_ckpt', default=None)
     p.add_argument('--cat_ckpt',    default=None)
     p.add_argument('--env',         default='kitchen-mixed-v0')
     p.add_argument('--n_ep',        type=int, default=10)
@@ -494,18 +544,31 @@ def main():
     p.add_argument('--no_gif',      action='store_true')
     p.add_argument('--out_dir',     default='checkpoints/eval')
     p.add_argument('--device',      default='cuda:1' if torch.cuda.is_available() else 'cpu')
+    p.add_argument('--action_inv_steps', type=int, default=30)
+    p.add_argument('--prior_sample', action='store_true',
+                   help='Sample policy_prior instead of using tanh(mean).')
     args=p.parse_args()
 
     import gym, d4rl
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
 
     if args.mode=='iql':
+        if args.policy_ckpt is None:
+            raise ValueError("--policy_ckpt is required for --mode iql")
         policy, model, wm = PolicyWrapper.load_iql(
             args.world_ckpt, args.policy_ckpt, args.device)
         cond_len=16
-    else:
+    elif args.mode=='online':
+        if args.policy_ckpt is None:
+            raise ValueError("--policy_ckpt is required for --mode online")
         policy, model, wm = PolicyWrapper.load_online(
             args.world_ckpt, args.policy_ckpt, args.cat_ckpt, args.device)
+        cond_len=OnlineConfig().cond_len
+    else:
+        policy, model, wm = PolicyWrapper.load_prior(
+            args.world_ckpt, args.device,
+            action_inv_steps=args.action_inv_steps,
+            deterministic=not args.prior_sample)
         cond_len=OnlineConfig().cond_len
 
     results=[]; all_info_keys=set()
