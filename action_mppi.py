@@ -387,7 +387,9 @@ class KODAQMPPIPlanner:
             u_plans = torch.cat(traj_list, dim=1)   # (H, N_actual, d_u)
 
             # Value estimation
-            values = self.estimate_value(z0, u_plans, w0).nan_to_num_(0.0)
+            values = self.estimate_value(z0, u_plans, w0)
+            values = torch.where(torch.isfinite(values),
+                                 values, torch.zeros_like(values))
 
             # Elite selection
             n_elite      = min(cfg.num_elites, u_plans.shape[1])
@@ -843,12 +845,12 @@ def main():
     # obs (60,) + obs_ref (60,) → x (2108,)
     # delta_e = 0 (R3M unavailable; zeros)
     # delta_p = obs[18:60] - obs_ref[18:60]
-    # q       = obs[0:9]
+    # delta_q = obs[0:9] - obs_ref[0:9]
     # qdot    = obs[9:18]
     def x_encoder(obs: np.ndarray, obs_ref: np.ndarray) -> np.ndarray:
         delta_e = np.zeros(2048, dtype=np.float32)
         delta_p = (obs[18:60] - obs_ref[18:60]).astype(np.float32)
-        q       = obs[0:9].astype(np.float32)
+        q       = (obs[0:9] - obs_ref[0:9]).astype(np.float32)
         qdot    = obs[9:18].astype(np.float32)
         return np.concatenate([delta_e, delta_p, q, qdot])
 
