@@ -36,6 +36,12 @@ from models.losses import symlog, symexp, blend_koopman
 from data.extract_skill_label import load_x_sequences
 
 
+def torch_solve(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    if hasattr(torch, "linalg") and hasattr(torch.linalg, "solve"):
+        return torch.linalg.solve(A, B)
+    return torch.solve(B, A).solution
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # D4RL Kitchen constants
 # ─────────────────────────────────────────────────────────────────────────────
@@ -598,7 +604,7 @@ class KODAQLQRPlanner:
             BtP  = B_flat.transpose(-2, -1) @ P          # (N, d_u, m)
             BtPB = BtP @ B_flat                           # (N, d_u, d_u)
             S    = BtPB + R_mat.unsqueeze(0)              # (N, d_u, d_u)
-            K    = torch.linalg.solve(S, BtP)            # (N, d_u, m)
+            K    = torch_solve(S, BtP)                   # (N, d_u, m)
             AtP  = A_flat.transpose(-2, -1) @ P          # (N, m, m)
             P    = (Q_mat.unsqueeze(0)
                    + AtP @ A_flat

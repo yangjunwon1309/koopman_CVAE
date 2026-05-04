@@ -35,6 +35,12 @@ def symexp(x: torch.Tensor) -> torch.Tensor:
     return torch.sign(x) * (torch.exp(torch.abs(x)) - 1.0)
 
 
+def matrix_inv(x: torch.Tensor) -> torch.Tensor:
+    if hasattr(torch, "linalg") and hasattr(torch.linalg, "inv"):
+        return torch.linalg.inv(x)
+    return torch.inverse(x)
+
+
 def blend_koopman(log_lambdas, thetas, G_k, U, w):
     r_bar = torch.einsum('bk,km->bm', w, log_lambdas)
     t_bar = torch.einsum('bk,km->bm', w, thetas)
@@ -44,7 +50,7 @@ def blend_koopman(log_lambdas, thetas, G_k, U, w):
         r_exp * torch.sin(t_bar),
     )
     U_c   = U.to(dtype=torch.complex64)
-    U_inv = torch.linalg.inv(U_c)
+    U_inv = matrix_inv(U_c)
     Lam   = torch.diag_embed(lambdas_c)
     A_c   = U_c.unsqueeze(0) @ Lam @ U_inv.unsqueeze(0)
     A_bar = A_c.real

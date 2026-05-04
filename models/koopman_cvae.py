@@ -50,6 +50,7 @@ from models.losses import (
     q_categorical_loss,
     MovingPercentileScale,
     policy_prior_loss,
+    matrix_inv,
 )
 
 
@@ -283,7 +284,7 @@ class SkillKoopmanOperator(nn.Module):
     def get_A_k(self):
         log_lam = self.get_log_lambdas()
         U_c = self.U.to(dtype=torch.complex64)
-        U_inv = torch.linalg.inv(U_c)
+        U_inv = matrix_inv(U_c)
         r_exp = torch.exp(log_lam)
         lam_c = torch.complex(r_exp * torch.cos(self.theta_k),
                               r_exp * torch.sin(self.theta_k))
@@ -830,7 +831,10 @@ class KoopmanCVAE(nn.Module):
     def init_skill_centroids(self, centroids: torch.Tensor):
         K, m = centroids.shape
         if K == self.cfg.num_skills and m == self.cfg.koopman_dim:
-            U_init, _, _ = torch.linalg.svd(centroids.T, full_matrices=True)
+            if hasattr(torch, "linalg") and hasattr(torch.linalg, "svd"):
+                U_init, _, _ = torch.linalg.svd(centroids.T, full_matrices=True)
+            else:
+                U_init, _, _ = torch.svd(centroids.T, some=False)
             with torch.no_grad():
                 self.koopman.U.copy_(
                     U_init[:m, :m] if U_init.shape[0] >= m else torch.eye(m)
