@@ -283,14 +283,11 @@ class SkillKoopmanOperator(nn.Module):
 
     def get_A_k(self):
         log_lam = self.get_log_lambdas()
-        U_c = self.U.to(dtype=torch.complex64)
-        U_inv = matrix_inv(U_c)
+        U_inv = matrix_inv(self.U)
         r_exp = torch.exp(log_lam)
-        lam_c = torch.complex(r_exp * torch.cos(self.theta_k),
-                              r_exp * torch.sin(self.theta_k))
-        Lam   = torch.diag_embed(lam_c)
-        A_c   = U_c.unsqueeze(0) @ Lam @ U_inv.unsqueeze(0)
-        return A_c.real
+        lam_real = r_exp * torch.cos(self.theta_k)
+        Lam   = torch.diag_embed(lam_real)
+        return self.U.unsqueeze(0) @ Lam @ U_inv.unsqueeze(0)
 
     def get_B_k(self):
         return self.U.unsqueeze(0) @ self.G_k

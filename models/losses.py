@@ -45,15 +45,10 @@ def blend_koopman(log_lambdas, thetas, G_k, U, w):
     r_bar = torch.einsum('bk,km->bm', w, log_lambdas)
     t_bar = torch.einsum('bk,km->bm', w, thetas)
     r_exp = torch.exp(r_bar)
-    lambdas_c = torch.complex(
-        r_exp * torch.cos(t_bar),
-        r_exp * torch.sin(t_bar),
-    )
-    U_c   = U.to(dtype=torch.complex64)
-    U_inv = matrix_inv(U_c)
-    Lam   = torch.diag_embed(lambdas_c)
-    A_c   = U_c.unsqueeze(0) @ Lam @ U_inv.unsqueeze(0)
-    A_bar = A_c.real
+    lambda_real = r_exp * torch.cos(t_bar)
+    U_inv = matrix_inv(U)
+    Lam   = torch.diag_embed(lambda_real)
+    A_bar = U.unsqueeze(0) @ Lam @ U_inv.unsqueeze(0)
     G_mix = torch.einsum('bk,kmd->bmd', w, G_k)
     B_bar = U.unsqueeze(0) @ G_mix
     return A_bar, B_bar, r_bar, t_bar
