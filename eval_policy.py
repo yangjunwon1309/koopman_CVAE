@@ -172,14 +172,12 @@ class PolicyWrapper:
         model.eval().to(dev)
         print(f"  m={model.cfg.koopman_dim}  u_dim={model.cfg.action_latent}  "
               f"action_dim={model.cfg.action_dim}")
-        cfg_on = OnlineConfig()
-        wm     = KoopmanWorldModelWrapper(model, cfg_on.wm_lr, dev)
         pw = cls('prior', device)
         pw._model = model
         pw.H_lo = 1
         pw._inv_steps = action_inv_steps
         pw._deterministic = deterministic
-        return pw, model, wm
+        return pw, model, None
 
     @torch.no_grad()
     def _prior_u(self, z_t):
