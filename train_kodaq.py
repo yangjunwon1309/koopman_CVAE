@@ -177,6 +177,7 @@ def load_dataset(args, cfg: KoopmanCVAEConfig):
             pca_dim=args.pca_dim,
             device=args.device,
             mode='window',
+            reward_crop=None if args.reward_crop < 0 else args.reward_crop,
         )
         # goal_z_seq is computed on-the-fly from skill_labels inside model.forward()
         # No external npz needed: skill_labels already in dataset (4-tuple)
@@ -602,6 +603,9 @@ def parse_args():
     p.add_argument('--pca_dim',      type=int,   default=64)
     p.add_argument('--skill_dir',    type=str,   default='checkpoints/skill_pretrain')
     p.add_argument('--n_synthetic',  type=int,   default=2000)
+    p.add_argument('--reward_crop',  type=float, default=2.0,
+                   help='Use each episode only until cumulative reward reaches this value. '
+                        'Set negative to disable cropping.')
 
     # architecture
     p.add_argument('--koopman_dim',   type=int,   default=None)

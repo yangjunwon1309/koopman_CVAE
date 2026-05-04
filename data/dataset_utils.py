@@ -55,6 +55,7 @@ class KODAQWindowDataset(Dataset):
         terminals:    np.ndarray,   # (N,) bool
         seq_len:      int = 64,
         stride:       int = None,
+        intervals:    Optional[List[Tuple[int, int]]] = None,
         rewards:      np.ndarray = None,  # (N,) float — reward diff
     ):
         self.x_seq        = x_seq.astype(np.float32)
@@ -72,12 +73,14 @@ class KODAQWindowDataset(Dataset):
         if stride is None:
             stride = seq_len // 2
         self.stride       = stride
+        self.intervals    = intervals
 
         self.windows = self._build_windows(terminals)
         print(f"KODAQWindowDataset: {len(self.windows)} windows  "
               f"seq_len={seq_len}  stride={stride}  "
               f"N={len(x_seq)}  x_dim={x_seq.shape[1]}  "
-              f"reward_rate={self.rewards.mean():.4f}")
+              f"reward_rate={self.rewards.mean():.4f}  "
+              f"intervals={len(intervals) if intervals is not None else 'full'}")
 
     def _build_windows(self, terminals: np.ndarray) -> List[int]:
         """
@@ -85,18 +88,24 @@ class KODAQWindowDataset(Dataset):
         A window [start, start+seq_len) is valid if it contains no terminal.
         (Terminal at the very end of the window is allowed.)
         """
-        N    = len(self.x_seq)
         T    = self.seq_len
         ends = set(np.where(terminals)[0].tolist())
         windows = []
 
-        for start in range(0, N - T + 1, self.stride):
-            end = start + T - 1
-            # Check if any terminal lies strictly inside [start, end-1]
-            # (terminal at end is OK: episode boundary after this window)
-            interior_terminal = any(t in ends for t in range(start, end))
-            if not interior_terminal:
-                windows.append(start)
+        intervals = self.intervals
+        if intervals is None:
+            intervals = [(0, len(self.x_seq) - 1)]
+
+        for seg_s, seg_e in intervals:
+            if seg_e - seg_s + 1 < T:
+                continue
+            for start in range(seg_s, seg_e - T + 2, self.stride):
+                end = start + T - 1
+                # Check if any terminal lies strictly inside [start, end-1]
+                # (terminal at end is OK: episode boundary after this window)
+                interior_terminal = any(t in ends for t in range(start, end))
+                if not interior_terminal:
+                    windows.append(start)
 
         return windows
 
@@ -185,6 +194,66 @@ def collate_fn_pad(batch: List[Dict]) -> Dict[str, torch.Tensor]:
 # Main loader: builds dataset from cache or runs full pipeline
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _reward_trace_for_crop(rewards: np.ndarray) -> np.ndarray:
+    """Kitchen rewards are cumulative per-step values like 000111222."""
+    return rewards.astype(np.float32)
+
+
+def build_reward_crop_intervals(
+    terminals: np.ndarray,
+    rewards: Optional[np.ndarray],
+    reward_crop: Optional[float] = 2.0,
+    min_len: int = 1,
+) -> Tuple[Optional[List[Tuple[int, int]]], np.ndarray]:
+    """
+    Build original-index intervals [episode_start, crop_end] ending at the
+    first timestep where per-episode reward reaches reward_crop.
+    """
+    terminals = terminals.astype(bool)
+    ep_ends = list(np.where(terminals)[0])
+    ep_starts = [0] + [e + 1 for e in ep_ends[:-1]]
+
+    if rewards is None:
+        intervals = [(s, e) for s, e in zip(ep_starts, ep_ends)
+                     if e - s + 1 >= min_len]
+        return intervals, terminals
+
+    crop_terminals = np.zeros_like(terminals, dtype=bool)
+    intervals = []
+    n_no_hit = 0
+
+    for ep_s, ep_e in zip(ep_starts, ep_ends):
+        rew_ep = rewards[ep_s:ep_e + 1]
+        if reward_crop is None:
+            crop_t = len(rew_ep) - 1
+        else:
+            trace = _reward_trace_for_crop(rew_ep)
+            hits = np.where(trace >= reward_crop)[0]
+            if len(hits) == 0:
+                n_no_hit += 1
+                continue
+            crop_t = int(hits[0])
+
+        crop_e = ep_s + crop_t
+        if crop_e - ep_s + 1 < min_len:
+            continue
+        intervals.append((ep_s, crop_e))
+        crop_terminals[crop_e] = True
+
+    if reward_crop is not None:
+        lengths = np.asarray([e - s + 1 for s, e in intervals], dtype=np.int64)
+        if len(lengths):
+            print(
+                f"Reward crop: target={reward_crop}  episodes={len(intervals)}/{len(ep_ends)}  "
+                f"no_hit={n_no_hit}  len=[{lengths.min()},{lengths.max()}]  "
+                f"mean={lengths.mean():.1f}"
+            )
+        else:
+            print(f"Reward crop: target={reward_crop} left no episodes.")
+
+    return intervals, crop_terminals
+
+
 def load_kodaq_dataset(
     env_name:   str  = 'kitchen-mixed-v0',
     seq_len:    int  = 64,
@@ -195,6 +264,7 @@ def load_kodaq_dataset(
     pca_dim:    int  = 64,
     device:     str  = 'cuda',
     mode:       str  = 'window',   # 'window' | 'segment'
+    reward_crop: Optional[float] = 2.0,
 ) -> Dataset:
     """
     Full KODAQ dataset loader.
@@ -240,15 +310,26 @@ def load_kodaq_dataset(
     print(f"  x_seq={x_seq.shape}  actions={actions.shape}  "
           f"terminals={terminals.sum()}  K={assignments.max()+1}")
 
+    crop_intervals = None
+    crop_terminals = terminals
+    if mode == 'window':
+        crop_intervals, crop_terminals = build_reward_crop_intervals(
+            terminals=terminals,
+            rewards=rewards,
+            reward_crop=reward_crop,
+            min_len=seq_len,
+        )
+
     # ── Build dataset ─────────────────────────────────────────────────────────
     if mode == 'window':
         return KODAQWindowDataset(
             x_seq=x_seq,
             actions=actions,
             skill_labels=assignments,
-            terminals=terminals,
+            terminals=crop_terminals,
             seq_len=seq_len,
             stride=stride,
+            intervals=crop_intervals,
             rewards=rewards,
         )
     elif mode == 'segment':
