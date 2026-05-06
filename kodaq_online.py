@@ -1235,6 +1235,8 @@ def main():
     p.add_argument('--no_prefill',    action='store_true')
     p.add_argument('--eval_every',    type=int,   default=10_000)
     p.add_argument('--n_eval_ep',     type=int,   default=10)
+    p.add_argument('--log_every',     type=int,   default=1_000)
+    p.add_argument('--save_every',    type=int,   default=50_000)
     p.add_argument('--device',        default='cuda:1'
                    if torch.cuda.is_available() else 'cpu')
     p.add_argument('--wandb_project', default=None)
@@ -1282,7 +1284,8 @@ def main():
         awr_beta=args.awr_beta, n_env_steps=args.n_steps,
         wm_lr=args.wm_lr, w_env=args.w_env, w_acc=args.w_acc,
         w_event=args.w_event, eval_every=args.eval_every,
-        n_eval_ep=args.n_eval_ep,
+        n_eval_ep=args.n_eval_ep, log_every=args.log_every,
+        save_every=args.save_every,
     )
 
     if args.prior_online:
