@@ -1223,6 +1223,7 @@ def main():
     p.add_argument('--gamma',         type=float, default=0.99)
     p.add_argument('--lr',            type=float, default=3e-4)
     p.add_argument('--batch_size',    type=int,   default=256)
+    p.add_argument('--n_updates_per_step', type=int, default=1)
     p.add_argument('--kl_weight',     type=float, default=1.0)
     p.add_argument('--kl_lqr_weight', type=float, default=0.1)
     p.add_argument('--awr_beta',      type=float, default=3.0)
@@ -1247,15 +1248,27 @@ def main():
     p.add_argument('--action_inv_lr',    type=float, default=0.05)
     args = p.parse_args()
 
+    if not sys.stdout.isatty():
+        try:
+            sys.stdout.reconfigure(line_buffering=True)
+            sys.stderr.reconfigure(line_buffering=True)
+        except AttributeError:
+            pass
+
     device = args.device
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
-    print(f"Device: {device}")
+    print(f"Device: {device}", flush=True)
 
     use_wandb = WANDB_AVAILABLE and args.wandb_project is not None
     if use_wandb:
         wandb.init(project=args.wandb_project,
                    name=args.wandb_run or 'kodaq_online_v3',
                    config=vars(args))
+        print(f"[wandb] project={args.wandb_project} run={wandb.run.name} "
+              f"url={wandb.run.url}", flush=True)
+    else:
+        print(f"[wandb] disabled available={WANDB_AVAILABLE} "
+              f"project={args.wandb_project}", flush=True)
 
     # World model
     print(f"\nLoading: {args.world_ckpt}")
@@ -1286,6 +1299,7 @@ def main():
         w_event=args.w_event, eval_every=args.eval_every,
         n_eval_ep=args.n_eval_ep, log_every=args.log_every,
         save_every=args.save_every,
+        n_updates_per_step=args.n_updates_per_step,
     )
 
     if args.prior_online:
