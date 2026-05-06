@@ -44,6 +44,7 @@ from dataclasses import dataclass
 from collections import deque
 
 from models.koopman_cvae import KoopmanCVAE
+from models.losses import q_categorical_loss, two_hot_decode, policy_prior_loss
 from data.extract_skill_label import load_x_sequences
 from lqr_koopman import (
     blend_koopman,
@@ -299,7 +300,7 @@ class KoopmanWorldModelWrapper:
 
         # Active: posterior, recurrent, skill_prior, reward_head
         reward_params = []
-        if model.cfg.use_reward_head:
+        if getattr(model.cfg, 'use_reward_head', True):
             head = getattr(model.decoder, 'head_reward',
                            getattr(model, 'reward_head', None))
             if head is not None:
@@ -319,7 +320,7 @@ class KoopmanWorldModelWrapper:
 
     def _r_hat_event(self, z: torch.Tensor) -> float:
         """P(task completion | z_t) via BCE head."""
-        if not self.model.cfg.use_reward_head: return 0.0
+        if not getattr(self.model.cfg, 'use_reward_head', True): return 0.0
         logit = self._bce_head(z)
         return torch.sigmoid(logit).mean().item() if logit is not None else 0.0
 
@@ -409,6 +410,184 @@ class EnvContext:
 # ─────────────────────────────────────────────────────────────────────────────
 # KODAQ Online Trainer
 # ─────────────────────────────────────────────────────────────────────────────
+
+class PriorReplayBuffer:
+    def __init__(self, capacity: int, device: str):
+        self.capacity = capacity
+        self.device = device
+        self._d: Dict[str, np.ndarray] = {}
+        self._ptr = 0
+        self._n = 0
+
+    def _init(self, z_dim: int, u_dim: int):
+        C = self.capacity
+        self._d = {
+            'z': np.zeros((C, z_dim), dtype=np.float32),
+            'u': np.zeros((C, u_dim), dtype=np.float32),
+            'r': np.zeros(C, dtype=np.float32),
+            'z_next': np.zeros((C, z_dim), dtype=np.float32),
+            'done': np.zeros(C, dtype=np.float32),
+        }
+
+    def add(self, z, u, r, z_next, done):
+        if not self._d:
+            self._init(z.shape[-1], u.shape[-1])
+        p = self._ptr
+        self._d['z'][p] = z
+        self._d['u'][p] = u
+        self._d['r'][p] = r
+        self._d['z_next'][p] = z_next
+        self._d['done'][p] = float(done)
+        self._ptr = (p + 1) % self.capacity
+        self._n = min(self._n + 1, self.capacity)
+
+    def sample(self, batch_size: int) -> Dict[str, torch.Tensor]:
+        idx = np.random.randint(0, self._n, batch_size)
+        return {k: torch.FloatTensor(v[idx]).to(self.device)
+                for k, v in self._d.items()}
+
+    @property
+    def size(self): return self._n
+
+
+class PolicyPriorOnlineTrainer:
+    def __init__(self, cfg: OnlineConfig, model: KoopmanCVAE, device: str,
+                 action_inv_steps: int = 30, action_inv_lr: float = 0.05):
+        self.cfg = cfg
+        self.model = model
+        self.device = device
+        self.step = 0
+        self.action_inv_steps = action_inv_steps
+        self.action_inv_lr = action_inv_lr
+        self.buf = PriorReplayBuffer(cfg.buffer_size, device)
+
+        for p in model.parameters():
+            p.requires_grad_(False)
+        for mod in [model.reward_ensemble_head, model.q_head, model.policy_prior]:
+            for p in mod.parameters():
+                p.requires_grad_(True)
+            mod.train()
+        model.q_head_target.eval()
+        model._detach_q_head.eval()
+
+        self.opt_reward = torch.optim.Adam(model.reward_ensemble_head.parameters(),
+                                           lr=cfg.wm_lr)
+        self.opt_q = torch.optim.Adam(model.q_head.parameters(), lr=cfg.lr)
+        self.opt_pi = torch.optim.Adam(model.policy_prior.parameters(), lr=cfg.lr)
+
+    def decode_action(self, u: torch.Tensor) -> np.ndarray:
+        if u.dim() == 1:
+            u = u.unsqueeze(0)
+        u_target = u.detach().to(self.device)
+        da = self.model.cfg.action_dim
+        a = torch.zeros(u_target.shape[0], da, device=self.device,
+                        requires_grad=True)
+        opt = torch.optim.Adam([a], lr=self.action_inv_lr)
+        with torch.enable_grad():
+            for _ in range(self.action_inv_steps):
+                opt.zero_grad()
+                loss = F.mse_loss(self.model.action_encoder(a), u_target)
+                loss.backward()
+                opt.step()
+                with torch.no_grad():
+                    a.clamp_(-1.0, 1.0)
+        return a.detach()[0].cpu().numpy()
+
+    @torch.no_grad()
+    def act(self, z: torch.Tensor) -> Tuple[np.ndarray, np.ndarray]:
+        u, _, _, _ = self.model.policy_prior(z)
+        a = self.decode_action(u)
+        return a, u[0].detach().cpu().numpy()
+
+    def update(self) -> Dict[str, float]:
+        if self.buf.size < self.cfg.batch_size:
+            return {}
+        b = self.buf.sample(self.cfg.batch_size)
+        z, u = b['z'], b['u']
+        r, z_next, done = b['r'], b['z_next'], b['done']
+        m = self.model
+
+        loss_r = m.reward_ensemble_head.ensemble_loss(z, u, r.clamp(0.0, 1.0))
+        self.opt_reward.zero_grad()
+        loss_r.backward()
+        nn.utils.clip_grad_norm_(m.reward_ensemble_head.parameters(),
+                                 self.cfg.grad_clip)
+        self.opt_reward.step()
+
+        with torch.no_grad():
+            u_next, _, _, _ = m.policy_prior(z_next)
+            r_hat = m.reward_ensemble_head.penalized_reward(z, u)
+            q_next = m.q_head_target.expected_value(
+                z_next, u_next, return_type='min')
+            y = (r_hat + self.cfg.gamma * (1 - done) * q_next).clamp(
+                m.cfg.v_min, m.cfg.v_max)
+
+        q_logits = m.q_head(z, u).permute(1, 0, 2).unsqueeze(1)
+        loss_q = q_categorical_loss(
+            q_logits=q_logits,
+            reward_seq=torch.zeros_like(y).unsqueeze(1),
+            q_target_scalar=y.unsqueeze(1),
+            bins=m.q_head.bins,
+            gamma=1.0,
+        )
+        self.opt_q.zero_grad()
+        loss_q.backward()
+        nn.utils.clip_grad_norm_(m.q_head.parameters(), self.cfg.grad_clip)
+        self.opt_q.step()
+        m.soft_update_target_Q()
+
+        u_pi, log_pi, _, _ = m.policy_prior(z)
+        q_logits_pi = m._detach_q_head(z, u_pi)
+        q_vals_pi = two_hot_decode(q_logits_pi, m.q_head.bins)
+        n_pick = min(2, m.cfg.num_q)
+        idx = torch.randperm(m.cfg.num_q, device=z.device)[:n_pick]
+        q_pi = q_vals_pi[idx].min(0).values
+        m.scale_tracker.update(q_pi.detach())
+        loss_pi = policy_prior_loss(
+            log_pi=log_pi,
+            q_pi=q_pi,
+            rho=m.scale_tracker.rho,
+            entropy_coef=m.cfg.entropy_coef,
+        )
+        self.opt_pi.zero_grad()
+        loss_pi.backward()
+        nn.utils.clip_grad_norm_(m.policy_prior.parameters(), self.cfg.grad_clip)
+        self.opt_pi.step()
+
+        return {
+            'loss_reward': loss_r.item(),
+            'loss_q': loss_q.item(),
+            'loss_pi': loss_pi.item(),
+            'q_mean': q_pi.detach().mean().item(),
+            'rho': m.scale_tracker.rho,
+            'r_hat': r_hat.detach().mean().item(),
+        }
+
+    def save(self, path: str):
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        torch.save({
+            'step': self.step,
+            'cfg': self.model.cfg,
+            'model_state': self.model.state_dict(),
+            'opt_reward': self.opt_reward.state_dict(),
+            'opt_q': self.opt_q.state_dict(),
+            'opt_pi': self.opt_pi.state_dict(),
+            'scale_tracker': self.model.scale_tracker.state_dict(),
+        }, path)
+        print(f"  Saved: {path}")
+
+    def load(self, path: str) -> int:
+        ck = torch.load(path, map_location=self.device)
+        self.model.load_state_dict(ck['model_state'], strict=False)
+        if 'opt_reward' in ck:
+            self.opt_reward.load_state_dict(ck['opt_reward'])
+            self.opt_q.load_state_dict(ck['opt_q'])
+            self.opt_pi.load_state_dict(ck['opt_pi'])
+        if 'scale_tracker' in ck:
+            self.model.scale_tracker.load_state_dict(ck['scale_tracker'])
+        self.step = int(ck.get('step', 0))
+        return self.step
+
 
 class KODAQOnlineTrainer:
     """
@@ -925,6 +1104,111 @@ def train(cfg: OnlineConfig, trainer: KODAQOnlineTrainer,
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
+def train_policy_prior_online(cfg: OnlineConfig,
+                              trainer: PolicyPriorOnlineTrainer,
+                              env_name: str,
+                              out_dir: str,
+                              device: str,
+                              use_wandb: bool = False):
+    import gym, d4rl
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    env = gym.make(env_name)
+    obs = env.reset()
+    ctx = EnvContext(trainer.model, device, cfg.cond_len)
+    ctx.reset(obs)
+    recent = {k: deque(maxlen=cfg.log_every) for k in
+              ['loss_reward', 'loss_q', 'loss_pi', 'q_mean', 'rho',
+               'r_hat', 'ep_reward', 'ep_tasks']}
+    global_step = trainer.step
+    ep_r = 0.0
+    ep_tasks = 0
+    t0 = time.time()
+
+    print(f"\n{'='*60}")
+    print(f"PolicyPrior Online  steps={cfg.n_env_steps}  env={env_name}")
+    print(f"  batch={cfg.batch_size}  buf={cfg.buffer_size}  cond={cfg.cond_len}")
+    print(f"{'='*60}\n")
+
+    while global_step < cfg.n_env_steps:
+        if ctx.z_t is None:
+            a = env.action_space.sample()
+            obs_nx, r, done, info = env.step(a)
+            ctx.step(obs_nx, a)
+            obs = obs_nx
+            ep_r += r
+            global_step += 1
+            if done:
+                recent['ep_reward'].append(ep_r)
+                recent['ep_tasks'].append(ep_tasks)
+                obs = env.reset()
+                ctx.reset(obs)
+                ep_r = 0.0
+                ep_tasks = 0
+            continue
+
+        z_t = ctx.z_t.clone()
+        a_np, u_np = trainer.act(z_t)
+        obs_nx, r_env, done, info = env.step(a_np.clip(-1, 1))
+        ctx.step(obs_nx, a_np)
+
+        ep_r += r_env
+        ep_c = info.get('episode_task_completions',
+                        info.get('completed_tasks', []))
+        ep_tasks = max(ep_tasks, len(ep_c) if isinstance(ep_c, list)
+                       else int(ep_c) if ep_c is not None else 0)
+
+        if ctx.z_t is not None:
+            trainer.buf.add(
+                z=z_t.cpu().numpy()[0],
+                u=u_np,
+                r=float(r_env > 0.0),
+                z_next=ctx.z_t.cpu().numpy()[0],
+                done=float(done),
+            )
+
+        for _ in range(cfg.n_updates_per_step):
+            info_d = trainer.update()
+            for k, v in info_d.items():
+                if k in recent:
+                    recent[k].append(v)
+
+        obs = obs_nx
+        global_step += 1
+
+        if done:
+            recent['ep_reward'].append(ep_r)
+            recent['ep_tasks'].append(ep_tasks)
+            obs = env.reset()
+            ctx.reset(obs)
+            ep_r = 0.0
+            ep_tasks = 0
+
+        if global_step % cfg.log_every == 0:
+            trainer.step = global_step
+            ms = {k: np.mean(list(v)) if v else 0.0
+                  for k, v in recent.items()}
+            sps = cfg.log_every / (time.time() - t0 + 1e-6)
+            t0 = time.time()
+            print(f"Step {global_step:7d} | "
+                  f"R={ms['loss_reward']:.3f} Q={ms['loss_q']:.3f} "
+                  f"Pi={ms['loss_pi']:.3f} q={ms['q_mean']:.3f} "
+                  f"rho={ms['rho']:.3f} rhat={ms['r_hat']:.3f} | "
+                  f"ep_r={ms['ep_reward']:.2f} tasks={ms['ep_tasks']:.2f} | "
+                  f"{sps:.0f}sps")
+            if use_wandb:
+                wandb.log({f"prior_online/{k}": v for k, v in ms.items()},
+                          step=global_step)
+
+        if global_step % cfg.save_every == 0:
+            trainer.step = global_step
+            trainer.save(f"{out_dir}/policy_prior_online_step{global_step}.pt")
+
+    trainer.step = global_step
+    trainer.save(f"{out_dir}/policy_prior_online_final.pt")
+    env.close()
+    print(f"\nDone. {global_step} steps -> {out_dir}/")
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--world_ckpt',    default='checkpoints/kodaq_v4/final.pt')
@@ -955,6 +1239,10 @@ def main():
                    if torch.cuda.is_available() else 'cpu')
     p.add_argument('--wandb_project', default=None)
     p.add_argument('--wandb_run',     default=None)
+    p.add_argument('--prior_online',  action='store_true',
+                   help='Fine-tune KoopmanCVAE.policy_prior online.')
+    p.add_argument('--action_inv_steps', type=int, default=30)
+    p.add_argument('--action_inv_lr',    type=float, default=0.05)
     args = p.parse_args()
 
     device = args.device
@@ -996,6 +1284,20 @@ def main():
         w_event=args.w_event, eval_every=args.eval_every,
         n_eval_ep=args.n_eval_ep,
     )
+
+    if args.prior_online:
+        trainer = PolicyPriorOnlineTrainer(
+            cfg, model, device,
+            action_inv_steps=args.action_inv_steps,
+            action_inv_lr=args.action_inv_lr,
+        )
+        if args.resume and Path(args.resume).exists():
+            trainer.load(args.resume)
+        train_policy_prior_online(
+            cfg, trainer, args.env, args.out_dir, device, use_wandb)
+        if use_wandb:
+            wandb.finish()
+        return
 
     wm      = KoopmanWorldModelWrapper(model, cfg.wm_lr, device,
                                         cat_head=cat_head)
