@@ -91,6 +91,7 @@ class ExtractClusterConfig:
     min_seg_len:    int   = 5
     device:         str   = 'cuda'
     env_name:       str   = 'kitchen-mixed-v0'
+    crop_reward:    Optional[float] = None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -110,6 +111,112 @@ def load_d4rl_flat(env_name: str = 'kitchen-mixed-v0') -> Tuple[np.ndarray, np.n
     terminals = dataset['terminals'].astype(bool)  # (N,)
     print(f"D4RL '{env_name}': {len(obs)} steps  episodes={terminals.sum()}")
     return obs, actions, terminals
+
+
+def load_d4rl_rewards(env_name: str = 'kitchen-mixed-v0') -> np.ndarray:
+    """Load D4RL rewards only. Kitchen rewards are cumulative per episode."""
+    import d4rl, gym
+    dataset = gym.make(env_name).get_dataset()
+    if 'rewards' not in dataset:
+        raise KeyError(f"D4RL dataset '{env_name}' has no rewards field")
+    return dataset['rewards'].astype(np.float32)
+
+
+def _crop_suffix(crop_reward: Optional[float]) -> str:
+    if crop_reward is None:
+        return ''
+    value = f"{float(crop_reward):g}".replace('-', 'm').replace('.', 'p')
+    return f"_reward{value}"
+
+
+def default_x_cache_path(out_h5: str, crop_reward: Optional[float] = None) -> str:
+    out_dir = Path(out_h5).parent
+    return str(out_dir / f"x_sequences{_crop_suffix(crop_reward)}.npz")
+
+
+def default_r3m_cache_path(out_h5: str, crop_reward: Optional[float] = None) -> str:
+    out_dir = Path(out_h5).parent
+    return str(out_dir / f"r3m_embeddings{_crop_suffix(crop_reward)}.npz")
+
+
+def build_reward_crop_indices(
+    terminals: np.ndarray,
+    rewards: np.ndarray,
+    crop_reward: Optional[float],
+    min_len: int = 1,
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], List[Tuple[int, int]]]:
+    """
+    Return original flat indices cropped at the first reward >= crop_reward.
+    Episodes that never reach crop_reward are skipped.
+    """
+    if crop_reward is None:
+        return None, None, []
+
+    terminals = terminals.astype(bool)
+    rewards = rewards.astype(np.float32)
+    ep_ends = list(np.where(terminals)[0])
+    ep_starts = [0] + [e + 1 for e in ep_ends[:-1]]
+
+    chunks = []
+    intervals = []
+    n_no_hit = 0
+    n_short = 0
+
+    for ep_s, ep_e in zip(ep_starts, ep_ends):
+        rew_ep = rewards[ep_s:ep_e + 1]
+        hits = np.where(rew_ep >= crop_reward)[0]
+        if len(hits) == 0:
+            n_no_hit += 1
+            continue
+
+        crop_e = ep_s + int(hits[0])
+        length = crop_e - ep_s + 1
+        if length < min_len:
+            n_short += 1
+            continue
+
+        intervals.append((ep_s, crop_e))
+        chunks.append(np.arange(ep_s, crop_e + 1, dtype=np.int64))
+
+    if not chunks:
+        raise ValueError(
+            f"crop_reward={crop_reward} left no usable episodes "
+            f"(episodes={len(ep_ends)}, no_hit={n_no_hit}, short={n_short})"
+        )
+
+    crop_indices = np.concatenate(chunks)
+    crop_terminals = np.zeros(len(crop_indices), dtype=bool)
+    offset = 0
+    for ep_s, crop_e in intervals:
+        offset += crop_e - ep_s + 1
+        crop_terminals[offset - 1] = True
+
+    lengths = np.asarray([e - s + 1 for s, e in intervals], dtype=np.int64)
+    print(
+        f"Reward crop: target={crop_reward}  episodes={len(intervals)}/{len(ep_ends)}  "
+        f"no_hit={n_no_hit}  short={n_short}  steps={len(crop_indices)}  "
+        f"len=[{lengths.min()},{lengths.max()}]  mean={lengths.mean():.1f}"
+    )
+    return crop_indices, crop_terminals, intervals
+
+
+def crop_flat_by_reward(
+    obs: np.ndarray,
+    actions: np.ndarray,
+    terminals: np.ndarray,
+    rewards: np.ndarray,
+    crop_reward: Optional[float],
+    embeddings: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    """Crop flat arrays to each episode's first reward >= crop_reward."""
+    crop_indices, crop_terminals, _ = build_reward_crop_indices(
+        terminals, rewards, crop_reward
+    )
+    if crop_indices is None:
+        return obs, actions, terminals, embeddings
+
+    embeddings_c = None if embeddings is None else embeddings[crop_indices]
+    return obs[crop_indices], actions[crop_indices], crop_terminals, embeddings_c
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -146,6 +253,7 @@ def render_and_embed_r3m(
     device:     str = 'cuda',
     batch_size: int = 256,
     cache_path: str = None,
+    crop_reward: Optional[float] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     EXTRACT generate_kitchen_data.py 방식:
@@ -169,12 +277,25 @@ def render_and_embed_r3m(
     actions   = dataset['actions'].copy()
     terminals = dataset['terminals'].astype(bool)
     N         = len(obs)
+    crop_indices = None
+    crop_terminals = None
+    crop_intervals = None
+    if crop_reward is not None:
+        rewards = dataset['rewards'].astype(np.float32)
+        crop_indices, crop_terminals, crop_intervals = build_reward_crop_indices(
+            terminals, rewards, crop_reward
+        )
+    expected_N = N if crop_indices is None else len(crop_indices)
 
     # ── 캐시 확인 ────────────────────────────────────────────────────────────
     if cache_path and Path(cache_path).exists():
         print(f"Loading cached R3M embeddings: {cache_path}")
         embeddings = np.load(cache_path)['embeddings']
-        assert len(embeddings) == N, f"Cache size mismatch: {len(embeddings)} vs {N}"
+        assert len(embeddings) == expected_N, f"Cache size mismatch: {len(embeddings)} vs {expected_N}"
+        if crop_indices is not None:
+            obs = obs[crop_indices]
+            actions = actions[crop_indices]
+            terminals = crop_terminals
         norm = np.linalg.norm(embeddings, axis=1).mean()
         print(f"  Loaded: {embeddings.shape}  mean_norm={norm:.2f}")
         if norm < 0.1:
@@ -187,13 +308,18 @@ def render_and_embed_r3m(
         model, transform = load_r3m(device)
 
     sim       = env.unwrapped.sim
-    ep_ends   = list(np.where(terminals)[0])
-    ep_starts = [0] + [e + 1 for e in ep_ends[:-1]]
-    print(f"Episodes: {len(ep_starts)}  Steps: {N}")
+    if crop_intervals is None:
+        ep_ends   = list(np.where(terminals)[0])
+        ep_starts = [0] + [e + 1 for e in ep_ends[:-1]]
+        replay_intervals = list(zip(ep_starts, ep_ends))
+    else:
+        replay_intervals = crop_intervals
+    print(f"Episodes: {len(replay_intervals)}  Steps: {expected_N}")
 
-    embeddings   = np.zeros((N, 2048), dtype=np.float32)
+    embeddings   = np.zeros((expected_N, 2048), dtype=np.float32)
     frames_batch = []
     idx_batch    = []
+    out_idx       = 0
 
     def flush():
         if not frames_batch:
@@ -207,20 +333,21 @@ def render_and_embed_r3m(
         idx_batch.clear()
 
     # ── Action replay ─────────────────────────────────────────────────────────
-    for ep_i, (ep_s, ep_e) in enumerate(zip(ep_starts, ep_ends)):
+    for ep_i, (ep_s, ep_e) in enumerate(replay_intervals):
         env.reset()
         for t in range(ep_s, ep_e + 1):
             frame = render_frame(sim)
             frames_batch.append(transform(Image.fromarray(frame)))
-            idx_batch.append(t)
+            idx_batch.append(out_idx)
+            out_idx += 1
             if len(frames_batch) >= batch_size:
                 flush()
             if t < ep_e:
                 env.step(actions[t])
 
         if (ep_i + 1) % 50 == 0:
-            print(f"  ep {ep_i+1}/{len(ep_starts)}  "
-                  f"t={ep_e+1}/{N} ({(ep_e+1)/N*100:.0f}%)", flush=True)
+            print(f"  ep {ep_i+1}/{len(replay_intervals)}  "
+                  f"steps={out_idx}/{expected_N} ({out_idx/expected_N*100:.0f}%)", flush=True)
 
     flush()
     norm = np.linalg.norm(embeddings, axis=1).mean()
@@ -233,6 +360,8 @@ def render_and_embed_r3m(
         np.savez_compressed(cache_path, embeddings=embeddings)
         print(f"Saved: {cache_path}")
 
+    if crop_indices is not None:
+        return obs[crop_indices], actions[crop_indices], crop_terminals, embeddings
     return obs, actions, terminals, embeddings
 
 
@@ -544,15 +673,21 @@ def run_extract_pipeline(
     Returns: smoothed_labels, logprobs, segments, diff_for_kmeans, kmeans_model
     """
     out_dir   = Path(out_h5).parent
-    r3m_cache = str(out_dir / 'r3m_embeddings.npz')
+    r3m_cache = default_r3m_cache_path(out_h5, cfg.crop_reward)
     if x_cache is None:
-        x_cache = str(out_dir / 'x_sequences.npz')
+        x_cache = default_x_cache_path(out_h5, cfg.crop_reward)
 
     # ── x_t 캐시 확인 (전체 파이프라인 재사용) ───────────────────────────────
     if Path(x_cache).exists() and Path(out_h5).exists():
         print(f"Loading cached x_t: {x_cache}")
         x_seq, actions, terminals = load_x_sequences(x_cache)
-        obs, _, _ = load_d4rl_flat(cfg.env_name)
+        obs, actions_full, terminals_full = load_d4rl_flat(cfg.env_name)
+        if cfg.crop_reward is not None:
+            rewards = load_d4rl_rewards(cfg.env_name)
+            obs, _, _, _ = crop_flat_by_reward(
+                obs, actions_full, terminals_full, rewards, cfg.crop_reward
+            )
+        assert len(obs) == len(x_seq), f"obs/x_seq length mismatch: {len(obs)} vs {len(x_seq)}"
         # R3M diff is already baked into x_seq[:, :2048]
         embeddings = None
     else:
@@ -562,10 +697,16 @@ def run_extract_pipeline(
             obs, actions, terminals, embeddings = render_and_embed_r3m(
                 cfg.env_name, model, transform, cfg.r3m_device,
                 cache_path=r3m_cache,
+                crop_reward=cfg.crop_reward,
             )
         else:
             obs, actions, terminals = load_d4rl_flat(cfg.env_name)
             embeddings = None
+            if cfg.crop_reward is not None:
+                rewards = load_d4rl_rewards(cfg.env_name)
+                obs, actions, terminals, embeddings = crop_flat_by_reward(
+                    obs, actions, terminals, rewards, cfg.crop_reward, embeddings
+                )
 
         # ── x_t 구성 ──────────────────────────────────────────────────────────
         x_seq = build_x_sequence(obs, terminals, embeddings)
@@ -576,6 +717,9 @@ def run_extract_pipeline(
         # EXTRACT 원본: K-means on Δe_t (R3M diff)
         r3m_diff = compute_r3m_diff(embeddings, terminals)
         diff_km  = r3m_diff
+    elif cfg.use_r3m and x_seq.shape[1] >= DIM_DELTA_E and np.any(x_seq[:, :DIM_DELTA_E]):
+        # Cached x_t already contains R3M diff in the first 2048 dims.
+        diff_km = x_seq[:, :DIM_DELTA_E].astype(np.float32)
     else:
         # Fallback: K-means on Δp_t (object state diff)
         diff_km = compute_state_diff(obs, terminals, use_object_only=True)
@@ -733,15 +877,19 @@ def main():
     p.add_argument('--window',    type=int, default=7)
     p.add_argument('--env',       default='kitchen-mixed-v0')
     p.add_argument('--device',    default='cuda')
+    p.add_argument('--crop_reward', type=float, default=None)
     p.add_argument('--visualize', action='store_true')
     p.add_argument('--viz',       default='checkpoints/skill_pretrain/cluster_viz.png')
     args = p.parse_args()
 
     if args.visualize:
         import d4rl, gym
-        env     = gym.make(args.env)
-        dataset = env.get_dataset()
-        term    = dataset['terminals'].astype(bool)
+        if args.crop_reward is not None:
+            term = load_x_sequences(default_x_cache_path(args.out, args.crop_reward))[2]
+        else:
+            env     = gym.make(args.env)
+            dataset = env.get_dataset()
+            term    = dataset['terminals'].astype(bool)
         asgn, _ = load_cluster_data(args.out)
         K_viz   = int(asgn.max()) + 1
         visualize_episodes(asgn, term, K_viz, args.viz)
@@ -752,13 +900,17 @@ def main():
         K=args.K, median_window=args.window,
         use_r3m=args.r3m, pca_dim=args.pca_dim,
         device=args.device, env_name=args.env,
+        crop_reward=args.crop_reward,
     )
     smoothed, logprobs, segs, diff, km = run_extract_pipeline(cfg, args.out)
 
     # Visualization
     try:
         import d4rl, gym
-        term = gym.make(args.env).get_dataset()['terminals'].astype(bool)
+        if args.crop_reward is not None:
+            term = load_x_sequences(default_x_cache_path(args.out, args.crop_reward))[2]
+        else:
+            term = gym.make(args.env).get_dataset()['terminals'].astype(bool)
         visualize_episodes(smoothed, term, cfg.K, args.viz)
         pca_path = args.viz.replace('.png', '_pca.png')
         visualize_pca_clusters(diff, smoothed, km, cfg.K, pca_path)
