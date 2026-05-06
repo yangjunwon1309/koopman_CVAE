@@ -115,6 +115,13 @@ class KODAQWindowDataset(Dataset):
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         start = self.windows[idx]
         end   = start + self.seq_len
+        if end > len(self.x_seq) or end > len(self.actions) or \
+           end > len(self.skill_labels) or end > len(self.rewards):
+            raise IndexError(
+                f"Invalid window [{start}:{end}] for lengths "
+                f"x={len(self.x_seq)} a={len(self.actions)} "
+                f"skill={len(self.skill_labels)} r={len(self.rewards)}"
+            )
         return (
             torch.from_numpy(self.x_seq[start:end]),         # (T, 2108)
             torch.from_numpy(self.actions[start:end]),        # (T, 9)
@@ -306,6 +313,29 @@ def load_kodaq_dataset(
               f"nonzero={( rewards > 0).sum()}")
     except Exception as e:
         print(f"  Rewards not available ({e}). Using zeros.")
+
+    lens = [len(x_seq), len(actions), len(terminals), len(assignments)]
+    names = ['x_seq', 'actions', 'terminals', 'assignments']
+    if rewards is not None:
+        lens.append(len(rewards))
+        names.append('rewards')
+    min_len = min(lens)
+    if len(set(lens)) != 1:
+        print("  Length mismatch detected: " +
+              ", ".join(f"{n}={l}" for n, l in zip(names, lens)))
+        print(f"  Trimming all arrays to min_len={min_len}.")
+        x_seq = x_seq[:min_len]
+        actions = actions[:min_len]
+        terminals = terminals[:min_len].copy()
+        assignments = assignments[:min_len]
+        logprobs = logprobs[:min_len]
+        if rewards is not None:
+            rewards = rewards[:min_len]
+        if len(terminals) and not terminals[-1]:
+            terminals[-1] = True
+        if reward_crop is not None:
+            print("  Disabling loader reward_crop because cache/labels are already length-mismatched.")
+            reward_crop = None
 
     print(f"  x_seq={x_seq.shape}  actions={actions.shape}  "
           f"terminals={terminals.sum()}  K={assignments.max()+1}")
