@@ -94,6 +94,15 @@ class OnlineConfig:
     n_updates_per_step: int = 1
     positive_fraction: float = 0.5
     offline_fraction:  float = 0.5
+    reward_positive_fraction: float = 0.5
+    reward_offline_fraction:  float = 0.5
+    q_positive_fraction:      float = 0.05
+    q_offline_fraction:       float = 0.8
+    pi_positive_fraction:     float = 0.02
+    pi_offline_fraction:      float = 0.8
+    q_reward_source:          str   = 'env'
+    q_bootstrap:              float = 0.0
+    pi_update_start:          int   = 10_000
     lambda_lqr_pi:     float = 0.1
     lqr_horizon:       int   = 4
     lqr_aux_k:         int   = 4
@@ -544,19 +553,56 @@ class PolicyPriorOnlineTrainer:
         a = self.decode_action(u)
         return a, u[0].detach().cpu().numpy()
 
+    def _sample_update_batches(self) -> Tuple[Dict[str, torch.Tensor],
+                                              Dict[str, torch.Tensor],
+                                              Dict[str, torch.Tensor]]:
+        bs = self.cfg.batch_size
+        b_r = self.buf.sample(
+            bs,
+            positive_fraction=self.cfg.reward_positive_fraction,
+            offline_fraction=self.cfg.reward_offline_fraction,
+        )
+        b_q = self.buf.sample(
+            bs,
+            positive_fraction=self.cfg.q_positive_fraction,
+            offline_fraction=self.cfg.q_offline_fraction,
+        )
+        b_pi = self.buf.sample(
+            bs,
+            positive_fraction=self.cfg.pi_positive_fraction,
+            offline_fraction=self.cfg.pi_offline_fraction,
+        )
+        return b_r, b_q, b_pi
+
+    def _plain_r_hat(self, z: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+        return self.model.reward_ensemble_head.member_probs(z, u).mean(0).clamp(0.0, 1.0)
+
+    def _q_reward(self, z: torch.Tensor, u: torch.Tensor,
+                  r_env: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        source = self.cfg.q_reward_source.lower()
+        r_hat = self._plain_r_hat(z, u)
+        if source == 'env':
+            return r_env.clamp(0.0, 1.0), r_hat
+        if source == 'rhat':
+            return r_hat, r_hat
+        if source == 'penalized':
+            return self.model.reward_ensemble_head.penalized_reward(z, u), r_hat
+        raise ValueError(
+            f"Unknown q_reward_source={self.cfg.q_reward_source!r}; "
+            "expected env, rhat, or penalized"
+        )
+
     def update(self) -> Dict[str, float]:
         if self.buf.size < self.cfg.batch_size:
             return {}
-        b = self.buf.sample(
-            self.cfg.batch_size,
-            positive_fraction=self.cfg.positive_fraction,
-            offline_fraction=self.cfg.offline_fraction,
-        )
-        z, u = b['z'], b['u']
-        r, z_next, done = b['r'], b['z_next'], b['done']
+        b_r, b_q, b_pi = self._sample_update_batches()
+        z_r, u_r, r_r = b_r['z'], b_r['u'], b_r['r']
+        z, u = b_q['z'], b_q['u']
+        r, z_next, done = b_q['r'], b_q['z_next'], b_q['done']
         m = self.model
 
-        loss_r = m.reward_ensemble_head.ensemble_loss(z, u, r.clamp(0.0, 1.0))
+        loss_r = m.reward_ensemble_head.ensemble_loss(
+            z_r, u_r, r_r.clamp(0.0, 1.0))
         self.opt_reward.zero_grad()
         loss_r.backward()
         nn.utils.clip_grad_norm_(m.reward_ensemble_head.parameters(),
@@ -565,11 +611,13 @@ class PolicyPriorOnlineTrainer:
 
         with torch.no_grad():
             u_next, _, _, _ = m.policy_prior(z_next)
-            r_hat = m.reward_ensemble_head.penalized_reward(z, u)
+            r_q, r_hat = self._q_reward(z, u, r)
             q_next = m.q_head_target.expected_value(
                 z_next, u_next, return_type='min')
-            y = (r_hat + self.cfg.gamma * (1 - done) * q_next).clamp(
-                m.cfg.v_min, m.cfg.v_max)
+            y = (
+                r_q
+                + self.cfg.q_bootstrap * self.cfg.gamma * (1 - done) * q_next
+            ).clamp(m.cfg.v_min, m.cfg.v_max)
 
         q_logits = m.q_head(z, u).permute(1, 0, 2).unsqueeze(1)
         loss_q = q_categorical_loss(
@@ -585,25 +633,30 @@ class PolicyPriorOnlineTrainer:
         self.opt_q.step()
         m.soft_update_target_Q()
 
-        u_pi, log_pi, mu_pi, _ = m.policy_prior(z)
-        q_logits_pi = m._detach_q_head(z, u_pi)
+        z_pi = b_pi['z']
+        u_pi, log_pi, mu_pi, _ = m.policy_prior(z_pi)
+        q_logits_pi = m._detach_q_head(z_pi, u_pi)
         q_vals_pi = two_hot_decode(q_logits_pi, m.q_head.bins)
         n_pick = min(2, m.cfg.num_q)
-        idx = torch.randperm(m.cfg.num_q, device=z.device)[:n_pick]
+        idx = torch.randperm(m.cfg.num_q, device=z_pi.device)[:n_pick]
         q_pi = q_vals_pi[idx].min(0).values
         m.scale_tracker.update(q_pi.detach())
-        loss_pi = policy_prior_loss(
-            log_pi=log_pi,
-            q_pi=q_pi,
-            rho=m.scale_tracker.rho,
-            entropy_coef=m.cfg.entropy_coef,
-        )
-        loss_lqr = self._lqr_reg_loss(torch.tanh(mu_pi), b)
-        loss_pi = loss_pi + self.cfg.lambda_lqr_pi * loss_lqr
-        self.opt_pi.zero_grad()
-        loss_pi.backward()
-        nn.utils.clip_grad_norm_(m.policy_prior.parameters(), self.cfg.grad_clip)
-        self.opt_pi.step()
+        loss_lqr = self._lqr_reg_loss(torch.tanh(mu_pi), b_pi)
+        pi_active = float(self.step >= self.cfg.pi_update_start)
+        if pi_active:
+            loss_pi = policy_prior_loss(
+                log_pi=log_pi,
+                q_pi=q_pi,
+                rho=m.scale_tracker.rho,
+                entropy_coef=m.cfg.entropy_coef,
+            )
+            loss_pi = loss_pi + self.cfg.lambda_lqr_pi * loss_lqr
+            self.opt_pi.zero_grad()
+            loss_pi.backward()
+            nn.utils.clip_grad_norm_(m.policy_prior.parameters(), self.cfg.grad_clip)
+            self.opt_pi.step()
+        else:
+            loss_pi = z_pi.new_tensor(0.0)
 
         return {
             'loss_reward': loss_r.item(),
@@ -613,6 +666,10 @@ class PolicyPriorOnlineTrainer:
             'q_mean': q_pi.detach().mean().item(),
             'rho': m.scale_tracker.rho,
             'r_hat': r_hat.detach().mean().item(),
+            'q_reward': r_q.detach().mean().item(),
+            'q_target': y.detach().mean().item(),
+            'q_next': q_next.detach().mean().item(),
+            'pi_active': pi_active,
         }
 
     def _lqr_reg_loss(self, u_mean: torch.Tensor,
@@ -1285,7 +1342,8 @@ def train_policy_prior_online(cfg: OnlineConfig,
     ctx.reset(obs)
     recent = {k: deque(maxlen=cfg.log_every) for k in
               ['loss_reward', 'loss_q', 'loss_pi', 'loss_lqr_pi', 'q_mean', 'rho',
-               'r_hat', 'ep_reward', 'ep_tasks']}
+               'r_hat', 'q_reward', 'q_target', 'q_next', 'pi_active',
+               'ep_reward', 'ep_tasks']}
     global_step = trainer.step
     ep_r = 0.0
     ep_tasks = 0
@@ -1294,6 +1352,13 @@ def train_policy_prior_online(cfg: OnlineConfig,
     print(f"\n{'='*60}")
     print(f"PolicyPrior Online  steps={cfg.n_env_steps}  env={env_name}")
     print(f"  batch={cfg.batch_size}  buf={cfg.buffer_size}  cond={cfg.cond_len}")
+    print(f"  reward batch pos/off={cfg.reward_positive_fraction:.2f}/"
+          f"{cfg.reward_offline_fraction:.2f}")
+    print(f"  q batch pos/off={cfg.q_positive_fraction:.2f}/"
+          f"{cfg.q_offline_fraction:.2f}  reward={cfg.q_reward_source} "
+          f"boot={cfg.q_bootstrap:.2f}")
+    print(f"  pi batch pos/off={cfg.pi_positive_fraction:.2f}/"
+          f"{cfg.pi_offline_fraction:.2f}  pi_start={cfg.pi_update_start}")
     print(f"{'='*60}\n")
 
     while global_step < cfg.n_env_steps:
@@ -1345,6 +1410,7 @@ def train_policy_prior_online(cfg: OnlineConfig,
                 source=0.0,
             )
 
+        trainer.step = global_step
         for _ in range(cfg.n_updates_per_step):
             info_d = trainer.update()
             for k, v in info_d.items():
@@ -1372,7 +1438,9 @@ def train_policy_prior_online(cfg: OnlineConfig,
                   f"R={ms['loss_reward']:.3f} Q={ms['loss_q']:.3f} "
                   f"Pi={ms['loss_pi']:.3f} LQR={ms['loss_lqr_pi']:.3f} "
                   f"q={ms['q_mean']:.3f} "
-                  f"rho={ms['rho']:.3f} rhat={ms['r_hat']:.3f} | "
+                  f"rho={ms['rho']:.3f} rhat={ms['r_hat']:.3f} "
+                  f"rQ={ms['q_reward']:.3f} y={ms['q_target']:.3f} "
+                  f"pi={ms['pi_active']:.0f} | "
                   f"ep_r={ms['ep_reward']:.2f} tasks={ms['ep_tasks']:.2f} | "
                   f"{sps:.0f}sps")
             if use_wandb:
@@ -1428,6 +1496,16 @@ def main():
     p.add_argument('--action_inv_lr',    type=float, default=0.05)
     p.add_argument('--positive_fraction', type=float, default=0.5)
     p.add_argument('--offline_fraction',  type=float, default=0.5)
+    p.add_argument('--reward_positive_fraction', type=float, default=None)
+    p.add_argument('--reward_offline_fraction',  type=float, default=None)
+    p.add_argument('--q_positive_fraction',      type=float, default=0.05)
+    p.add_argument('--q_offline_fraction',       type=float, default=0.8)
+    p.add_argument('--pi_positive_fraction',     type=float, default=0.02)
+    p.add_argument('--pi_offline_fraction',      type=float, default=0.8)
+    p.add_argument('--q_reward_source', choices=['env', 'rhat', 'penalized'],
+                   default='env')
+    p.add_argument('--q_bootstrap', type=float, default=0.0)
+    p.add_argument('--pi_update_start', type=int, default=10_000)
     p.add_argument('--lambda_lqr_pi',     type=float, default=0.1)
     p.add_argument('--lqr_horizon',       type=int,   default=4)
     p.add_argument('--lqr_aux_k',         type=int,   default=4)
@@ -1491,6 +1569,23 @@ def main():
         n_updates_per_step=args.n_updates_per_step,
         positive_fraction=args.positive_fraction,
         offline_fraction=args.offline_fraction,
+        reward_positive_fraction=(
+            args.reward_positive_fraction
+            if args.reward_positive_fraction is not None
+            else args.positive_fraction
+        ),
+        reward_offline_fraction=(
+            args.reward_offline_fraction
+            if args.reward_offline_fraction is not None
+            else args.offline_fraction
+        ),
+        q_positive_fraction=args.q_positive_fraction,
+        q_offline_fraction=args.q_offline_fraction,
+        pi_positive_fraction=args.pi_positive_fraction,
+        pi_offline_fraction=args.pi_offline_fraction,
+        q_reward_source=args.q_reward_source,
+        q_bootstrap=args.q_bootstrap,
+        pi_update_start=args.pi_update_start,
         lambda_lqr_pi=args.lambda_lqr_pi,
         lqr_horizon=args.lqr_horizon,
         lqr_aux_k=args.lqr_aux_k,
