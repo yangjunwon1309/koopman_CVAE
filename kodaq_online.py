@@ -103,6 +103,8 @@ class OnlineConfig:
     q_reward_source:          str   = 'env'
     q_bootstrap:              float = 0.0
     pi_update_start:          int   = 10_000
+    lambda_bc_pi:             float = 0.0
+    bc_target_clip:           float = 1.0
     lambda_lqr_pi:     float = 0.1
     lqr_horizon:       int   = 4
     lqr_aux_k:         int   = 4
@@ -641,7 +643,9 @@ class PolicyPriorOnlineTrainer:
         idx = torch.randperm(m.cfg.num_q, device=z_pi.device)[:n_pick]
         q_pi = q_vals_pi[idx].min(0).values
         m.scale_tracker.update(q_pi.detach())
-        loss_lqr = self._lqr_reg_loss(torch.tanh(mu_pi), b_pi)
+        u_mean = torch.tanh(mu_pi)
+        loss_lqr = self._lqr_reg_loss(u_mean, b_pi)
+        loss_bc = self._bc_reg_loss(u_mean, b_pi)
         pi_active = float(self.step >= self.cfg.pi_update_start)
         if pi_active:
             loss_pi = policy_prior_loss(
@@ -650,7 +654,11 @@ class PolicyPriorOnlineTrainer:
                 rho=m.scale_tracker.rho,
                 entropy_coef=m.cfg.entropy_coef,
             )
-            loss_pi = loss_pi + self.cfg.lambda_lqr_pi * loss_lqr
+            loss_pi = (
+                loss_pi
+                + self.cfg.lambda_lqr_pi * loss_lqr
+                + self.cfg.lambda_bc_pi * loss_bc
+            )
             self.opt_pi.zero_grad()
             loss_pi.backward()
             nn.utils.clip_grad_norm_(m.policy_prior.parameters(), self.cfg.grad_clip)
@@ -663,6 +671,7 @@ class PolicyPriorOnlineTrainer:
             'loss_q': loss_q.item(),
             'loss_pi': loss_pi.item(),
             'loss_lqr_pi': loss_lqr.item(),
+            'loss_bc_pi': loss_bc.item(),
             'q_mean': q_pi.detach().mean().item(),
             'rho': m.scale_tracker.rho,
             'r_hat': r_hat.detach().mean().item(),
@@ -671,6 +680,20 @@ class PolicyPriorOnlineTrainer:
             'q_next': q_next.detach().mean().item(),
             'pi_active': pi_active,
         }
+
+    def _bc_reg_loss(self, u_mean: torch.Tensor,
+                     batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        if self.cfg.lambda_bc_pi <= 0.0 or 'source' not in batch or 'u' not in batch:
+            return u_mean.new_tensor(0.0)
+        mask = batch['source'] > 0.5
+        if mask.numel() == 0 or not bool(mask.any()):
+            return u_mean.new_tensor(0.0)
+        target = batch['u'].to(u_mean.device)
+        if self.cfg.bc_target_clip > 0.0:
+            target = target.clamp(-self.cfg.bc_target_clip,
+                                  self.cfg.bc_target_clip)
+        loss = (u_mean - target).pow(2).mean(-1)
+        return loss[mask].mean()
 
     def _lqr_reg_loss(self, u_mean: torch.Tensor,
                       batch: Dict[str, torch.Tensor]) -> torch.Tensor:
@@ -1341,8 +1364,8 @@ def train_policy_prior_online(cfg: OnlineConfig,
     ctx = EnvContext(trainer.model, device, cfg.cond_len)
     ctx.reset(obs)
     recent = {k: deque(maxlen=cfg.log_every) for k in
-              ['loss_reward', 'loss_q', 'loss_pi', 'loss_lqr_pi', 'q_mean', 'rho',
-               'r_hat', 'q_reward', 'q_target', 'q_next', 'pi_active',
+              ['loss_reward', 'loss_q', 'loss_pi', 'loss_lqr_pi', 'loss_bc_pi',
+               'q_mean', 'rho', 'r_hat', 'q_reward', 'q_target', 'q_next', 'pi_active',
                'ep_reward', 'ep_tasks']}
     global_step = trainer.step
     ep_r = 0.0
@@ -1358,7 +1381,8 @@ def train_policy_prior_online(cfg: OnlineConfig,
           f"{cfg.q_offline_fraction:.2f}  reward={cfg.q_reward_source} "
           f"boot={cfg.q_bootstrap:.2f}")
     print(f"  pi batch pos/off={cfg.pi_positive_fraction:.2f}/"
-          f"{cfg.pi_offline_fraction:.2f}  pi_start={cfg.pi_update_start}")
+          f"{cfg.pi_offline_fraction:.2f}  pi_start={cfg.pi_update_start} "
+          f"bc={cfg.lambda_bc_pi:.3f}")
     print(f"{'='*60}\n")
 
     while global_step < cfg.n_env_steps:
@@ -1437,6 +1461,7 @@ def train_policy_prior_online(cfg: OnlineConfig,
             print(f"Step {global_step:7d} | "
                   f"R={ms['loss_reward']:.3f} Q={ms['loss_q']:.3f} "
                   f"Pi={ms['loss_pi']:.3f} LQR={ms['loss_lqr_pi']:.3f} "
+                  f"BC={ms['loss_bc_pi']:.3f} "
                   f"q={ms['q_mean']:.3f} "
                   f"rho={ms['rho']:.3f} rhat={ms['r_hat']:.3f} "
                   f"rQ={ms['q_reward']:.3f} y={ms['q_target']:.3f} "
@@ -1506,6 +1531,8 @@ def main():
                    default='env')
     p.add_argument('--q_bootstrap', type=float, default=0.0)
     p.add_argument('--pi_update_start', type=int, default=10_000)
+    p.add_argument('--lambda_bc_pi', type=float, default=0.0)
+    p.add_argument('--bc_target_clip', type=float, default=1.0)
     p.add_argument('--lambda_lqr_pi',     type=float, default=0.1)
     p.add_argument('--lqr_horizon',       type=int,   default=4)
     p.add_argument('--lqr_aux_k',         type=int,   default=4)
@@ -1586,6 +1613,8 @@ def main():
         q_reward_source=args.q_reward_source,
         q_bootstrap=args.q_bootstrap,
         pi_update_start=args.pi_update_start,
+        lambda_bc_pi=args.lambda_bc_pi,
+        bc_target_clip=args.bc_target_clip,
         lambda_lqr_pi=args.lambda_lqr_pi,
         lqr_horizon=args.lqr_horizon,
         lqr_aux_k=args.lqr_aux_k,
