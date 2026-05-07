@@ -1610,9 +1610,13 @@ def main():
             action_inv_lr=args.action_inv_lr,
             lqr_planner=lqr_planner,
         )
-        if args.resume and Path(args.resume).exists():
+        did_resume = args.resume and Path(args.resume).exists()
+        if did_resume:
             trainer.load(args.resume)
-        elif not args.no_prefill:
+            print("  Resume loaded model/optim states. Replay buffer is not "
+                  "stored in checkpoints; use offline prefill unless this is "
+                  "intentionally online-only.")
+        if not args.no_prefill:
             quality = 'mixed'
             if 'partial' in args.env:
                 quality = 'partial'
