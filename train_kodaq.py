@@ -224,6 +224,7 @@ class Trainer:
         self.freeze_world_model = getattr(args, 'freeze_world_model', False)
         # Two-stage resume: 'wm' = WM fine-tune only, 'heads' = Q/R/pi only
         self.resume_stage       = getattr(args, 'resume_stage', None)
+        self.train_heads        = False
 
         self.use_wandb = (
             _WANDB_AVAILABLE
@@ -264,6 +265,8 @@ class Trainer:
         skill_labels = skill_labels.to(self.device)
         if mask    is not None: mask    = mask.to(self.device)
         if rewards is not None: rewards = rewards.to(self.device)
+        if not self.train_heads:
+            rewards = None
 
         # goal_z_seq is computed on-the-fly inside model.forward()
         # from skill_labels + x_batch → no need to pass from dataset
@@ -319,6 +322,12 @@ class Trainer:
     def _set_head_requires_grad(self, flag: bool):
         for p in self._head_params():
             p.requires_grad_(flag)
+
+    def _set_head_loss_weights(self, reward=None, q=None, pi=None, goal=None):
+        if reward is not None: self.model.cfg.lambda_reward = reward
+        if q      is not None: self.model.cfg.lambda_q      = q
+        if pi     is not None: self.model.cfg.lambda_pi     = pi
+        if goal   is not None: self.model.cfg.lambda_goal   = goal
 
     def train_epoch(self, loader) -> Dict:
         self.model.train()
@@ -470,6 +479,11 @@ class Trainer:
             self._train_two_stage(train_loader, val_loader, t0)
         else:
             # ── Normal (non-resume) single loop ──────────────────────────────
+            print("[Normal train] WM-only: freezing reward/Q/policy heads "
+                  "and disabling head losses.", flush=True)
+            self.train_heads = False
+            self._set_head_requires_grad(False)
+            self._set_head_loss_weights(reward=0.0, q=0.0, pi=0.0, goal=0.0)
             self.args.epochs = getattr(self.args, 'epochs', 400)
             best = self._run_loop(train_loader, val_loader,
                                   n_epochs=self.args.epochs,
@@ -514,9 +528,9 @@ class Trainer:
         saved_lR  = self.model.cfg.lambda_reward
         saved_lQ  = self.model.cfg.lambda_q
         saved_lpi = self.model.cfg.lambda_pi
-        self.model.cfg.lambda_reward = 0.0
-        self.model.cfg.lambda_q      = 0.0
-        self.model.cfg.lambda_pi     = 0.0
+        saved_lg  = self.model.cfg.lambda_goal
+        self.train_heads = False
+        self._set_head_loss_weights(reward=0.0, q=0.0, pi=0.0, goal=0.0)
         # Phase 3 for full WM loss (L_rec + L_dyn + L_skill + L_reg)
         self.model.cfg.phase = 3
         self.phase2_epoch = 0
@@ -549,6 +563,8 @@ class Trainer:
         self.model.cfg.lambda_reward = saved_lR
         self.model.cfg.lambda_q      = saved_lQ
         self.model.cfg.lambda_pi     = saved_lpi
+        self.model.cfg.lambda_goal   = saved_lg
+        self.train_heads = True
         # Phase stays 3 (all WM losses computed but lambda=0 for R/Q/pi in wm)
         # For head stage we still need phase>=2 for policy prior activation
         self.model.cfg.phase = 3
