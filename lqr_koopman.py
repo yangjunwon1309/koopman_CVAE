@@ -259,6 +259,7 @@ class KODAQLQRPlanner:
         self.u_min: Optional[np.ndarray] = None
         self.u_max: Optional[np.ndarray] = None
         # Pre-computed gain tensors for batch LQR (set by _precompute_gains)
+        self._K_gains: Optional[torch.Tensor] = None  # (K, H, d_u, m)
         self._L_tensor: Optional[torch.Tensor] = None  # (K, d_u, m)
         self._M_tensor: Optional[torch.Tensor] = None  # (K, d_u, m)
 
@@ -530,6 +531,117 @@ class KODAQLQRPlanner:
         return {int(k): data[str(k)] for k in ep_starts}
 
     # ── Batch LQR rollout for Q target computation ────────────────────────────
+
+    @torch.no_grad()
+    def build_reward_goal_z_seq(
+        self,
+        obs_ep:      np.ndarray,
+        h_seq:       torch.Tensor,
+        completions: Optional[Dict[str, int]] = None,
+        batch_size:  int = 64,
+    ) -> torch.Tensor:
+        """
+        Build z*_t for an episode using the next reward/completion boundary.
+
+        For each segment [c_{i-1}, c_i), the goal is obs[c_i]. The final
+        segment falls back to the episode end, so every timestep has a bounded
+        target.
+        """
+        dev = self.device
+        obs_ep = np.asarray(obs_ep)
+        L = len(obs_ep)
+        if L == 0:
+            return torch.empty(0, self.m_cfg.koopman_dim, device=dev)
+
+        h_seq = h_seq.to(dev)
+        ref_obs = obs_ep[0]
+        m = self.m_cfg.koopman_dim
+        goal_z_seq = torch.zeros(L, m, device=dev)
+
+        boundaries = []
+        if completions:
+            boundaries = sorted(
+                int(t) for t in completions.values()
+                if t is not None and 0 <= int(t) < L
+            )
+        if not boundaries or boundaries[-1] != L - 1:
+            boundaries.append(L - 1)
+
+        seg_start = 0
+        for seg_end in boundaries:
+            seg_end = min(max(int(seg_end), seg_start), L - 1)
+            seg_len = seg_end - seg_start
+            if seg_len <= 0:
+                seg_start = seg_end
+                continue
+
+            x_goal_np = obs_to_x_goal(obs_ep[seg_end], ref_obs)
+            x_goal = torch.FloatTensor(x_goal_np).to(dev)
+            h_seg = h_seq[seg_start:seg_start + seg_len]
+            x_rep = x_goal.unsqueeze(0).expand(seg_len, -1)
+
+            for i in range(0, seg_len, batch_size):
+                j = min(i + batch_size, seg_len)
+                mu, _ = self.model.posterior(x_rep[i:j], h_seg[i:j])
+                goal_z_seq[seg_start + i:seg_start + j] = mu
+
+            seg_start = seg_end
+
+        return goal_z_seq
+
+    @torch.no_grad()
+    def sample_lqr_latent_action_targets(
+        self,
+        o_seq:      torch.Tensor,
+        h_seq:      torch.Tensor,
+        goal_z_seq: torch.Tensor,
+        H:          int = 4,
+        aux_k:      int = 4,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Return first-step LQR latent actions for policy-prior regularization.
+
+        main: reward-aware target toward goal_z_seq (Offline B).
+        aux:  weak fixed-k future-state target using o_{t+k} (Offline A).
+        """
+        if o_seq.dim() != 3 or h_seq.dim() != 3 or goal_z_seq.dim() != 3:
+            raise ValueError("o_seq, h_seq, goal_z_seq must be (B,T,D)")
+        if o_seq.shape[:2] != h_seq.shape[:2] or o_seq.shape[:2] != goal_z_seq.shape[:2]:
+            raise ValueError("o_seq, h_seq, and goal_z_seq must share B,T")
+
+        B, T, _ = o_seq.shape
+        d_u = self.m_cfg.action_latent
+        if T < 2:
+            empty = o_seq.new_zeros(B, 0, d_u)
+            mask = torch.zeros(B, 0, dtype=torch.bool, device=o_seq.device)
+            return {'main': empty, 'aux': empty, 'main_mask': mask, 'aux_mask': mask}
+
+        o_seq = o_seq.detach()
+        h_seq = h_seq.detach()
+        goal_z_seq = goal_z_seq.detach()
+
+        u_main_seq, _ = self.lqr_rollout_batch(
+            o_seq=o_seq, h_seq=h_seq, goal_z_seq=goal_z_seq, H=H)
+        u_main = u_main_seq[:, :, 0].detach()
+        main_mask = goal_z_seq[:, :-1].abs().sum(-1) > 1e-6
+
+        u_aux = torch.zeros_like(u_main)
+        aux_mask = torch.zeros_like(main_mask)
+        if aux_k and aux_k > 0:
+            idx = torch.arange(T, device=o_seq.device)
+            idx_goal = (idx + int(aux_k)).clamp(max=T - 1)
+            aux_goal_z = o_seq[:, idx_goal]
+            u_aux_seq, _ = self.lqr_rollout_batch(
+                o_seq=o_seq, h_seq=h_seq, goal_z_seq=aux_goal_z, H=H)
+            u_aux = u_aux_seq[:, :, 0].detach()
+            aux_mask = (idx[:T - 1] + int(aux_k) < T).unsqueeze(0).expand_as(main_mask)
+
+        return {
+            'main': u_main,
+            'aux': u_aux,
+            'main_mask': main_mask,
+            'aux_mask': aux_mask,
+        }
 
     @torch.no_grad()
     def lqr_rollout_batch(

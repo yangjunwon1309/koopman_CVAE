@@ -48,6 +48,7 @@ from models.losses import q_categorical_loss, two_hot_decode, policy_prior_loss
 from data.extract_skill_label import load_x_sequences
 from lqr_koopman import (
     blend_koopman,
+    KODAQLQRPlanner, LQRConfig,
     X_DQ_START, X_DQ_END, X_DP_START, X_DP_END,
     OBS_ELEMENT_INDICES, OBS_ELEMENT_GOALS,
     load_kitchen_episodes,
@@ -91,6 +92,12 @@ class OnlineConfig:
     batch_size:     int   = 256
     grad_clip:      float = 1.0
     n_updates_per_step: int = 1
+    positive_fraction: float = 0.5
+    offline_fraction:  float = 0.5
+    lambda_lqr_pi:     float = 0.1
+    lqr_horizon:       int   = 4
+    lqr_aux_k:         int   = 4
+    lqr_aux_weight:    float = 0.25
 
     # World model
     wm_lr:          float = 1e-4
@@ -427,9 +434,15 @@ class PriorReplayBuffer:
             'r': np.zeros(C, dtype=np.float32),
             'z_next': np.zeros((C, z_dim), dtype=np.float32),
             'done': np.zeros(C, dtype=np.float32),
+            'u_lqr': np.zeros((C, u_dim), dtype=np.float32),
+            'u_lqr_aux': np.zeros((C, u_dim), dtype=np.float32),
+            'has_lqr': np.zeros(C, dtype=np.float32),
+            'source': np.zeros(C, dtype=np.float32),
         }
 
-    def add(self, z, u, r, z_next, done):
+    def add(self, z, u, r, z_next, done,
+            u_lqr=None, u_lqr_aux=None, has_lqr: float = 0.0,
+            source: float = 0.0):
         if not self._d:
             self._init(z.shape[-1], u.shape[-1])
         p = self._ptr
@@ -438,11 +451,41 @@ class PriorReplayBuffer:
         self._d['r'][p] = r
         self._d['z_next'][p] = z_next
         self._d['done'][p] = float(done)
+        if u_lqr is not None:
+            self._d['u_lqr'][p] = u_lqr
+        if u_lqr_aux is not None:
+            self._d['u_lqr_aux'][p] = u_lqr_aux
+        self._d['has_lqr'][p] = float(has_lqr)
+        self._d['source'][p] = float(source)
         self._ptr = (p + 1) % self.capacity
         self._n = min(self._n + 1, self.capacity)
 
-    def sample(self, batch_size: int) -> Dict[str, torch.Tensor]:
-        idx = np.random.randint(0, self._n, batch_size)
+    def _choice(self, candidates: np.ndarray, n: int) -> np.ndarray:
+        if n <= 0 or len(candidates) == 0:
+            return np.zeros(0, dtype=np.int64)
+        return np.random.choice(candidates, n, replace=len(candidates) < n)
+
+    def sample(self, batch_size: int,
+               positive_fraction: float = 0.0,
+               offline_fraction: float = 0.0) -> Dict[str, torch.Tensor]:
+        valid = np.arange(self._n)
+        idx_parts = []
+
+        n_pos = int(round(batch_size * max(0.0, min(1.0, positive_fraction))))
+        pos = valid[self._d['r'][:self._n] > 0.0]
+        idx_parts.append(self._choice(pos, n_pos))
+
+        n_off = int(round(batch_size * max(0.0, min(1.0, offline_fraction))))
+        off = valid[self._d['source'][:self._n] > 0.5]
+        idx_parts.append(self._choice(off, n_off))
+
+        n_used = sum(len(x) for x in idx_parts)
+        n_rest = max(0, batch_size - n_used)
+        idx_parts.append(self._choice(valid, n_rest))
+        idx = np.concatenate(idx_parts) if idx_parts else self._choice(valid, batch_size)
+        if len(idx) > batch_size:
+            idx = np.random.choice(idx, batch_size, replace=False)
+        np.random.shuffle(idx)
         return {k: torch.FloatTensor(v[idx]).to(self.device)
                 for k, v in self._d.items()}
 
@@ -452,13 +495,15 @@ class PriorReplayBuffer:
 
 class PolicyPriorOnlineTrainer:
     def __init__(self, cfg: OnlineConfig, model: KoopmanCVAE, device: str,
-                 action_inv_steps: int = 30, action_inv_lr: float = 0.05):
+                 action_inv_steps: int = 30, action_inv_lr: float = 0.05,
+                 lqr_planner: Optional[KODAQLQRPlanner] = None):
         self.cfg = cfg
         self.model = model
         self.device = device
         self.step = 0
         self.action_inv_steps = action_inv_steps
         self.action_inv_lr = action_inv_lr
+        self.lqr_planner = lqr_planner
         self.buf = PriorReplayBuffer(cfg.buffer_size, device)
 
         for p in model.parameters():
@@ -502,7 +547,11 @@ class PolicyPriorOnlineTrainer:
     def update(self) -> Dict[str, float]:
         if self.buf.size < self.cfg.batch_size:
             return {}
-        b = self.buf.sample(self.cfg.batch_size)
+        b = self.buf.sample(
+            self.cfg.batch_size,
+            positive_fraction=self.cfg.positive_fraction,
+            offline_fraction=self.cfg.offline_fraction,
+        )
         z, u = b['z'], b['u']
         r, z_next, done = b['r'], b['z_next'], b['done']
         m = self.model
@@ -536,7 +585,7 @@ class PolicyPriorOnlineTrainer:
         self.opt_q.step()
         m.soft_update_target_Q()
 
-        u_pi, log_pi, _, _ = m.policy_prior(z)
+        u_pi, log_pi, mu_pi, _ = m.policy_prior(z)
         q_logits_pi = m._detach_q_head(z, u_pi)
         q_vals_pi = two_hot_decode(q_logits_pi, m.q_head.bins)
         n_pick = min(2, m.cfg.num_q)
@@ -549,6 +598,8 @@ class PolicyPriorOnlineTrainer:
             rho=m.scale_tracker.rho,
             entropy_coef=m.cfg.entropy_coef,
         )
+        loss_lqr = self._lqr_reg_loss(torch.tanh(mu_pi), b)
+        loss_pi = loss_pi + self.cfg.lambda_lqr_pi * loss_lqr
         self.opt_pi.zero_grad()
         loss_pi.backward()
         nn.utils.clip_grad_norm_(m.policy_prior.parameters(), self.cfg.grad_clip)
@@ -558,10 +609,46 @@ class PolicyPriorOnlineTrainer:
             'loss_reward': loss_r.item(),
             'loss_q': loss_q.item(),
             'loss_pi': loss_pi.item(),
+            'loss_lqr_pi': loss_lqr.item(),
             'q_mean': q_pi.detach().mean().item(),
             'rho': m.scale_tracker.rho,
             'r_hat': r_hat.detach().mean().item(),
         }
+
+    def _lqr_reg_loss(self, u_mean: torch.Tensor,
+                      batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        if self.cfg.lambda_lqr_pi <= 0.0 or 'has_lqr' not in batch:
+            return u_mean.new_tensor(0.0)
+        mask = batch['has_lqr'] > 0.5
+        if mask.numel() == 0 or not bool(mask.any()):
+            return u_mean.new_tensor(0.0)
+        main = (u_mean - batch['u_lqr'].to(u_mean.device)).pow(2).mean(-1)
+        aux = (u_mean - batch['u_lqr_aux'].to(u_mean.device)).pow(2).mean(-1)
+        return (
+            main[mask].mean()
+            + self.cfg.lqr_aux_weight * aux[mask].mean()
+        )
+
+    @torch.no_grad()
+    def lqr_target_for_goal(self, z: torch.Tensor, h: torch.Tensor,
+                            goal_z: torch.Tensor):
+        if self.lqr_planner is None or self.cfg.lambda_lqr_pi <= 0.0:
+            return None
+        z = z.detach().to(self.device)
+        h = h.detach().to(self.device)
+        goal_z = goal_z.detach().to(self.device)
+        if z.dim() == 1: z = z.unsqueeze(0)
+        if h.dim() == 1: h = h.unsqueeze(0)
+        if goal_z.dim() == 1: goal_z = goal_z.unsqueeze(0)
+
+        o_seq = torch.stack([z[0], goal_z[0]], dim=0).unsqueeze(0)
+        h_seq = torch.stack([h[0], h[0]], dim=0).unsqueeze(0)
+        g_seq = torch.stack([goal_z[0], goal_z[0]], dim=0).unsqueeze(0)
+        targets = self.lqr_planner.sample_lqr_latent_action_targets(
+            o_seq=o_seq, h_seq=h_seq, goal_z_seq=g_seq,
+            H=self.cfg.lqr_horizon, aux_k=0)
+        u_lqr = targets['main'][0, 0].detach().cpu().numpy()
+        return u_lqr, u_lqr, 1.0
 
     def save(self, path: str):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -587,6 +674,86 @@ class PolicyPriorOnlineTrainer:
             self.model.scale_tracker.load_state_dict(ck['scale_tracker'])
         self.step = int(ck.get('step', 0))
         return self.step
+
+@torch.no_grad()
+def prefill_prior_buffer_from_offline(trainer: PolicyPriorOnlineTrainer,
+                                      x_cache_path: str,
+                                      quality: str = 'mixed',
+                                      max_transitions: int = 50_000,
+                                      device: str = 'cuda') -> int:
+    """Offline data prefill for --prior_online with LQR regularization targets."""
+    dev = torch.device(device)
+    model = trainer.model
+    model.eval()
+    x_seq_full, _, _ = load_x_sequences(x_cache_path)
+    episodes, _ = load_kitchen_episodes(quality=quality, min_len=trainer.cfg.cond_len + 2)
+    np.random.shuffle(episodes)
+
+    n_added = 0
+    print(f"\n[Prior Offline Pre-fill] {x_cache_path}")
+    for ep in episodes:
+        if n_added >= max_transitions:
+            break
+        L = ep['length']
+        if L < 2:
+            continue
+        s_t = ep['start_t']
+        x_ep = x_seq_full[s_t:s_t + L]
+        acts = ep['actions'].astype(np.float32)
+        rews = ep['rewards'].astype(np.float32)
+
+        x_t = torch.FloatTensor(x_ep).unsqueeze(0).to(dev)
+        a_t = torch.FloatTensor(acts).unsqueeze(0).to(dev)
+        enc = model.encode_sequence(x_t, a_t)
+        z_ep = enc['o_seq'][0]
+        h_ep = enc['h_seq'][0]
+        u_ep = model.action_encoder(torch.FloatTensor(acts).to(dev))
+
+        rew_max = float(rews.max()) if len(rews) else 0.0
+        if len(rews) > 1 and np.all(np.diff(rews) >= -1e-6) and rew_max > 1.0:
+            r_step = np.diff(rews, prepend=rews[0])
+        else:
+            r_step = rews
+        r_step = np.clip(r_step, 0.0, 1.0).astype(np.float32)
+
+        u_lqr_np = np.zeros((L - 1, model.cfg.action_latent), dtype=np.float32)
+        u_aux_np = np.zeros_like(u_lqr_np)
+        has_lqr_np = np.zeros(L - 1, dtype=np.float32)
+        if trainer.lqr_planner is not None and trainer.cfg.lambda_lqr_pi > 0.0:
+            goal_z = trainer.lqr_planner.build_reward_goal_z_seq(
+                ep['obs'], h_ep, ep['goal_info'].get('completions', {}),
+                batch_size=64)
+            targets = trainer.lqr_planner.sample_lqr_latent_action_targets(
+                o_seq=z_ep.unsqueeze(0),
+                h_seq=h_ep.unsqueeze(0),
+                goal_z_seq=goal_z.unsqueeze(0),
+                H=trainer.cfg.lqr_horizon,
+                aux_k=trainer.cfg.lqr_aux_k,
+            )
+            u_lqr_np = targets['main'][0].cpu().numpy().astype(np.float32)
+            u_aux_np = targets['aux'][0].cpu().numpy().astype(np.float32)
+            has_lqr_np = (
+                targets['main_mask'][0] | targets['aux_mask'][0]
+            ).cpu().numpy().astype(np.float32)
+
+        for t in range(L - 1):
+            trainer.buf.add(
+                z=z_ep[t].cpu().numpy(),
+                u=u_ep[t].cpu().numpy(),
+                r=float(r_step[t] > 0.0),
+                z_next=z_ep[t + 1].cpu().numpy(),
+                done=0.0,
+                u_lqr=u_lqr_np[t],
+                u_lqr_aux=u_aux_np[t],
+                has_lqr=has_lqr_np[t],
+                source=1.0,
+            )
+            n_added += 1
+            if n_added >= max_transitions:
+                break
+
+    print(f"[Prior Offline Pre-fill] added {n_added}  buf={trainer.buf.size}")
+    return n_added
 
 
 class KODAQOnlineTrainer:
@@ -1117,7 +1284,7 @@ def train_policy_prior_online(cfg: OnlineConfig,
     ctx = EnvContext(trainer.model, device, cfg.cond_len)
     ctx.reset(obs)
     recent = {k: deque(maxlen=cfg.log_every) for k in
-              ['loss_reward', 'loss_q', 'loss_pi', 'q_mean', 'rho',
+              ['loss_reward', 'loss_q', 'loss_pi', 'loss_lqr_pi', 'q_mean', 'rho',
                'r_hat', 'ep_reward', 'ep_tasks']}
     global_step = trainer.step
     ep_r = 0.0
@@ -1147,6 +1314,7 @@ def train_policy_prior_online(cfg: OnlineConfig,
             continue
 
         z_t = ctx.z_t.clone()
+        h_t = ctx.h_t.clone()
         a_np, u_np = trainer.act(z_t)
         obs_nx, r_env, done, info = env.step(a_np.clip(-1, 1))
         ctx.step(obs_nx, a_np)
@@ -1158,12 +1326,23 @@ def train_policy_prior_online(cfg: OnlineConfig,
                        else int(ep_c) if ep_c is not None else 0)
 
         if ctx.z_t is not None:
+            u_lqr = None
+            u_lqr_aux = None
+            has_lqr = 0.0
+            if r_env > 0.0:
+                lqr_t = trainer.lqr_target_for_goal(z_t, h_t, ctx.z_t)
+                if lqr_t is not None:
+                    u_lqr, u_lqr_aux, has_lqr = lqr_t
             trainer.buf.add(
                 z=z_t.cpu().numpy()[0],
                 u=u_np,
                 r=float(r_env > 0.0),
                 z_next=ctx.z_t.cpu().numpy()[0],
                 done=float(done),
+                u_lqr=u_lqr,
+                u_lqr_aux=u_lqr_aux,
+                has_lqr=has_lqr,
+                source=0.0,
             )
 
         for _ in range(cfg.n_updates_per_step):
@@ -1191,7 +1370,8 @@ def train_policy_prior_online(cfg: OnlineConfig,
             t0 = time.time()
             print(f"Step {global_step:7d} | "
                   f"R={ms['loss_reward']:.3f} Q={ms['loss_q']:.3f} "
-                  f"Pi={ms['loss_pi']:.3f} q={ms['q_mean']:.3f} "
+                  f"Pi={ms['loss_pi']:.3f} LQR={ms['loss_lqr_pi']:.3f} "
+                  f"q={ms['q_mean']:.3f} "
                   f"rho={ms['rho']:.3f} rhat={ms['r_hat']:.3f} | "
                   f"ep_r={ms['ep_reward']:.2f} tasks={ms['ep_tasks']:.2f} | "
                   f"{sps:.0f}sps")
@@ -1246,6 +1426,15 @@ def main():
                    help='Fine-tune KoopmanCVAE.policy_prior online.')
     p.add_argument('--action_inv_steps', type=int, default=30)
     p.add_argument('--action_inv_lr',    type=float, default=0.05)
+    p.add_argument('--positive_fraction', type=float, default=0.5)
+    p.add_argument('--offline_fraction',  type=float, default=0.5)
+    p.add_argument('--lambda_lqr_pi',     type=float, default=0.1)
+    p.add_argument('--lqr_horizon',       type=int,   default=4)
+    p.add_argument('--lqr_aux_k',         type=int,   default=4)
+    p.add_argument('--lqr_aux_weight',    type=float, default=0.25)
+    p.add_argument('--lqr_Q_scale',       type=float, default=1.0)
+    p.add_argument('--lqr_R_scale',       type=float, default=10.0)
+    p.add_argument('--u_bounds_path',     default=None)
     args = p.parse_args()
 
     if not sys.stdout.isatty():
@@ -1300,16 +1489,43 @@ def main():
         n_eval_ep=args.n_eval_ep, log_every=args.log_every,
         save_every=args.save_every,
         n_updates_per_step=args.n_updates_per_step,
+        positive_fraction=args.positive_fraction,
+        offline_fraction=args.offline_fraction,
+        lambda_lqr_pi=args.lambda_lqr_pi,
+        lqr_horizon=args.lqr_horizon,
+        lqr_aux_k=args.lqr_aux_k,
+        lqr_aux_weight=args.lqr_aux_weight,
     )
 
     if args.prior_online:
+        lqr_planner = None
+        if cfg.lambda_lqr_pi > 0.0:
+            lqr_planner = KODAQLQRPlanner(
+                model,
+                LQRConfig(Q_scale=args.lqr_Q_scale, R_scale=args.lqr_R_scale),
+            )
+            if args.u_bounds_path and Path(args.u_bounds_path).exists():
+                lqr_planner.load_u_bounds(args.u_bounds_path)
+            lqr_planner.precompute_gains(H=cfg.lqr_horizon)
+            print(f"  LQR policy regularizer enabled: "
+                  f"lambda={cfg.lambda_lqr_pi} aux_k={cfg.lqr_aux_k}")
         trainer = PolicyPriorOnlineTrainer(
             cfg, model, device,
             action_inv_steps=args.action_inv_steps,
             action_inv_lr=args.action_inv_lr,
+            lqr_planner=lqr_planner,
         )
         if args.resume and Path(args.resume).exists():
             trainer.load(args.resume)
+        elif not args.no_prefill:
+            quality = 'mixed'
+            if 'partial' in args.env:
+                quality = 'partial'
+            elif 'complete' in args.env:
+                quality = 'complete'
+            prefill_prior_buffer_from_offline(
+                trainer, args.x_cache, quality=quality,
+                max_transitions=args.prefill_size, device=device)
         train_policy_prior_online(
             cfg, trainer, args.env, args.out_dir, device, use_wandb)
         if use_wandb:

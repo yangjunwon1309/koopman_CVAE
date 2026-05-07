@@ -76,6 +76,76 @@ def load_model_v5(ckpt_path: str, device: str) -> KoopmanCVAE:
     return model
 
 
+def crop_episodes_by_reward(
+    episodes: List[Dict],
+    reward_crop: Optional[float],
+    min_len: int,
+) -> List[Dict]:
+    """Crop episodes at the first timestep whose Kitchen reward reaches target."""
+    if reward_crop is None:
+        return episodes
+
+    cropped = []
+    no_hit = 0
+    for ep in episodes:
+        rew_ep = ep['rewards'].astype(np.float32)
+        hits = np.where(rew_ep >= float(reward_crop))[0]
+        if len(hits) == 0:
+            no_hit += 1
+            continue
+
+        crop_t = int(hits[0])
+        L = crop_t + 1
+        if L < min_len:
+            continue
+
+        obs_crop = ep['obs'][:L]
+        act_crop = ep['actions'][:L]
+        rew_crop = ep['rewards'][:L]
+        completed = {
+            k: int(v)
+            for k, v in ep['goal_info']['completions'].items()
+            if int(v) <= crop_t
+        }
+        subtask_goals = {
+            task: {'obs': obs_crop[t], 'timestep': t, 'completed': True}
+            for task, t in completed.items()
+        }
+        goal_info = dict(ep['goal_info'])
+        goal_info.update({
+            'final_goal': obs_crop[-1],
+            'midpoint_goal': obs_crop[L // 2],
+            'subtask_goals': subtask_goals,
+            'completions': completed,
+            'episode_len': L,
+            'n_completed': len(completed),
+            'reward_total': float(rew_crop[-1]),
+        })
+
+        ep_crop = dict(ep)
+        ep_crop.update({
+            'obs': obs_crop,
+            'actions': act_crop,
+            'rewards': rew_crop,
+            'end_t': ep['start_t'] + crop_t,
+            'length': L,
+            'tasks': list(completed.keys()),
+            'goal_info': goal_info,
+        })
+        cropped.append(ep_crop)
+
+    if cropped:
+        lengths = np.asarray([e['length'] for e in cropped], dtype=np.int64)
+        print(
+            f"Reward crop: target={reward_crop}  episodes={len(cropped)}/{len(episodes)}  "
+            f"no_hit={no_hit}  len=[{lengths.min()},{lengths.max()}]  "
+            f"mean={lengths.mean():.1f}"
+        )
+    else:
+        print(f"Reward crop: target={reward_crop} left no episodes.")
+    return cropped
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Core: skill-segment rollout analysis
 # ──────────────────────────────────────────────────────────────────────────────
@@ -632,6 +702,8 @@ def parse_args():
                    help='Rollout horizon per segment (≤8 recommended)')
     p.add_argument('--min_seg_len',type=int, default=8,
                    help='Minimum segment length to analyze')
+    p.add_argument('--reward_crop', type=float, default=2.0,
+                   help='Crop each episode at first reward >= target; set <0 to disable')
     p.add_argument('--out_dir',    default='checkpoints/kodaq_v5_lqr/analysis')
     p.add_argument('--device',     default='cuda' if torch.cuda.is_available() else 'cpu')
     p.add_argument('--seed',       type=int, default=42)
@@ -653,11 +725,17 @@ if __name__ == '__main__':
     x_seq_full, _, _ = load_x_sequences(args.x_cache)
     episodes, _      = load_kitchen_episodes(
         quality=args.quality, min_len=args.min_seg_len + args.horizon + 2)
+    reward_crop = None if args.reward_crop < 0 else args.reward_crop
+    episodes = crop_episodes_by_reward(
+        episodes, reward_crop, min_len=args.min_seg_len + args.horizon + 2)
 
     # Select episodes with tasks, sorted by reward (descending for variety)
     eps_with_tasks = [e for e in episodes if e['tasks']]
     eps_with_tasks.sort(key=lambda e: e['goal_info']['reward_total'], reverse=True)
     selected = eps_with_tasks[:args.n_ep]
+    if not selected:
+        print("No episodes selected. Check reward_crop, quality, and min lengths.")
+        exit(1)
     print(f"Selected {len(selected)} episodes  "
           f"(reward range: {selected[-1]['goal_info']['reward_total']:.0f}"
           f"~{selected[0]['goal_info']['reward_total']:.0f})")
@@ -666,7 +744,7 @@ if __name__ == '__main__':
     print(f"\nAnalyzing skill segments (horizon={args.horizon}) ...")
     results = analyze_skill_segments(
         model, selected, x_seq_full,
-        horizon=args.min_seg_len, device=args.device,
+        horizon=args.horizon, device=args.device,
         min_seg_len=args.min_seg_len,
     )
 

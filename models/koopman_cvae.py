@@ -106,6 +106,9 @@ class KoopmanCVAEConfig:
 
     # ── v5.2 LQR policy prior for Q target ───────────────────────────────────
     use_lqr_policy:  bool  = False  # True=LQR rollout for Q target
+    lambda_lqr_pi:   float = 0.0    # supervised LQR latent-action regularizer
+    lqr_aux_k:       int   = 4      # weak future-state auxiliary target offset
+    lqr_aux_weight:  float = 0.25   # weight for Offline A(k) auxiliary target
     lqr_horizon:     int   = 4      # H for LQR Q target (≤ td_horizon)
 
     # ── v5.3 Goal Proposal Policy ─────────────────────────────────────────────
@@ -1290,6 +1293,38 @@ class KoopmanCVAE(nn.Module):
         #     loss_goal = β·KL  (π_goal이 z_g^seg 분포 모방)
         #   Phase B (epoch >= warmup_goal_epochs):
         #     z_g ~ π_goal(z_t, h_t) → Q-maximize 활성화
+        loss_lqr_pi = torch.tensor(0.0, device=device)
+        if (cfg.phase >= 2
+                and getattr(cfg, 'lambda_lqr_pi', 0.0) > 0.0
+                and self._lqr_planner is not None
+                and goal_z_seq is not None
+                and h_seq is not None):
+            targets = self._lqr_planner.sample_lqr_latent_action_targets(
+                o_seq=o_seq.detach(),
+                h_seq=h_seq.detach(),
+                goal_z_seq=goal_z_seq.detach(),
+                H=getattr(cfg, 'lqr_horizon', 4),
+                aux_k=getattr(cfg, 'lqr_aux_k', 4),
+            )
+            _, _, mu_pi_reg, _ = self.policy_prior(o_seq[:, :-1].detach())
+            u_mean = torch.tanh(mu_pi_reg)
+
+            def _masked_mse(pred, target, mask):
+                mask = mask.to(pred.device)
+                if mask.numel() == 0 or not bool(mask.any()):
+                    return pred.new_tensor(0.0)
+                err = (pred - target.to(pred.device)).pow(2).mean(-1)
+                return err[mask].mean()
+
+            main_loss = _masked_mse(
+                u_mean, targets['main'], targets['main_mask'])
+            aux_loss = _masked_mse(
+                u_mean, targets['aux'], targets['aux_mask'])
+            loss_lqr_pi = (
+                main_loss
+                + getattr(cfg, 'lqr_aux_weight', 0.25) * aux_loss
+            )
+
         loss_goal      = torch.tensor(0.0, device=device)
         goal_phase_str = 'off'
 
@@ -1359,6 +1394,7 @@ class KoopmanCVAE(nn.Module):
             + cfg.lambda_reward * loss_reward
             + cfg.lambda_q      * loss_q
             + cfg.lambda_pi     * loss_pi
+            + getattr(cfg, 'lambda_lqr_pi', 0.0) * loss_lqr_pi
             + cfg.lambda_goal   * loss_goal
         )
 
@@ -1380,6 +1416,7 @@ class KoopmanCVAE(nn.Module):
             'loss_reward':      loss_reward,
             'loss_q':           loss_q,
             'loss_pi':          loss_pi,
+            'loss_lqr_pi':      loss_lqr_pi,
             'loss_goal':        loss_goal,
             'rho':              torch.tensor(self.scale_tracker.rho, device=device),
             'q_scale':          torch.tensor(self.scale_tracker.scale, device=device),

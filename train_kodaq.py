@@ -107,15 +107,32 @@ class GoalZDatasetWrapper(torch.utils.data.Dataset):
         # Get global window range from base dataset
         # KODAQWindowDataset stores windows as (global_start, global_end)
         if hasattr(self.base_ds, 'windows'):
-            t0, t1 = self.base_ds.windows[idx]
+            win = self.base_ds.windows[idx]
+            if isinstance(win, (tuple, list)):
+                t0, t1 = int(win[0]), int(win[1])
+            else:
+                t0 = int(win)
+                t1 = t0 + (
+                    sample['x_seq'].shape[0]
+                    if isinstance(sample, dict) else sample[0].shape[0])
         elif hasattr(self.base_ds, 'dataset') and hasattr(self.base_ds.dataset, 'windows'):
             # Subset wrapper (from random_split)
             real_idx = self.base_ds.indices[idx]
-            t0, t1   = self.base_ds.dataset.windows[real_idx]
+            win = self.base_ds.dataset.windows[real_idx]
+            if isinstance(win, (tuple, list)):
+                t0, t1 = int(win[0]), int(win[1])
+            else:
+                t0 = int(win)
+                t1 = t0 + (
+                    sample['x_seq'].shape[0]
+                    if isinstance(sample, dict) else sample[0].shape[0])
         else:
             # Fallback: no window info → return zeros (Mode D disabled)
             seq_len = sample['x_seq'].shape[0] if isinstance(sample, dict) else sample[0].shape[0]
-            sample['goal_z_seq'] = torch.zeros(seq_len, self.koopman_dim)
+            if isinstance(sample, dict):
+                sample['goal_z_seq'] = torch.zeros(seq_len, self.koopman_dim)
+            else:
+                sample = list(sample) + [torch.zeros(seq_len, self.koopman_dim)]
             return sample
 
         # Slice goal_z for this window
@@ -198,7 +215,7 @@ class Trainer:
         'loss_reg', 'loss_stab',
         'loss_rec_delta_e', 'loss_rec_delta_p', 'loss_rec_q', 'loss_rec_qdot',
         # v5 new head losses
-        'loss_reward', 'loss_q', 'loss_pi', 'loss_goal',
+        'loss_reward', 'loss_q', 'loss_pi', 'loss_lqr_pi', 'loss_goal',
         # v5 diagnostics
         'rho', 'q_scale',
     ]
@@ -246,8 +263,11 @@ class Trainer:
     # ── Batch forward ────────────────────────────────────────────────────────
 
     def _forward_batch(self, batch) -> Dict:
+        goal_z_seq = None
         if isinstance(batch, (list, tuple)):
-            if len(batch) == 4:
+            if len(batch) == 5:
+                x_seq, actions, skill_labels, rewards, goal_z_seq = batch
+            elif len(batch) == 4:
                 x_seq, actions, skill_labels, rewards = batch
             else:
                 x_seq, actions, skill_labels = batch
@@ -259,18 +279,20 @@ class Trainer:
             skill_labels = batch['skill_labels']
             mask         = batch.get('mask', None)
             rewards      = batch.get('rewards', None)
+            goal_z_seq   = batch.get('goal_z_seq', None)
 
         x_seq        = x_seq.to(self.device)
         actions      = actions.to(self.device)
         skill_labels = skill_labels.to(self.device)
         if mask    is not None: mask    = mask.to(self.device)
         if rewards is not None: rewards = rewards.to(self.device)
+        if goal_z_seq is not None: goal_z_seq = goal_z_seq.to(self.device)
         if not self.train_heads:
             rewards = None
 
-        # goal_z_seq is computed on-the-fly inside model.forward()
-        # from skill_labels + x_batch → no need to pass from dataset
-        return self.model(x_seq, actions, skill_labels, mask, rewards)
+        return self.model(
+            x_seq, actions, skill_labels, mask, rewards,
+            goal_z_seq=goal_z_seq)
 
     # ── Epoch helpers ────────────────────────────────────────────────────────
 
@@ -323,11 +345,12 @@ class Trainer:
         for p in self._head_params():
             p.requires_grad_(flag)
 
-    def _set_head_loss_weights(self, reward=None, q=None, pi=None, goal=None):
+    def _set_head_loss_weights(self, reward=None, q=None, pi=None, goal=None, lqr_pi=None):
         if reward is not None: self.model.cfg.lambda_reward = reward
         if q      is not None: self.model.cfg.lambda_q      = q
         if pi     is not None: self.model.cfg.lambda_pi     = pi
         if goal   is not None: self.model.cfg.lambda_goal   = goal
+        if lqr_pi is not None: self.model.cfg.lambda_lqr_pi = lqr_pi
 
     def train_epoch(self, loader) -> Dict:
         self.model.train()
@@ -423,9 +446,10 @@ class Trainer:
                       'loss_skill', 'loss_reg']:
                 if metrics.get(k, 0.0) != 0.0:
                     line += f"  {k.replace('loss_','')[:4]}={metrics[k]:.4f}"
-            for k in ['loss_reward', 'loss_q', 'loss_pi']:
+            for k in ['loss_reward', 'loss_q', 'loss_pi', 'loss_lqr_pi']:
                 if k in metrics and metrics.get(k, 0.0) != 0.0:
-                    line += f"  {k.replace('loss_','')[:4]}={metrics[k]:.4f}"
+                    name = 'lqrp' if k == 'loss_lqr_pi' else k.replace('loss_','')[:4]
+                    line += f"  {name}={metrics[k]:.4f}"
             # loss_goal: always show when use_goal_proposal (even if 0 in Phase A)
             if use_goal and 'loss_goal' in metrics:
                 line += f"  goal={metrics['loss_goal']:.4f}"
@@ -483,7 +507,8 @@ class Trainer:
                   "and disabling head losses.", flush=True)
             self.train_heads = False
             self._set_head_requires_grad(False)
-            self._set_head_loss_weights(reward=0.0, q=0.0, pi=0.0, goal=0.0)
+            self._set_head_loss_weights(
+                reward=0.0, q=0.0, pi=0.0, goal=0.0, lqr_pi=0.0)
             self.args.epochs = getattr(self.args, 'epochs', 400)
             best = self._run_loop(train_loader, val_loader,
                                   n_epochs=self.args.epochs,
@@ -529,8 +554,10 @@ class Trainer:
         saved_lQ  = self.model.cfg.lambda_q
         saved_lpi = self.model.cfg.lambda_pi
         saved_lg  = self.model.cfg.lambda_goal
+        saved_lqr = self.model.cfg.lambda_lqr_pi
         self.train_heads = False
-        self._set_head_loss_weights(reward=0.0, q=0.0, pi=0.0, goal=0.0)
+        self._set_head_loss_weights(
+            reward=0.0, q=0.0, pi=0.0, goal=0.0, lqr_pi=0.0)
         # Phase 3 for full WM loss (L_rec + L_dyn + L_skill + L_reg)
         self.model.cfg.phase = 3
         self.phase2_epoch = 0
@@ -552,7 +579,8 @@ class Trainer:
         print(f"\n{'='*60}", flush=True)
         print(f"[Stage 2] Head training  {n_heads} epochs  lr={lr_heads}", flush=True)
         print(f"  WM frozen,  heads trainable,  lambda_R={saved_lR} ", flush=True)
-        print(f"  lambda_Q={saved_lQ}  lambda_pi={saved_lpi}", flush=True)
+        print(f"  lambda_Q={saved_lQ}  lambda_pi={saved_lpi}"
+              f"  lambda_lqr_pi={saved_lqr}", flush=True)
         print(f"{'='*60}", flush=True)
 
         # Freeze WM, unfreeze heads
@@ -564,6 +592,7 @@ class Trainer:
         self.model.cfg.lambda_q      = saved_lQ
         self.model.cfg.lambda_pi     = saved_lpi
         self.model.cfg.lambda_goal   = saved_lg
+        self.model.cfg.lambda_lqr_pi = saved_lqr
         self.train_heads = True
         # Phase stays 3 (all WM losses computed but lambda=0 for R/Q/pi in wm)
         # For head stage we still need phase>=2 for policy prior activation
@@ -708,6 +737,12 @@ def parse_args():
                         'Requires --goal_z_path and --u_bounds_path.')
     p.add_argument('--lqr_horizon',          type=int,   default=4,
                    help='H-step LQR rollout for Q target.')
+    p.add_argument('--lambda_lqr_pi',        type=float, default=0.1,
+                   help='Weight for LQR latent-action policy regularization.')
+    p.add_argument('--lqr_aux_k',            type=int,   default=4,
+                   help='Future-state offset for weak auxiliary LQR target.')
+    p.add_argument('--lqr_aux_weight',       type=float, default=0.25,
+                   help='Relative weight for the k-step auxiliary LQR target.')
     p.add_argument('--goal_z_path',          type=str,   default=None,
                    help='Path to pre-computed goal_latent_map.npz.')
     p.add_argument('--u_bounds_path',        type=str,   default=None,
@@ -757,6 +792,11 @@ if __name__ == '__main__':
     cfg.lambda_reward = args.lambda_reward
     cfg.lambda_q      = args.lambda_q
     cfg.lambda_pi     = args.lambda_pi
+    cfg.use_lqr_policy = args.use_lqr_policy
+    cfg.lqr_horizon    = args.lqr_horizon
+    cfg.lambda_lqr_pi = args.lambda_lqr_pi if args.use_lqr_policy else 0.0
+    cfg.lqr_aux_k     = args.lqr_aux_k
+    cfg.lqr_aux_weight = args.lqr_aux_weight
 
     print("=" * 65, flush=True)
     print("KODAQ v5")
@@ -822,6 +862,9 @@ if __name__ == '__main__':
         resume_cfg.log_std_max         = args.log_std_max
         resume_cfg.use_lqr_policy      = args.use_lqr_policy
         resume_cfg.lqr_horizon         = args.lqr_horizon
+        resume_cfg.lambda_lqr_pi       = args.lambda_lqr_pi if args.use_lqr_policy else 0.0
+        resume_cfg.lqr_aux_k           = args.lqr_aux_k
+        resume_cfg.lqr_aux_weight      = args.lqr_aux_weight
         resume_cfg.use_goal_proposal   = args.use_goal_proposal
         resume_cfg.goal_kl_weight      = args.goal_kl_weight
         resume_cfg.lambda_goal         = args.lambda_goal
@@ -909,11 +952,15 @@ if __name__ == '__main__':
 
     # ── LQR planner setup (Mode D) ────────────────────────────────────────
     if getattr(args, 'use_lqr_policy', False):
-        if args.goal_z_path is None:
+        if args.goal_z_path is None or not Path(args.goal_z_path).exists():
             print("[WARNING] --use_lqr_policy requires --goal_z_path. "
                   "Falling back to policy prior.")
-            if is_resume: resume_cfg.use_lqr_policy = False
-            else: cfg.use_lqr_policy = False
+            if is_resume:
+                resume_cfg.use_lqr_policy = False
+                resume_cfg.lambda_lqr_pi = 0.0
+            else:
+                cfg.use_lqr_policy = False
+                cfg.lambda_lqr_pi = 0.0
         else:
             from lqr_koopman import KODAQLQRPlanner, LQRConfig,                 KODAQLQRPlanner as _Planner
             lqr_cfg = LQRConfig(
@@ -952,6 +999,11 @@ if __name__ == '__main__':
     print(flush=True)
 
     dataset = load_dataset(args, cfg)
+    if (getattr(cfg, 'use_lqr_policy', False)
+            and args.goal_z_path is not None
+            and Path(args.goal_z_path).exists()):
+        dataset = GoalZDatasetWrapper(
+            dataset, args.goal_z_path, cfg.koopman_dim)
     print(f"Dataset: {len(dataset)} samples", flush=True)
 
     n_val   = max(1, int(args.val_ratio * len(dataset)))
