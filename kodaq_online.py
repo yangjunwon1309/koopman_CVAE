@@ -1505,6 +1505,7 @@ def main():
     p.add_argument('--w_env',         type=float, default=0.4)
     p.add_argument('--w_acc',         type=float, default=0.4)
     p.add_argument('--w_event',       type=float, default=0.2)
+    p.add_argument('--buffer_size',   type=int,   default=200_000)
     p.add_argument('--prefill_size',  type=int,   default=50_000)
     p.add_argument('--no_prefill',    action='store_true')
     p.add_argument('--eval_every',    type=int,   default=10_000)
@@ -1589,6 +1590,7 @@ def main():
         lr=args.lr, batch_size=args.batch_size,
         kl_weight=args.kl_weight, kl_lqr_weight=args.kl_lqr_weight,
         awr_beta=args.awr_beta, n_env_steps=args.n_steps,
+        buffer_size=args.buffer_size,
         wm_lr=args.wm_lr, w_env=args.w_env, w_acc=args.w_acc,
         w_event=args.w_event, eval_every=args.eval_every,
         n_eval_ep=args.n_eval_ep, log_every=args.log_every,
