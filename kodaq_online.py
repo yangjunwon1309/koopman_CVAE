@@ -106,6 +106,7 @@ class OnlineConfig:
     actor_mode:               str   = 'policy_prior'  # policy_prior | skill_decoder
     pi_q_weight:              float = 1.0
     action_noise_std:         float = 0.0
+    skilldec_exec_horizon:    int   = 1
     lambda_bc_pi:             float = 0.0
     bc_target_clip:           float = 1.0
     lambda_q_cql_policy:      float = 0.0
@@ -594,21 +595,34 @@ class PolicyPriorOnlineTrainer:
         return a.detach()[0].cpu().numpy()
 
     @torch.no_grad()
-    def act(self, z: torch.Tensor,
-            h: Optional[torch.Tensor] = None) -> Tuple[np.ndarray, np.ndarray]:
+    def act_sequence(
+        self,
+        z: torch.Tensor,
+        h: Optional[torch.Tensor] = None,
+        horizon: Optional[int] = None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
         if self.actor_mode == 'skill_decoder':
             if h is None:
                 raise ValueError("h is required when actor_mode=skill_decoder")
             w = self.model.skill_prior.soft_weights(h)
-            a_seq = self.model.skill_action_decoder(z, h, w)
-            a = a_seq[0, 0].clamp(-1.0, 1.0)
+            a_seq = self.model.skill_action_decoder(z, h, w)[0].clamp(-1.0, 1.0)
+            n = max(1, int(horizon or self.cfg.skilldec_exec_horizon))
+            a_seq = a_seq[:min(n, a_seq.shape[0])]
             if self.cfg.action_noise_std > 0.0:
-                a = (a + self.cfg.action_noise_std * torch.randn_like(a)).clamp(-1.0, 1.0)
-            u = self.model.action_encoder(a.unsqueeze(0))[0]
-            return a.cpu().numpy(), u.detach().cpu().numpy()
+                a_seq = (
+                    a_seq + self.cfg.action_noise_std * torch.randn_like(a_seq)
+                ).clamp(-1.0, 1.0)
+            u_seq = self.model.action_encoder(a_seq)
+            return a_seq.cpu().numpy(), u_seq.detach().cpu().numpy()
         u, _, _, _ = self.model.policy_prior(z)
         a = self.decode_action(u)
-        return a, u[0].detach().cpu().numpy()
+        return a[None], u[0:1].detach().cpu().numpy()
+
+    @torch.no_grad()
+    def act(self, z: torch.Tensor,
+            h: Optional[torch.Tensor] = None) -> Tuple[np.ndarray, np.ndarray]:
+        a_seq, u_seq = self.act_sequence(z, h, horizon=1)
+        return a_seq[0], u_seq[0]
 
     def _skilldec_action_seq(
         self,
@@ -1573,7 +1587,8 @@ def train_policy_prior_online(cfg: OnlineConfig,
 
     print(f"\n{'='*60}")
     print(f"PolicyPrior Online  steps={cfg.n_env_steps}  env={env_name}")
-    print(f"  actor={cfg.actor_mode}  noise={cfg.action_noise_std:.3f}")
+    print(f"  actor={cfg.actor_mode}  exec_h={cfg.skilldec_exec_horizon} "
+          f"noise={cfg.action_noise_std:.3f}")
     print(f"  batch={cfg.batch_size}  buf={cfg.buffer_size}  cond={cfg.cond_len}")
     print(f"  reward batch pos/off={cfg.reward_positive_fraction:.2f}/"
           f"{cfg.reward_offline_fraction:.2f}")
@@ -1609,86 +1624,98 @@ def train_policy_prior_online(cfg: OnlineConfig,
                 ep_tasks = 0
             continue
 
-        z_t, h_t = cur
-        z_t = z_t.clone()
-        h_t = h_t.clone()
-        a_np, u_np = trainer.act(z_t, h_t)
-        obs_nx, r_env, done, info = env.step(a_np.clip(-1, 1))
-        ctx.step(obs_nx, a_np)
+        z_plan, h_plan = cur
+        exec_h = cfg.skilldec_exec_horizon if cfg.actor_mode == 'skill_decoder' else 1
+        a_seq_np, u_seq_np = trainer.act_sequence(
+            z_plan.clone(), h_plan.clone(), horizon=exec_h)
 
-        ep_r += r_env
-        ep_c = info.get('episode_task_completions',
-                        info.get('completed_tasks', []))
-        ep_tasks = max(ep_tasks, len(ep_c) if isinstance(ep_c, list)
-                       else int(ep_c) if ep_c is not None else 0)
+        for a_np, u_np in zip(a_seq_np, u_seq_np):
+            cur_step = ctx.current_latent()
+            if cur_step is None or global_step >= cfg.n_env_steps:
+                break
+            z_t, h_t = cur_step
+            z_t = z_t.clone()
+            h_t = h_t.clone()
 
-        nxt = ctx.current_latent()
-        if nxt is not None:
-            z_next_t, h_next_t = nxt
-            u_lqr = None
-            u_lqr_aux = None
-            has_lqr = 0.0
-            if r_env > 0.0:
-                lqr_t = trainer.lqr_target_for_goal(z_t, h_t, z_next_t)
-                if lqr_t is not None:
-                    u_lqr, u_lqr_aux, has_lqr = lqr_t
-            trainer.buf.add(
-                z=z_t.cpu().numpy()[0],
-                h=h_t.cpu().numpy()[0],
-                u=u_np,
-                r=float(r_env > 0.0),
-                z_next=z_next_t.cpu().numpy()[0],
-                h_next=h_next_t.cpu().numpy()[0],
-                done=float(done),
-                u_lqr=u_lqr,
-                u_lqr_aux=u_lqr_aux,
-                has_lqr=has_lqr,
-                source=0.0,
-            )
+            obs_nx, r_env, done, info = env.step(a_np.clip(-1, 1))
+            ctx.step(obs_nx, a_np)
 
-        trainer.step = global_step
-        for _ in range(cfg.n_updates_per_step):
-            info_d = trainer.update()
-            for k, v in info_d.items():
-                if k in recent:
-                    recent[k].append(v)
+            ep_r += r_env
+            ep_c = info.get('episode_task_completions',
+                            info.get('completed_tasks', []))
+            ep_tasks = max(ep_tasks, len(ep_c) if isinstance(ep_c, list)
+                           else int(ep_c) if ep_c is not None else 0)
 
-        obs = obs_nx
-        global_step += 1
+            nxt = ctx.current_latent()
+            if nxt is not None:
+                z_next_t, h_next_t = nxt
+                u_lqr = None
+                u_lqr_aux = None
+                has_lqr = 0.0
+                if r_env > 0.0:
+                    lqr_t = trainer.lqr_target_for_goal(z_t, h_t, z_next_t)
+                    if lqr_t is not None:
+                        u_lqr, u_lqr_aux, has_lqr = lqr_t
+                trainer.buf.add(
+                    z=z_t.cpu().numpy()[0],
+                    h=h_t.cpu().numpy()[0],
+                    u=u_np,
+                    r=float(r_env > 0.0),
+                    z_next=z_next_t.cpu().numpy()[0],
+                    h_next=h_next_t.cpu().numpy()[0],
+                    done=float(done),
+                    u_lqr=u_lqr,
+                    u_lqr_aux=u_lqr_aux,
+                    has_lqr=has_lqr,
+                    source=0.0,
+                )
 
-        if done:
-            recent['ep_reward'].append(ep_r)
-            recent['ep_tasks'].append(ep_tasks)
-            obs = env.reset()
-            ctx.reset(obs)
-            ep_r = 0.0
-            ep_tasks = 0
-
-        if global_step % cfg.log_every == 0:
             trainer.step = global_step
-            ms = {k: np.mean(list(v)) if v else 0.0
-                  for k, v in recent.items()}
-            sps = cfg.log_every / (time.time() - t0 + 1e-6)
-            t0 = time.time()
-            print(f"Step {global_step:7d} | "
-                  f"R={ms['loss_reward']:.3f} Q={ms['loss_q']:.3f} "
-                  f"TD={ms['loss_q_td']:.3f} CQ={ms['loss_q_cql_policy']:.3f} "
-                  f"RD={ms['loss_q_rank_data']:.3f} "
-                  f"Pi={ms['loss_pi']:.3f} Anc={ms['loss_skilldec_anchor']:.3f} "
-                  f"Aw={ms['skilldec_anchor_w']:.2f} "
-                  f"q={ms['q_mean']:.3f} "
-                  f"qd={ms['q_data']:.3f} rho={ms['rho']:.3f} rhat={ms['r_hat']:.3f} "
-                  f"rQ={ms['q_reward']:.3f} y={ms['q_target']:.3f} "
-                  f"pi={ms['pi_active']:.0f} | "
-                  f"ep_r={ms['ep_reward']:.2f} tasks={ms['ep_tasks']:.2f} | "
-                  f"{sps:.0f}sps")
-            if use_wandb:
-                wandb.log({f"prior_online/{k}": v for k, v in ms.items()},
-                          step=global_step)
+            for _ in range(cfg.n_updates_per_step):
+                info_d = trainer.update()
+                for k, v in info_d.items():
+                    if k in recent:
+                        recent[k].append(v)
 
-        if global_step % cfg.save_every == 0:
-            trainer.step = global_step
-            trainer.save(f"{out_dir}/policy_prior_online_step{global_step}.pt")
+            obs = obs_nx
+            global_step += 1
+
+            if done:
+                recent['ep_reward'].append(ep_r)
+                recent['ep_tasks'].append(ep_tasks)
+                obs = env.reset()
+                ctx.reset(obs)
+                ep_r = 0.0
+                ep_tasks = 0
+
+            if global_step % cfg.log_every == 0:
+                trainer.step = global_step
+                ms = {k: np.mean(list(v)) if v else 0.0
+                      for k, v in recent.items()}
+                sps = cfg.log_every / (time.time() - t0 + 1e-6)
+                t0 = time.time()
+                print(f"Step {global_step:7d} | "
+                      f"R={ms['loss_reward']:.3f} Q={ms['loss_q']:.3f} "
+                      f"TD={ms['loss_q_td']:.3f} CQ={ms['loss_q_cql_policy']:.3f} "
+                      f"RD={ms['loss_q_rank_data']:.3f} "
+                      f"Pi={ms['loss_pi']:.3f} Anc={ms['loss_skilldec_anchor']:.3f} "
+                      f"Aw={ms['skilldec_anchor_w']:.2f} "
+                      f"q={ms['q_mean']:.3f} "
+                      f"qd={ms['q_data']:.3f} rho={ms['rho']:.3f} rhat={ms['r_hat']:.3f} "
+                      f"rQ={ms['q_reward']:.3f} y={ms['q_target']:.3f} "
+                      f"pi={ms['pi_active']:.0f} | "
+                      f"ep_r={ms['ep_reward']:.2f} tasks={ms['ep_tasks']:.2f} | "
+                      f"{sps:.0f}sps")
+                if use_wandb:
+                    wandb.log({f"prior_online/{k}": v for k, v in ms.items()},
+                              step=global_step)
+
+            if global_step % cfg.save_every == 0:
+                trainer.step = global_step
+                trainer.save(f"{out_dir}/policy_prior_online_step{global_step}.pt")
+
+            if done:
+                break
 
     trainer.step = global_step
     trainer.save(f"{out_dir}/policy_prior_online_final.pt")
@@ -1750,6 +1777,8 @@ def main():
                    default='policy_prior')
     p.add_argument('--pi_q_weight', type=float, default=1.0)
     p.add_argument('--action_noise_std', type=float, default=0.0)
+    p.add_argument('--skilldec_exec_horizon', type=int, default=1,
+                   help='Number of decoded skill actions to execute open-loop before replanning.')
     p.add_argument('--lambda_bc_pi', type=float, default=0.0)
     p.add_argument('--bc_target_clip', type=float, default=1.0)
     p.add_argument('--lambda_q_cql_policy', type=float, default=0.0)
@@ -1844,6 +1873,7 @@ def main():
         actor_mode=args.actor_mode,
         pi_q_weight=args.pi_q_weight,
         action_noise_std=args.action_noise_std,
+        skilldec_exec_horizon=args.skilldec_exec_horizon,
         lambda_bc_pi=args.lambda_bc_pi,
         bc_target_clip=args.bc_target_clip,
         lambda_q_cql_policy=args.lambda_q_cql_policy,
