@@ -103,14 +103,20 @@ class OnlineConfig:
     q_reward_source:          str   = 'env'
     q_bootstrap:              float = 0.0
     pi_update_start:          int   = 10_000
+    actor_mode:               str   = 'policy_prior'  # policy_prior | skill_decoder
     pi_q_weight:              float = 1.0
+    action_noise_std:         float = 0.0
     lambda_bc_pi:             float = 0.0
     bc_target_clip:           float = 1.0
     lambda_q_cql_policy:      float = 0.0
+    lambda_q_rank_data:       float = 0.0
     lambda_q_rank_bc:         float = 0.0
     lambda_q_rank_lqr:        float = 0.0
     q_rank_margin:            float = 0.05
-    lambda_lqr_pi:     float = 0.1
+    lambda_skilldec_anchor:   float = 0.0
+    skilldec_anchor_min:      float = 0.0
+    skilldec_anchor_decay_steps: int = 200_000
+    lambda_lqr_pi:     float = 0.0
     lqr_horizon:       int   = 4
     lqr_aux_k:         int   = 4
     lqr_aux_weight:    float = 0.25
@@ -429,26 +435,41 @@ class EnvContext:
             self.z_t = enc['o_seq'][0, -1:]
             self.h_t = enc['h_seq'][0, -1:]
 
+    @torch.no_grad()
+    def current_latent(self) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        if self.h_t is None or not self.obs_buf:
+            return None
+        dev = torch.device(self.device)
+        h = self.h_t
+        x_now = torch.FloatTensor(
+            self._obs_to_x(self.obs_buf[-1])).unsqueeze(0).to(dev)
+        z_now, _, _ = self.model.posterior.sample(x_now, h)
+        return z_now, h
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # KODAQ Online Trainer
 # ─────────────────────────────────────────────────────────────────────────────
 
 class PriorReplayBuffer:
-    def __init__(self, capacity: int, device: str):
+    def __init__(self, capacity: int, device: str, h_dim: int = 0):
         self.capacity = capacity
         self.device = device
+        self.h_dim = h_dim
         self._d: Dict[str, np.ndarray] = {}
         self._ptr = 0
         self._n = 0
 
     def _init(self, z_dim: int, u_dim: int):
         C = self.capacity
+        h_dim = int(self.h_dim)
         self._d = {
             'z': np.zeros((C, z_dim), dtype=np.float32),
+            'h': np.zeros((C, h_dim), dtype=np.float32),
             'u': np.zeros((C, u_dim), dtype=np.float32),
             'r': np.zeros(C, dtype=np.float32),
             'z_next': np.zeros((C, z_dim), dtype=np.float32),
+            'h_next': np.zeros((C, h_dim), dtype=np.float32),
             'done': np.zeros(C, dtype=np.float32),
             'u_lqr': np.zeros((C, u_dim), dtype=np.float32),
             'u_lqr_aux': np.zeros((C, u_dim), dtype=np.float32),
@@ -457,15 +478,20 @@ class PriorReplayBuffer:
         }
 
     def add(self, z, u, r, z_next, done,
+            h=None, h_next=None,
             u_lqr=None, u_lqr_aux=None, has_lqr: float = 0.0,
             source: float = 0.0):
         if not self._d:
             self._init(z.shape[-1], u.shape[-1])
         p = self._ptr
         self._d['z'][p] = z
+        if h is not None and self.h_dim > 0:
+            self._d['h'][p] = h
         self._d['u'][p] = u
         self._d['r'][p] = r
         self._d['z_next'][p] = z_next
+        if h_next is not None and self.h_dim > 0:
+            self._d['h_next'][p] = h_next
         self._d['done'][p] = float(done)
         if u_lqr is not None:
             self._d['u_lqr'][p] = u_lqr
@@ -520,11 +546,24 @@ class PolicyPriorOnlineTrainer:
         self.action_inv_steps = action_inv_steps
         self.action_inv_lr = action_inv_lr
         self.lqr_planner = lqr_planner
-        self.buf = PriorReplayBuffer(cfg.buffer_size, device)
+        self.actor_mode = cfg.actor_mode.lower()
+        if self.actor_mode not in ('policy_prior', 'skill_decoder'):
+            raise ValueError(
+                f"Unknown actor_mode={cfg.actor_mode!r}; "
+                "expected policy_prior or skill_decoder")
+        self.buf = PriorReplayBuffer(
+            cfg.buffer_size, device, h_dim=model.cfg.gru_hidden)
+        self.skill_decoder_anchor = copy.deepcopy(model.skill_action_decoder)
+        self.skill_decoder_anchor.to(device).eval()
+        for p in self.skill_decoder_anchor.parameters():
+            p.requires_grad_(False)
 
         for p in model.parameters():
             p.requires_grad_(False)
-        for mod in [model.reward_ensemble_head, model.q_head, model.policy_prior]:
+        actor_mod = (model.skill_action_decoder
+                     if self.actor_mode == 'skill_decoder'
+                     else model.policy_prior)
+        for mod in [model.reward_ensemble_head, model.q_head, actor_mod]:
             for p in mod.parameters():
                 p.requires_grad_(True)
             mod.train()
@@ -534,7 +573,7 @@ class PolicyPriorOnlineTrainer:
         self.opt_reward = torch.optim.Adam(model.reward_ensemble_head.parameters(),
                                            lr=cfg.wm_lr)
         self.opt_q = torch.optim.Adam(model.q_head.parameters(), lr=cfg.lr)
-        self.opt_pi = torch.optim.Adam(model.policy_prior.parameters(), lr=cfg.lr)
+        self.opt_pi = torch.optim.Adam(actor_mod.parameters(), lr=cfg.lr)
 
     def decode_action(self, u: torch.Tensor) -> np.ndarray:
         if u.dim() == 1:
@@ -555,10 +594,55 @@ class PolicyPriorOnlineTrainer:
         return a.detach()[0].cpu().numpy()
 
     @torch.no_grad()
-    def act(self, z: torch.Tensor) -> Tuple[np.ndarray, np.ndarray]:
+    def act(self, z: torch.Tensor,
+            h: Optional[torch.Tensor] = None) -> Tuple[np.ndarray, np.ndarray]:
+        if self.actor_mode == 'skill_decoder':
+            if h is None:
+                raise ValueError("h is required when actor_mode=skill_decoder")
+            w = self.model.skill_prior.soft_weights(h)
+            a_seq = self.model.skill_action_decoder(z, h, w)
+            a = a_seq[0, 0].clamp(-1.0, 1.0)
+            if self.cfg.action_noise_std > 0.0:
+                a = (a + self.cfg.action_noise_std * torch.randn_like(a)).clamp(-1.0, 1.0)
+            u = self.model.action_encoder(a.unsqueeze(0))[0]
+            return a.cpu().numpy(), u.detach().cpu().numpy()
         u, _, _, _ = self.model.policy_prior(z)
         a = self.decode_action(u)
         return a, u[0].detach().cpu().numpy()
+
+    def _skilldec_action_seq(
+        self,
+        z: torch.Tensor,
+        h: torch.Tensor,
+        anchor: bool = False,
+    ) -> torch.Tensor:
+        w = self.model.skill_prior.soft_weights(h)
+        dec = self.skill_decoder_anchor if anchor else self.model.skill_action_decoder
+        return dec(z, h, w)
+
+    def _actor_u_for_q(
+        self,
+        z: torch.Tensor,
+        h: Optional[torch.Tensor] = None,
+        deterministic: bool = False,
+    ) -> torch.Tensor:
+        if self.actor_mode == 'skill_decoder':
+            if h is None:
+                raise ValueError("h is required when actor_mode=skill_decoder")
+            a_seq = self._skilldec_action_seq(z, h, anchor=False)
+            a0 = a_seq[:, 0].clamp(-1.0, 1.0)
+            return self.model.action_encoder(a0)
+        if deterministic:
+            return self._policy_mean_action(z)
+        u, _, _, _ = self.model.policy_prior(z)
+        return u
+
+    def _anchor_weight(self) -> float:
+        lam0 = float(self.cfg.lambda_skilldec_anchor)
+        lam_min = float(self.cfg.skilldec_anchor_min)
+        decay = max(1, int(self.cfg.skilldec_anchor_decay_steps))
+        frac = min(1.0, max(0.0, self.step / decay))
+        return lam_min + (lam0 - lam_min) * (1.0 - frac)
 
     def _sample_update_batches(self) -> Tuple[Dict[str, torch.Tensor],
                                               Dict[str, torch.Tensor],
@@ -605,6 +689,7 @@ class PolicyPriorOnlineTrainer:
         b_r, b_q, b_pi = self._sample_update_batches()
         z_r, u_r, r_r = b_r['z'], b_r['u'], b_r['r']
         z, u = b_q['z'], b_q['u']
+        h_q, h_next_q = b_q.get('h', None), b_q.get('h_next', None)
         r, z_next, done = b_q['r'], b_q['z_next'], b_q['done']
         m = self.model
 
@@ -617,7 +702,7 @@ class PolicyPriorOnlineTrainer:
         self.opt_reward.step()
 
         with torch.no_grad():
-            u_next, _, _, _ = m.policy_prior(z_next)
+            u_next = self._actor_u_for_q(z_next, h_next_q)
             r_q, r_hat = self._q_reward(z, u, r)
             q_next = m.q_head_target.expected_value(
                 z_next, u_next, return_type='min')
@@ -638,6 +723,7 @@ class PolicyPriorOnlineTrainer:
         loss_q = (
             loss_q_td
             + self.cfg.lambda_q_cql_policy * combo['loss_q_cql_policy']
+            + self.cfg.lambda_q_rank_data * combo['loss_q_rank_data']
             + self.cfg.lambda_q_rank_bc * combo['loss_q_rank_bc']
             + self.cfg.lambda_q_rank_lqr * combo['loss_q_rank_lqr']
         )
@@ -648,34 +734,53 @@ class PolicyPriorOnlineTrainer:
         m.soft_update_target_Q()
 
         z_pi = b_pi['z']
-        u_pi, log_pi, mu_pi, _ = m.policy_prior(z_pi)
+        h_pi = b_pi.get('h', None)
+        if self.actor_mode == 'skill_decoder':
+            a_pi_seq = self._skilldec_action_seq(z_pi, h_pi, anchor=False)
+            u_pi = m.action_encoder(a_pi_seq[:, 0].clamp(-1.0, 1.0))
+            log_pi = None
+            u_mean = u_pi
+            with torch.no_grad():
+                a_anchor_seq = self._skilldec_action_seq(z_pi, h_pi, anchor=True)
+            loss_anchor = (a_pi_seq - a_anchor_seq).pow(2).mean()
+            anchor_w = self._anchor_weight()
+        else:
+            u_pi, log_pi, mu_pi, _ = m.policy_prior(z_pi)
+            u_mean = torch.tanh(mu_pi)
+            loss_anchor = z_pi.new_tensor(0.0)
+            anchor_w = 0.0
         q_logits_pi = m._detach_q_head(z_pi, u_pi)
         q_vals_pi = two_hot_decode(q_logits_pi, m.q_head.bins)
         n_pick = min(2, m.cfg.num_q)
         idx = torch.randperm(m.cfg.num_q, device=z_pi.device)[:n_pick]
         q_pi = q_vals_pi[idx].min(0).values
         m.scale_tracker.update(q_pi.detach())
-        u_mean = torch.tanh(mu_pi)
         loss_lqr = self._lqr_reg_loss(u_mean, b_pi)
         loss_bc = self._bc_reg_loss(u_mean, b_pi)
         pi_active = float(self.step >= self.cfg.pi_update_start)
         if pi_active:
-            log_pi_eff = log_pi
-            if log_pi_eff.dim() > q_pi.dim():
-                log_pi_eff = log_pi_eff.sum(-1)
-            loss_pi = (
-                (m.cfg.entropy_coef * log_pi_eff
-                 - self.cfg.pi_q_weight * q_pi)
-                * m.scale_tracker.rho
-            ).mean()
-            loss_pi = (
-                loss_pi
-                + self.cfg.lambda_lqr_pi * loss_lqr
-                + self.cfg.lambda_bc_pi * loss_bc
-            )
+            if self.actor_mode == 'skill_decoder':
+                loss_pi = (
+                    -self.cfg.pi_q_weight * q_pi * m.scale_tracker.rho
+                ).mean() + anchor_w * loss_anchor
+            else:
+                log_pi_eff = log_pi
+                if log_pi_eff.dim() > q_pi.dim():
+                    log_pi_eff = log_pi_eff.sum(-1)
+                loss_pi = (
+                    (m.cfg.entropy_coef * log_pi_eff
+                     - self.cfg.pi_q_weight * q_pi)
+                    * m.scale_tracker.rho
+                ).mean()
+                loss_pi = (
+                    loss_pi
+                    + self.cfg.lambda_lqr_pi * loss_lqr
+                    + self.cfg.lambda_bc_pi * loss_bc
+                )
             self.opt_pi.zero_grad()
             loss_pi.backward()
-            nn.utils.clip_grad_norm_(m.policy_prior.parameters(), self.cfg.grad_clip)
+            nn.utils.clip_grad_norm_(
+                self.opt_pi.param_groups[0]['params'], self.cfg.grad_clip)
             self.opt_pi.step()
         else:
             loss_pi = z_pi.new_tensor(0.0)
@@ -685,13 +790,17 @@ class PolicyPriorOnlineTrainer:
             'loss_q': loss_q.item(),
             'loss_q_td': loss_q_td.item(),
             'loss_q_cql_policy': combo['loss_q_cql_policy'].item(),
+            'loss_q_rank_data': combo['loss_q_rank_data'].item(),
             'loss_q_rank_bc': combo['loss_q_rank_bc'].item(),
             'loss_q_rank_lqr': combo['loss_q_rank_lqr'].item(),
             'loss_pi': loss_pi.item(),
             'loss_lqr_pi': loss_lqr.item(),
             'loss_bc_pi': loss_bc.item(),
+            'loss_skilldec_anchor': loss_anchor.item(),
+            'skilldec_anchor_w': anchor_w,
             'q_mean': q_pi.detach().mean().item(),
             'q_policy_cql': combo['q_policy'].detach().mean().item(),
+            'q_data': combo['q_data'].detach().mean().item(),
             'rho': m.scale_tracker.rho,
             'r_hat': r_hat.detach().mean().item(),
             'q_reward': r_q.detach().mean().item(),
@@ -714,25 +823,32 @@ class PolicyPriorOnlineTrainer:
                       batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         zero = z.new_tensor(0.0)
         if (self.cfg.lambda_q_cql_policy <= 0.0
+                and self.cfg.lambda_q_rank_data <= 0.0
                 and self.cfg.lambda_q_rank_bc <= 0.0
                 and self.cfg.lambda_q_rank_lqr <= 0.0):
             return {
                 'loss_q_cql_policy': zero,
+                'loss_q_rank_data': zero,
                 'loss_q_rank_bc': zero,
                 'loss_q_rank_lqr': zero,
                 'q_policy': zero,
+                'q_data': zero,
             }
 
-        u_pi = self._policy_mean_action(z).detach()
+        u_pi = self._actor_u_for_q(z, batch.get('h', None), deterministic=True).detach()
         q_policy = self._q_min_value(z, u_pi)
-        loss_cql = q_policy.mean()
+        q_data = self._q_min_value(z, batch['u'].detach())
+        loss_cql = (q_policy - q_data).mean()
+
+        loss_rank_data = zero
+        if self.cfg.lambda_q_rank_data > 0.0:
+            loss_rank_data = F.relu(
+                self.cfg.q_rank_margin + q_policy - q_data).mean()
 
         loss_rank_bc = zero
         if self.cfg.lambda_q_rank_bc > 0.0 and 'source' in batch and 'u' in batch:
             mask_bc = batch['source'] > 0.5
             if mask_bc.numel() > 0 and bool(mask_bc.any()):
-                u_data = batch['u'].detach()
-                q_data = self._q_min_value(z, u_data)
                 rank_bc = F.relu(
                     self.cfg.q_rank_margin + q_policy - q_data)
                 loss_rank_bc = rank_bc[mask_bc].mean()
@@ -750,9 +866,11 @@ class PolicyPriorOnlineTrainer:
 
         return {
             'loss_q_cql_policy': loss_cql,
+            'loss_q_rank_data': loss_rank_data,
             'loss_q_rank_bc': loss_rank_bc,
             'loss_q_rank_lqr': loss_rank_lqr,
             'q_policy': q_policy.detach(),
+            'q_data': q_data.detach(),
         }
 
     def _bc_reg_loss(self, u_mean: torch.Tensor,
@@ -861,6 +979,7 @@ def prefill_prior_buffer_from_offline(trainer: PolicyPriorOnlineTrainer,
         enc = model.encode_sequence(x_t, a_t)
         z_ep = enc['o_seq'][0]
         h_ep = enc['h_seq'][0]
+        h_pre_ep = enc.get('h_pre_seq', enc['h_seq'])[0]
         u_ep = model.action_encoder(torch.FloatTensor(acts).to(dev))
 
         rew_max = float(rews.max()) if len(rews) else 0.0
@@ -893,9 +1012,11 @@ def prefill_prior_buffer_from_offline(trainer: PolicyPriorOnlineTrainer,
         for t in range(L - 1):
             trainer.buf.add(
                 z=z_ep[t].cpu().numpy(),
+                h=h_pre_ep[t].cpu().numpy(),
                 u=u_ep[t].cpu().numpy(),
                 r=float(r_step[t] > 0.0),
                 z_next=z_ep[t + 1].cpu().numpy(),
+                h_next=h_pre_ep[t + 1].cpu().numpy(),
                 done=0.0,
                 u_lqr=u_lqr_np[t],
                 u_lqr_aux=u_aux_np[t],
@@ -1439,8 +1560,10 @@ def train_policy_prior_online(cfg: OnlineConfig,
     ctx.reset(obs)
     recent = {k: deque(maxlen=cfg.log_every) for k in
               ['loss_reward', 'loss_q', 'loss_q_td', 'loss_q_cql_policy',
-               'loss_q_rank_bc', 'loss_q_rank_lqr', 'loss_pi', 'loss_lqr_pi',
-               'loss_bc_pi', 'q_mean', 'q_policy_cql', 'rho', 'r_hat',
+               'loss_q_rank_data', 'loss_q_rank_bc', 'loss_q_rank_lqr',
+               'loss_pi', 'loss_lqr_pi', 'loss_bc_pi',
+               'loss_skilldec_anchor', 'skilldec_anchor_w',
+               'q_mean', 'q_policy_cql', 'q_data', 'rho', 'r_hat',
                'q_reward', 'q_target', 'q_next', 'pi_active',
                'ep_reward', 'ep_tasks']}
     global_step = trainer.step
@@ -1450,6 +1573,7 @@ def train_policy_prior_online(cfg: OnlineConfig,
 
     print(f"\n{'='*60}")
     print(f"PolicyPrior Online  steps={cfg.n_env_steps}  env={env_name}")
+    print(f"  actor={cfg.actor_mode}  noise={cfg.action_noise_std:.3f}")
     print(f"  batch={cfg.batch_size}  buf={cfg.buffer_size}  cond={cfg.cond_len}")
     print(f"  reward batch pos/off={cfg.reward_positive_fraction:.2f}/"
           f"{cfg.reward_offline_fraction:.2f}")
@@ -1457,16 +1581,19 @@ def train_policy_prior_online(cfg: OnlineConfig,
           f"{cfg.q_offline_fraction:.2f}  reward={cfg.q_reward_source} "
           f"boot={cfg.q_bootstrap:.2f}")
     print(f"  q combo cql={cfg.lambda_q_cql_policy:.3f} "
+          f"rank_data={cfg.lambda_q_rank_data:.3f} "
           f"rank_bc={cfg.lambda_q_rank_bc:.3f} "
           f"rank_lqr={cfg.lambda_q_rank_lqr:.3f} "
           f"margin={cfg.q_rank_margin:.3f}")
     print(f"  pi batch pos/off={cfg.pi_positive_fraction:.2f}/"
           f"{cfg.pi_offline_fraction:.2f}  pi_start={cfg.pi_update_start} "
-          f"q_w={cfg.pi_q_weight:.2f} bc={cfg.lambda_bc_pi:.3f}")
+          f"q_w={cfg.pi_q_weight:.2f} bc={cfg.lambda_bc_pi:.3f} "
+          f"anchor={cfg.lambda_skilldec_anchor:.3f}->{cfg.skilldec_anchor_min:.3f}")
     print(f"{'='*60}\n")
 
     while global_step < cfg.n_env_steps:
-        if ctx.z_t is None:
+        cur = ctx.current_latent()
+        if cur is None:
             a = env.action_space.sample()
             obs_nx, r, done, info = env.step(a)
             ctx.step(obs_nx, a)
@@ -1482,9 +1609,10 @@ def train_policy_prior_online(cfg: OnlineConfig,
                 ep_tasks = 0
             continue
 
-        z_t = ctx.z_t.clone()
-        h_t = ctx.h_t.clone()
-        a_np, u_np = trainer.act(z_t)
+        z_t, h_t = cur
+        z_t = z_t.clone()
+        h_t = h_t.clone()
+        a_np, u_np = trainer.act(z_t, h_t)
         obs_nx, r_env, done, info = env.step(a_np.clip(-1, 1))
         ctx.step(obs_nx, a_np)
 
@@ -1494,19 +1622,23 @@ def train_policy_prior_online(cfg: OnlineConfig,
         ep_tasks = max(ep_tasks, len(ep_c) if isinstance(ep_c, list)
                        else int(ep_c) if ep_c is not None else 0)
 
-        if ctx.z_t is not None:
+        nxt = ctx.current_latent()
+        if nxt is not None:
+            z_next_t, h_next_t = nxt
             u_lqr = None
             u_lqr_aux = None
             has_lqr = 0.0
             if r_env > 0.0:
-                lqr_t = trainer.lqr_target_for_goal(z_t, h_t, ctx.z_t)
+                lqr_t = trainer.lqr_target_for_goal(z_t, h_t, z_next_t)
                 if lqr_t is not None:
                     u_lqr, u_lqr_aux, has_lqr = lqr_t
             trainer.buf.add(
                 z=z_t.cpu().numpy()[0],
+                h=h_t.cpu().numpy()[0],
                 u=u_np,
                 r=float(r_env > 0.0),
-                z_next=ctx.z_t.cpu().numpy()[0],
+                z_next=z_next_t.cpu().numpy()[0],
+                h_next=h_next_t.cpu().numpy()[0],
                 done=float(done),
                 u_lqr=u_lqr,
                 u_lqr_aux=u_lqr_aux,
@@ -1541,10 +1673,11 @@ def train_policy_prior_online(cfg: OnlineConfig,
             print(f"Step {global_step:7d} | "
                   f"R={ms['loss_reward']:.3f} Q={ms['loss_q']:.3f} "
                   f"TD={ms['loss_q_td']:.3f} CQ={ms['loss_q_cql_policy']:.3f} "
-                  f"Pi={ms['loss_pi']:.3f} LQR={ms['loss_lqr_pi']:.3f} "
-                  f"BC={ms['loss_bc_pi']:.3f} "
+                  f"RD={ms['loss_q_rank_data']:.3f} "
+                  f"Pi={ms['loss_pi']:.3f} Anc={ms['loss_skilldec_anchor']:.3f} "
+                  f"Aw={ms['skilldec_anchor_w']:.2f} "
                   f"q={ms['q_mean']:.3f} "
-                  f"rho={ms['rho']:.3f} rhat={ms['r_hat']:.3f} "
+                  f"qd={ms['q_data']:.3f} rho={ms['rho']:.3f} rhat={ms['r_hat']:.3f} "
                   f"rQ={ms['q_reward']:.3f} y={ms['q_target']:.3f} "
                   f"pi={ms['pi_active']:.0f} | "
                   f"ep_r={ms['ep_reward']:.2f} tasks={ms['ep_tasks']:.2f} | "
@@ -1598,7 +1731,7 @@ def main():
     p.add_argument('--wandb_project', default=None)
     p.add_argument('--wandb_run',     default=None)
     p.add_argument('--prior_online',  action='store_true',
-                   help='Fine-tune KoopmanCVAE.policy_prior online.')
+                   help='Fine-tune a KoopmanCVAE actor online. Use --actor_mode to choose policy_prior or skill_decoder.')
     p.add_argument('--action_inv_steps', type=int, default=30)
     p.add_argument('--action_inv_lr',    type=float, default=0.05)
     p.add_argument('--positive_fraction', type=float, default=0.5)
@@ -1613,14 +1746,21 @@ def main():
                    default='env')
     p.add_argument('--q_bootstrap', type=float, default=0.0)
     p.add_argument('--pi_update_start', type=int, default=10_000)
+    p.add_argument('--actor_mode', choices=['policy_prior', 'skill_decoder'],
+                   default='policy_prior')
     p.add_argument('--pi_q_weight', type=float, default=1.0)
+    p.add_argument('--action_noise_std', type=float, default=0.0)
     p.add_argument('--lambda_bc_pi', type=float, default=0.0)
     p.add_argument('--bc_target_clip', type=float, default=1.0)
     p.add_argument('--lambda_q_cql_policy', type=float, default=0.0)
+    p.add_argument('--lambda_q_rank_data',   type=float, default=0.0)
     p.add_argument('--lambda_q_rank_bc',     type=float, default=0.0)
     p.add_argument('--lambda_q_rank_lqr',    type=float, default=0.0)
     p.add_argument('--q_rank_margin',        type=float, default=0.05)
-    p.add_argument('--lambda_lqr_pi',     type=float, default=0.1)
+    p.add_argument('--lambda_skilldec_anchor', type=float, default=0.0)
+    p.add_argument('--skilldec_anchor_min', type=float, default=0.0)
+    p.add_argument('--skilldec_anchor_decay_steps', type=int, default=200_000)
+    p.add_argument('--lambda_lqr_pi',     type=float, default=0.0)
     p.add_argument('--lqr_horizon',       type=int,   default=4)
     p.add_argument('--lqr_aux_k',         type=int,   default=4)
     p.add_argument('--lqr_aux_weight',    type=float, default=0.25)
@@ -1701,13 +1841,19 @@ def main():
         q_reward_source=args.q_reward_source,
         q_bootstrap=args.q_bootstrap,
         pi_update_start=args.pi_update_start,
+        actor_mode=args.actor_mode,
         pi_q_weight=args.pi_q_weight,
+        action_noise_std=args.action_noise_std,
         lambda_bc_pi=args.lambda_bc_pi,
         bc_target_clip=args.bc_target_clip,
         lambda_q_cql_policy=args.lambda_q_cql_policy,
+        lambda_q_rank_data=args.lambda_q_rank_data,
         lambda_q_rank_bc=args.lambda_q_rank_bc,
         lambda_q_rank_lqr=args.lambda_q_rank_lqr,
         q_rank_margin=args.q_rank_margin,
+        lambda_skilldec_anchor=args.lambda_skilldec_anchor,
+        skilldec_anchor_min=args.skilldec_anchor_min,
+        skilldec_anchor_decay_steps=args.skilldec_anchor_decay_steps,
         lambda_lqr_pi=args.lambda_lqr_pi,
         lqr_horizon=args.lqr_horizon,
         lqr_aux_k=args.lqr_aux_k,
