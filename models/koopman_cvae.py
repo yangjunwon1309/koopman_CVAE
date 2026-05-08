@@ -128,7 +128,20 @@ class KoopmanCVAEConfig:
     # ── v5 Loss weights ───────────────────────────────────────────────────────
     lambda_reward: float = 1.0    # L_R categorical reward head
     lambda_q:      float = 1.0    # L_Q Bellman TD
-    lambda_pi:     float = 0.1    # L_π policy prior
+    lambda_pi:     float = 0.1    # L_pi policy prior
+    lambda_wm:     float = 1.0    # L_wm multiplier; set 0 for decoder-only fitting
+
+    # v5.4 Skill action decoder: supervised action chunk prior from frozen latents.
+    use_skill_decoder:           bool  = False
+    skill_decoder_horizon:       int   = 4
+    skill_decoder_use_o:         bool  = True
+    skill_decoder_use_h:         bool  = True
+    skill_decoder_use_skill:     bool  = True
+    skill_decoder_hidden:        int   = 512
+    skill_decoder_layers:        int   = 3
+    lambda_skill_decoder:        float = 0.0
+    lambda_skill_decoder_latent: float = 0.0
+    skill_decoder_detach_latents: bool = True
 
     # ── v5 Policy prior ───────────────────────────────────────────────────────
     entropy_coef:  float = 0.01   # entropy regularization (α)
@@ -607,6 +620,64 @@ class PolicyPrior(nn.Module):
 # v5.3 NEW: Goal Proposal Policy  π_goal(z_g | z_t, h_t)
 # ──────────────────────────────────────────────────────────────────────────────
 
+class SkillActionDecoder(nn.Module):
+    """
+    Supervised open-loop action chunk decoder.
+
+    It predicts real env actions a[t:t+H] from the frozen world-model state
+    available before executing a[t]: posterior latent o_t, recurrent context h_t,
+    and the soft skill distribution p(k|h_t). This mirrors EXTRACT's decoder
+    role without introducing a learned skill VAE yet.
+    """
+
+    def __init__(self, cfg: 'KoopmanCVAEConfig'):
+        super().__init__()
+        self.cfg = cfg
+        self.H = int(getattr(cfg, 'skill_decoder_horizon', 4))
+        in_dim = 0
+        if getattr(cfg, 'skill_decoder_use_o', True):
+            in_dim += cfg.koopman_dim
+        if getattr(cfg, 'skill_decoder_use_h', True):
+            in_dim += cfg.gru_hidden
+        if getattr(cfg, 'skill_decoder_use_skill', True):
+            in_dim += cfg.num_skills
+        if in_dim <= 0:
+            raise ValueError("SkillActionDecoder needs at least one conditioning input.")
+
+        self.net = make_mlp(
+            in_dim,
+            self.H * cfg.action_dim,
+            getattr(cfg, 'skill_decoder_hidden', cfg.mlp_hidden),
+            getattr(cfg, 'skill_decoder_layers', 3),
+            cfg.dropout,
+        )
+
+    def forward(
+        self,
+        o: Optional[torch.Tensor] = None,
+        h: Optional[torch.Tensor] = None,
+        skill_prob: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        parts = []
+        cfg = self.cfg
+        if getattr(cfg, 'skill_decoder_use_o', True):
+            if o is None:
+                raise ValueError("o is required when skill_decoder_use_o=True")
+            parts.append(o)
+        if getattr(cfg, 'skill_decoder_use_h', True):
+            if h is None:
+                raise ValueError("h is required when skill_decoder_use_h=True")
+            parts.append(h)
+        if getattr(cfg, 'skill_decoder_use_skill', True):
+            if skill_prob is None:
+                raise ValueError("skill_prob is required when skill_decoder_use_skill=True")
+            parts.append(skill_prob)
+
+        x = torch.cat(parts, dim=-1)
+        out = self.net(x)
+        return out.reshape(*x.shape[:-1], self.H, cfg.action_dim)
+
+
 class GoalProposalPolicy(nn.Module):
     """
     π_goal(z_g | z_t, h_t) — Gaussian goal latent proposal.
@@ -717,6 +788,7 @@ class KoopmanCVAE(nn.Module):
         self.reward_ensemble_head = RewardEnsembleHead(cfg)   # v5.1
         self.q_head              = QHead(cfg)
         self.policy_prior        = PolicyPrior(cfg)
+        self.skill_action_decoder = SkillActionDecoder(cfg)
 
         # ── Q network: three versions (TD-MPC2 §H pattern) ───────────────
         #
@@ -914,6 +986,7 @@ class KoopmanCVAE(nn.Module):
 
         # ── Unroll RSSM ───────────────────────────────────────────────────
         h = self.recurrent.init_hidden(B, device)
+        h_pre_list = []
         h_list, o_list, mu_list, sigma2_list = [], [], [], []
         skill_logits_list  = []
         koopman_pred_list  = []
@@ -924,6 +997,7 @@ class KoopmanCVAE(nn.Module):
             a_t = actions[:, t]
             u_t = u_seq[:, t]
 
+            h_pre_list.append(h)
             w_t = self.skill_prior.soft_weights(h)
             skill_logits_list.append(self.skill_prior(h))
 
@@ -944,6 +1018,7 @@ class KoopmanCVAE(nn.Module):
 
         # ── Stack ─────────────────────────────────────────────────────────
         h_seq        = torch.stack(h_list,             dim=1)  # (B, T, d_h)
+        h_pre_seq    = torch.stack(h_pre_list,         dim=1)  # (B, T, d_h)
         o_seq        = torch.stack(o_list,             dim=1)  # (B, T, d_o)
         mu_seq       = torch.stack(mu_list,            dim=1)  # (B, T, d_o)
         sigma2_seq   = torch.stack(sigma2_list,        dim=1)  # (B, T, d_o)
@@ -982,6 +1057,8 @@ class KoopmanCVAE(nn.Module):
             rewards=rewards,
             goal_z_seq=goal_z_seq,
             h_seq=h_seq,
+            h_pre_seq=h_pre_seq,
+            actions=actions,
         )
 
         return {
@@ -990,12 +1067,86 @@ class KoopmanCVAE(nn.Module):
             'mu_seq':       mu_seq,
             'sigma2_seq':   sigma2_seq,
             'h_seq':        h_seq,
+            'h_pre_seq':    h_pre_seq,
             'skill_logits': skill_logits,
             'recon':        recon,
         }
 
 
     # ── Loss computation ─────────────────────────────────────────────────────
+
+    def _chunk_valid_mask(
+        self,
+        mask: Optional[torch.Tensor],
+        B: int,
+        N: int,
+        H: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if mask is None:
+            return torch.ones(B, N, dtype=torch.bool, device=device)
+        valid = torch.ones(B, N, dtype=torch.bool, device=device)
+        m = mask.to(device).bool()
+        for k in range(H):
+            valid &= m[:, k:k + N]
+        return valid
+
+    def _masked_mean(self, values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        if mask.numel() == 0 or not bool(mask.any()):
+            return values.new_tensor(0.0)
+        return values[mask].mean()
+
+    def _compute_skill_decoder_loss(
+        self,
+        o_seq: torch.Tensor,
+        h_pre_seq: torch.Tensor,
+        skill_logits: torch.Tensor,
+        actions: torch.Tensor,
+        u_seq: torch.Tensor,
+        mask: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        cfg = self.cfg
+        H = int(getattr(cfg, 'skill_decoder_horizon', 4))
+        B, T, _ = actions.shape
+        device = actions.device
+        if H <= 0 or T < H:
+            zero = actions.new_tensor(0.0)
+            return zero, zero, zero
+
+        N = T - H + 1
+        o_in = o_seq[:, :N]
+        h_in = h_pre_seq[:, :N]
+        w_in = torch.softmax(skill_logits[:, :N], dim=-1)
+        target_a = torch.stack(
+            [actions[:, k:k + N] for k in range(H)], dim=2
+        )
+        valid = self._chunk_valid_mask(mask, B, N, H, device)
+
+        if getattr(cfg, 'skill_decoder_detach_latents', True):
+            o_in = o_in.detach()
+            h_in = h_in.detach()
+            w_in = w_in.detach()
+
+        pred_a = self.skill_action_decoder(o_in, h_in, w_in)
+        action_err = (pred_a - target_a).pow(2).mean(dim=(-1, -2))
+        loss_action = self._masked_mean(action_err, valid)
+
+        loss_latent = actions.new_tensor(0.0)
+        if getattr(cfg, 'lambda_skill_decoder_latent', 0.0) > 0.0:
+            target_u = torch.stack(
+                [u_seq[:, k:k + N] for k in range(H)], dim=2
+            )
+            pred_u = self.action_encoder(
+                pred_a.reshape(B * N * H, cfg.action_dim)
+            ).reshape(B, N, H, cfg.action_latent)
+            latent_err = (pred_u - target_u.detach()).pow(2).mean(dim=(-1, -2))
+            loss_latent = self._masked_mean(latent_err, valid)
+
+        loss = (
+            loss_action
+            + getattr(cfg, 'lambda_skill_decoder_latent', 0.0) * loss_latent
+        )
+        return loss, loss_action, loss_latent
 
     def _compute_losses(
         self,
@@ -1013,6 +1164,8 @@ class KoopmanCVAE(nn.Module):
         rewards:      Optional[torch.Tensor],  # (B, T) step reward {0,1}
         goal_z_seq:   Optional[torch.Tensor] = None,  # (B, T, m) pre-computed goal z*
         h_seq:        Optional[torch.Tensor] = None,  # (B, T, d_h) for LQR
+        h_pre_seq:    Optional[torch.Tensor] = None,  # (B, T, d_h) before action a_t
+        actions:      Optional[torch.Tensor] = None,  # (B, T, action_dim)
     ) -> Dict[str, torch.Tensor]:
 
         cfg    = self.cfg
@@ -1059,6 +1212,24 @@ class KoopmanCVAE(nn.Module):
             loss_rec, loss_dyn, loss_skill, loss_reg, loss_stab,
             cfg.lambda1, cfg.lambda2, cfg.lambda3, cfg.lambda4, cfg.phase,
         )
+
+        loss_skill_decoder = torch.tensor(0.0, device=device)
+        loss_skill_decoder_action = torch.tensor(0.0, device=device)
+        loss_skill_decoder_latent = torch.tensor(0.0, device=device)
+        if (getattr(cfg, 'use_skill_decoder', False)
+                and getattr(cfg, 'lambda_skill_decoder', 0.0) > 0.0
+                and h_pre_seq is not None
+                and actions is not None):
+            (loss_skill_decoder,
+             loss_skill_decoder_action,
+             loss_skill_decoder_latent) = self._compute_skill_decoder_loss(
+                o_seq=o_seq,
+                h_pre_seq=h_pre_seq,
+                skill_logits=skill_logits,
+                actions=actions,
+                u_seq=u_seq,
+                mask=mask,
+            )
 
         # ── v5 Reward Head: Categorical CE (Two-Hot, step reward) ────────
         # Transition: (o_t, u_t) → predicts step reward r_t (received at t)
@@ -1390,12 +1561,13 @@ class KoopmanCVAE(nn.Module):
 
         # ── Total loss ────────────────────────────────────────────────────
         loss_total = (
-            loss_wm
+            getattr(cfg, 'lambda_wm', 1.0) * loss_wm
             + cfg.lambda_reward * loss_reward
             + cfg.lambda_q      * loss_q
             + cfg.lambda_pi     * loss_pi
             + getattr(cfg, 'lambda_lqr_pi', 0.0) * loss_lqr_pi
             + cfg.lambda_goal   * loss_goal
+            + getattr(cfg, 'lambda_skill_decoder', 0.0) * loss_skill_decoder
         )
 
         return {
@@ -1418,6 +1590,9 @@ class KoopmanCVAE(nn.Module):
             'loss_pi':          loss_pi,
             'loss_lqr_pi':      loss_lqr_pi,
             'loss_goal':        loss_goal,
+            'loss_skill_decoder':        loss_skill_decoder,
+            'loss_skill_decoder_action': loss_skill_decoder_action,
+            'loss_skill_decoder_latent': loss_skill_decoder_latent,
             'rho':              torch.tensor(self.scale_tracker.rho, device=device),
             'q_scale':          torch.tensor(self.scale_tracker.scale, device=device),
         }
@@ -1429,8 +1604,9 @@ class KoopmanCVAE(nn.Module):
         B, T, _ = x_batch.shape
         device   = x_batch.device
         h = self.recurrent.init_hidden(B, device)
-        h_list, o_list, w_list = [], [], []
+        h_pre_list, h_list, o_list, w_list = [], [], [], []
         for t in range(T):
+            h_pre_list.append(h)
             w_t = self.skill_prior.soft_weights(h)
             o_t, mu_t, _ = self.posterior.sample(x_batch[:, t], h)
             h = self.recurrent(h, o_t, actions[:, t])
@@ -1440,6 +1616,7 @@ class KoopmanCVAE(nn.Module):
         return {
             'o_seq': torch.stack(o_list, dim=1),
             'h_seq': torch.stack(h_list, dim=1),
+            'h_pre_seq': torch.stack(h_pre_list, dim=1),
             'w_seq': torch.stack(w_list, dim=1),
             'A_k':   self.koopman.get_A_k(),
             'B_k':   self.koopman.get_B_k(),

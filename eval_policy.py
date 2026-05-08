@@ -110,7 +110,7 @@ class PolicyWrapper:
         dev = device
         print(f"\n[IQL] world: {world_ckpt}")
         wc    = torch.load(world_ckpt, map_location=dev)
-        model = KoopmanCVAE(wc['cfg']); model.load_state_dict(wc['model_state'])
+        model = KoopmanCVAE(wc['cfg']); model.load_state_dict(wc['model_state'], strict=False)
         model.eval().to(dev)
         z_dim = model.cfg.koopman_dim; a_dim = model.cfg.action_dim
         print(f"  m={z_dim}  action_dim={a_dim}")
@@ -131,7 +131,7 @@ class PolicyWrapper:
         dev = device
         print(f"\n[Online] world: {world_ckpt}")
         wc    = torch.load(world_ckpt, map_location=dev)
-        model = KoopmanCVAE(wc['cfg']); model.load_state_dict(wc['model_state'])
+        model = KoopmanCVAE(wc['cfg']); model.load_state_dict(wc['model_state'], strict=False)
         model.eval().to(dev)
         z_dim = model.cfg.koopman_dim; n_skills = model.cfg.num_skills
         a_dim = model.cfg.action_dim
@@ -143,7 +143,7 @@ class PolicyWrapper:
             print("  CategoricalRewardHead loaded")
         # H_lo를 checkpoint에서 자동 감지
         pc = torch.load(policy_ckpt, map_location=dev)
-        if 'world_model' in pc: model.load_state_dict(pc['world_model']); model.eval()
+        if 'world_model' in pc: model.load_state_dict(pc['world_model'], strict=False); model.eval()
         pi_lo_w = pc['pi_lo']['mu.weight']          # (H_lo*9, hidden)
         H_lo_ckpt = pi_lo_w.shape[0] // a_dim       # 자동 감지
         print(f"  H_lo detected from checkpoint: {H_lo_ckpt}")
@@ -168,7 +168,7 @@ class PolicyWrapper:
         print(f"\n[Prior] world: {world_ckpt}")
         wc    = torch.load(world_ckpt, map_location=dev)
         model = KoopmanCVAE(wc['cfg'])
-        model.load_state_dict(wc['model_state'])
+        model.load_state_dict(wc['model_state'], strict=False)
         model.eval().to(dev)
         print(f"  m={model.cfg.koopman_dim}  u_dim={model.cfg.action_latent}  "
               f"action_dim={model.cfg.action_dim}")
@@ -177,6 +177,22 @@ class PolicyWrapper:
         pw.H_lo = 1
         pw._inv_steps = action_inv_steps
         pw._deterministic = deterministic
+        return pw, model, None
+
+    @classmethod
+    def load_skill_decoder(cls, world_ckpt, device):
+        dev = device
+        print(f"\n[SkillDecoder] world: {world_ckpt}")
+        wc    = torch.load(world_ckpt, map_location=dev)
+        model = KoopmanCVAE(wc['cfg'])
+        model.load_state_dict(wc['model_state'], strict=False)
+        model.eval().to(dev)
+        H = int(getattr(model.cfg, 'skill_decoder_horizon', 4))
+        print(f"  m={model.cfg.koopman_dim}  h={model.cfg.gru_hidden}  "
+              f"H={H}  action_dim={model.cfg.action_dim}")
+        pw = cls('skill_decoder', device)
+        pw._model = model
+        pw.H_lo = H
         return pw, model, None
 
     @torch.no_grad()
@@ -208,7 +224,7 @@ class PolicyWrapper:
         self._hi_timer = 0; self._sid = 0
 
     @torch.no_grad()
-    def act(self, z_t):
+    def act(self, z_t, h_t=None):
         dev = torch.device(self.device)
         if self.mode == 'iql':
             # ChunkPolicy: (1, H_lo, 9) chunk → execute first step deterministically
@@ -219,6 +235,12 @@ class PolicyWrapper:
             u = self._prior_u(z_t)
             a = self._decode_action(u)
             return a.cpu().numpy()      # (1, 9)
+        elif self.mode == 'skill_decoder':
+            if h_t is None:
+                raise ValueError("h_t is required for skill_decoder mode")
+            w = self._model.skill_prior.soft_weights(h_t)
+            a_seq = self._model.skill_action_decoder(z_t, h_t, w)
+            return a_seq[0].cpu().numpy()
         else:
             trainer = self._trainer; cfg = self._cfg
             if self._hi_timer == 0:
@@ -227,6 +249,20 @@ class PolicyWrapper:
             a_seq, _ = trainer.pi_lo.sample(z_t)
             self._hi_timer = max(0, self._hi_timer - cfg.H_lo)
             return a_seq[0].cpu().numpy()  # (H_lo, 9)
+
+    @torch.no_grad()
+    def act_from_context(self, ctx):
+        if self.mode != 'skill_decoder':
+            return self.act(ctx.z_t, ctx.h_t)
+        if ctx.h_t is None or not ctx.obs_buf:
+            raise ValueError("EnvContext is not ready for skill_decoder mode")
+        dev = torch.device(self.device)
+        h = ctx.h_t.to(dev)
+        x_now = torch.FloatTensor(ctx._obs_to_x(ctx.obs_buf[-1])).unsqueeze(0).to(dev)
+        z_now, _, _ = self._model.posterior.sample(x_now, h)
+        w = self._model.skill_prior.soft_weights(h)
+        a_seq = self._model.skill_action_decoder(z_now, h, w)
+        return a_seq[0].cpu().numpy()
 
     @property
     def skill_id(self): return self._sid if self.mode == 'online' else -1
@@ -254,7 +290,7 @@ def rollout_episode(env, model, policy, device, cond_len=16,
             n_t,_=inspect_info(info); n_tasks_max=max(n_tasks_max,n_t)
             info_hist.append(info); info_keys.update(info.keys()); t+=1; continue
 
-        a_seq = policy.act(ctx.z_t); sid = policy.skill_id
+        a_seq = policy.act_from_context(ctx); sid = policy.skill_id
         for k in range(len(a_seq)):
             if done or t >= max_steps: break
             ak = a_seq[k].clip(-1,1)
@@ -530,7 +566,7 @@ def analyze_reward_distribution(results_with_extra, wm, out_path, device):
 
 def main():
     p=argparse.ArgumentParser()
-    p.add_argument('--mode',        choices=['iql','online','prior'], default='online')
+    p.add_argument('--mode',        choices=['iql','online','prior','skill_decoder'], default='online')
     p.add_argument('--world_ckpt',  required=True)
     p.add_argument('--policy_ckpt', default=None)
     p.add_argument('--cat_ckpt',    default=None)
@@ -561,6 +597,10 @@ def main():
             raise ValueError("--policy_ckpt is required for --mode online")
         policy, model, wm = PolicyWrapper.load_online(
             args.world_ckpt, args.policy_ckpt, args.cat_ckpt, args.device)
+        cond_len=OnlineConfig().cond_len
+    elif args.mode=='skill_decoder':
+        policy, model, wm = PolicyWrapper.load_skill_decoder(
+            args.world_ckpt, args.device)
         cond_len=OnlineConfig().cond_len
     else:
         policy, model, wm = PolicyWrapper.load_prior(

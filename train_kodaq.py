@@ -216,6 +216,8 @@ class Trainer:
         'loss_rec_delta_e', 'loss_rec_delta_p', 'loss_rec_q', 'loss_rec_qdot',
         # v5 new head losses
         'loss_reward', 'loss_q', 'loss_pi', 'loss_lqr_pi', 'loss_goal',
+        'loss_skill_decoder', 'loss_skill_decoder_action',
+        'loss_skill_decoder_latent',
         # v5 diagnostics
         'rho', 'q_scale',
     ]
@@ -337,6 +339,21 @@ class Trainer:
         for mod in self._head_modules():
             yield from mod.parameters()
 
+    def _skill_decoder_modules(self):
+        return [self.model.skill_action_decoder]
+
+    def _skill_decoder_params(self):
+        for mod in self._skill_decoder_modules():
+            yield from mod.parameters()
+
+    def _set_all_requires_grad(self, flag: bool):
+        for p in self.model.parameters():
+            p.requires_grad_(flag)
+
+    def _set_skill_decoder_requires_grad(self, flag: bool):
+        for p in self._skill_decoder_params():
+            p.requires_grad_(flag)
+
     def _set_wm_requires_grad(self, flag: bool):
         for p in self._wm_params():
             p.requires_grad_(flag)
@@ -442,14 +459,26 @@ class Trainer:
             line = (f"[{stage_tag}|Ph{phase}|G{gp_tag}] Ep {local_ep:4d}/{n_epochs}"
                     f"  {ep_sec:.1f}s  ({tot_min:.0f}m)")
 
-            for k in ['loss', 'loss_wm', 'loss_rec', 'loss_dyn',
-                      'loss_skill', 'loss_reg']:
-                if metrics.get(k, 0.0) != 0.0:
-                    line += f"  {k.replace('loss_','')[:4]}={metrics[k]:.4f}"
-            for k in ['loss_reward', 'loss_q', 'loss_pi', 'loss_lqr_pi']:
-                if k in metrics and metrics.get(k, 0.0) != 0.0:
-                    name = 'lqrp' if k == 'loss_lqr_pi' else k.replace('loss_','')[:4]
-                    line += f"  {name}={metrics[k]:.4f}"
+            if stage_tag == 'skilldec':
+                line += f"  loss={metrics.get('loss', 0.0):.4f}"
+                line += f"  skdec={metrics['loss_skill_decoder']:.4f}"
+                line += f"  act={metrics.get('loss_skill_decoder_action', 0.0):.4f}"
+                if metrics.get('loss_skill_decoder_latent', 0.0) != 0.0:
+                    line += f"  ulat={metrics['loss_skill_decoder_latent']:.4f}"
+            else:
+                for k in ['loss', 'loss_wm', 'loss_rec', 'loss_dyn',
+                          'loss_skill', 'loss_reg']:
+                    if metrics.get(k, 0.0) != 0.0:
+                        line += f"  {k.replace('loss_','')[:4]}={metrics[k]:.4f}"
+                for k in ['loss_reward', 'loss_q', 'loss_pi', 'loss_lqr_pi']:
+                    if k in metrics and metrics.get(k, 0.0) != 0.0:
+                        name = 'lqrp' if k == 'loss_lqr_pi' else k.replace('loss_','')[:4]
+                        line += f"  {name}={metrics[k]:.4f}"
+                if metrics.get('loss_skill_decoder', 0.0) != 0.0:
+                    line += f"  skdec={metrics['loss_skill_decoder']:.4f}"
+                    line += f"  act={metrics.get('loss_skill_decoder_action', 0.0):.4f}"
+                    if metrics.get('loss_skill_decoder_latent', 0.0) != 0.0:
+                        line += f"  ulat={metrics['loss_skill_decoder_latent']:.4f}"
             # loss_goal: always show when use_goal_proposal (even if 0 in Phase A)
             if use_goal and 'loss_goal' in metrics:
                 line += f"  goal={metrics['loss_goal']:.4f}"
@@ -498,6 +527,12 @@ class Trainer:
                 self.use_wandb = False
         t0 = time.time()
 
+        if getattr(self.args, 'train_skill_decoder', False):
+            self._train_skill_decoder(train_loader, val_loader, t0)
+            if self.use_wandb:
+                wandb.finish()
+            return
+
         # ── Two-stage resume ──────────────────────────────────────────────────
         if self.resume_stage is not None:
             self._train_two_stage(train_loader, val_loader, t0)
@@ -519,6 +554,49 @@ class Trainer:
 
         if self.use_wandb:
             wandb.finish()
+
+    def _train_skill_decoder(self, train_loader, val_loader, t0: float):
+        n_epochs = int(self.args.skill_decoder_epochs)
+        lr = float(self.args.skill_decoder_lr)
+
+        print(f"\n{'='*60}", flush=True)
+        print(f"[Skill Decoder] offline supervised action chunk training", flush=True)
+        print(f"  epochs={n_epochs}  lr={lr}  H={self.model.cfg.skill_decoder_horizon}",
+              flush=True)
+        print(f"  WM/Q/R/policy frozen; only skill_action_decoder trainable",
+              flush=True)
+        print(f"{'='*60}", flush=True)
+
+        self._set_all_requires_grad(False)
+        self._set_skill_decoder_requires_grad(True)
+        self.train_heads = False
+        self.freeze_world_model = True
+
+        self.model.cfg.use_skill_decoder = True
+        self.model.cfg.lambda_wm = 0.0
+        self.model.cfg.lambda_reward = 0.0
+        self.model.cfg.lambda_q = 0.0
+        self.model.cfg.lambda_pi = 0.0
+        self.model.cfg.lambda_goal = 0.0
+        self.model.cfg.lambda_lqr_pi = 0.0
+        self.model.cfg.lambda_skill_decoder = self.args.lambda_skill_decoder
+        self.model.cfg.lambda_skill_decoder_latent = (
+            self.args.lambda_skill_decoder_latent)
+        self.model.cfg.phase = 3
+        self.phase2_epoch = 0
+        self.phase3_epoch = 0
+
+        self._rebuild_optimizer(self._skill_decoder_params(), lr=lr)
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=max(1, n_epochs)
+        )
+
+        self._run_loop(train_loader, val_loader,
+                       n_epochs=n_epochs, epoch_offset=0,
+                       stage_tag='skilldec', t0=t0)
+
+        print(f"\nSkill decoder training done.  "
+              f"time={(time.time()-t0)/60:.1f}m", flush=True)
 
     def _train_two_stage(self, train_loader, val_loader, t0: float):
         """
@@ -626,7 +704,7 @@ class Trainer:
     def load_checkpoint(cls, path: str, device: str = 'cpu'):
         ckpt  = torch.load(path, map_location=device)
         model = KoopmanCVAE(ckpt['cfg'])
-        model.load_state_dict(ckpt['model_state'])
+        model.load_state_dict(ckpt['model_state'], strict=False)
         model.cfg.phase = ckpt.get('phase', 1)
         if 'scale_tracker' in ckpt:
             model.scale_tracker.load_state_dict(ckpt['scale_tracker'])
@@ -702,6 +780,20 @@ def parse_args():
                    default='cuda' if torch.cuda.is_available() else 'cpu')
     p.add_argument('--num_workers',   type=int,   default=2)
     p.add_argument('--val_ratio',     type=float, default=0.1)
+
+    # skill decoder offline fitting
+    p.add_argument('--train_skill_decoder', action='store_true',
+                   help='Train only SkillActionDecoder from a resumed WM checkpoint.')
+    p.add_argument('--skill_decoder_epochs', type=int, default=100)
+    p.add_argument('--skill_decoder_lr',     type=float, default=1e-4)
+    p.add_argument('--skill_decoder_horizon', type=int, default=4)
+    p.add_argument('--skill_decoder_hidden',  type=int, default=512)
+    p.add_argument('--skill_decoder_layers',  type=int, default=3)
+    p.add_argument('--lambda_skill_decoder', type=float, default=1.0)
+    p.add_argument('--lambda_skill_decoder_latent', type=float, default=0.0)
+    p.add_argument('--skill_decoder_no_h', action='store_true')
+    p.add_argument('--skill_decoder_no_o', action='store_true')
+    p.add_argument('--skill_decoder_no_skill', action='store_true')
 
     # ── resume (two-stage fine-tuning) ──────────────────────────────────
     p.add_argument('--resume_ckpt',        type=str,   default=None,
@@ -792,6 +884,16 @@ if __name__ == '__main__':
     cfg.lambda_reward = args.lambda_reward
     cfg.lambda_q      = args.lambda_q
     cfg.lambda_pi     = args.lambda_pi
+    cfg.use_skill_decoder = args.train_skill_decoder
+    cfg.skill_decoder_horizon = args.skill_decoder_horizon
+    cfg.skill_decoder_hidden = args.skill_decoder_hidden
+    cfg.skill_decoder_layers = args.skill_decoder_layers
+    cfg.skill_decoder_use_h = not args.skill_decoder_no_h
+    cfg.skill_decoder_use_o = not args.skill_decoder_no_o
+    cfg.skill_decoder_use_skill = not args.skill_decoder_no_skill
+    cfg.lambda_skill_decoder = (
+        args.lambda_skill_decoder if args.train_skill_decoder else 0.0)
+    cfg.lambda_skill_decoder_latent = args.lambda_skill_decoder_latent
     cfg.use_lqr_policy = args.use_lqr_policy
     cfg.lqr_horizon    = args.lqr_horizon
     cfg.lambda_lqr_pi = args.lambda_lqr_pi if args.use_lqr_policy else 0.0
@@ -818,6 +920,8 @@ if __name__ == '__main__':
 
     # ── Resume: load WM from checkpoint, reset Q/reward_ens/policy ─────────────
     is_resume = (args.resume_ckpt is not None)
+    if args.train_skill_decoder and not is_resume:
+        raise ValueError("--train_skill_decoder requires --resume_ckpt with a trained world model.")
     if is_resume:
         print(f"\n[Resume] Loading checkpoint: {args.resume_ckpt}", flush=True)
         ckpt = torch.load(args.resume_ckpt, map_location='cpu')
@@ -873,6 +977,16 @@ if __name__ == '__main__':
         resume_cfg.lambda_reward       = args.lambda_reward
         resume_cfg.lambda_q            = args.lambda_q
         resume_cfg.lambda_pi           = args.lambda_pi
+        resume_cfg.use_skill_decoder   = args.train_skill_decoder
+        resume_cfg.skill_decoder_horizon = args.skill_decoder_horizon
+        resume_cfg.skill_decoder_hidden  = args.skill_decoder_hidden
+        resume_cfg.skill_decoder_layers  = args.skill_decoder_layers
+        resume_cfg.skill_decoder_use_h = not args.skill_decoder_no_h
+        resume_cfg.skill_decoder_use_o = not args.skill_decoder_no_o
+        resume_cfg.skill_decoder_use_skill = not args.skill_decoder_no_skill
+        resume_cfg.lambda_skill_decoder = (
+            args.lambda_skill_decoder if args.train_skill_decoder else 0.0)
+        resume_cfg.lambda_skill_decoder_latent = args.lambda_skill_decoder_latent
         resume_cfg.phase               = 3
         cfg = resume_cfg
 
@@ -929,19 +1043,30 @@ if __name__ == '__main__':
                   flush=True)
 
         # ── Two-stage resume schedule ─────────────────────────────────────
-        args.resume_stage  = 'two_stage'
-        args.phase2_epoch  = 0    # phase 3 immediately in both stages
-        args.phase3_epoch  = 0
-        args.epochs        = args.resume_epochs_wm + args.resume_epochs_heads
-        args.lr            = args.resume_lr_wm
-        print(f"  Two-stage resume:", flush=True)
-        print(f"    Stage 1 (WM fine-tune):  {args.resume_epochs_wm} ep"
-              f"  lr={args.resume_lr_wm}", flush=True)
-        print(f"    Stage 2 (Head training): {args.resume_epochs_heads} ep"
-              f"  lr={args.resume_lr_heads}", flush=True)
-        print(f"    H={cfg.td_horizon}  beta={cfg.mopo_beta}"
-              f"  N_ens={cfg.reward_ensemble_n}", flush=True)
-        if args.use_goal_proposal:
+        if args.train_skill_decoder:
+            args.resume_stage = None
+            args.phase2_epoch = 0
+            args.phase3_epoch = 0
+            args.epochs = args.skill_decoder_epochs
+            args.lr = args.skill_decoder_lr
+            print(f"  Skill decoder resume:", flush=True)
+            print(f"    decoder-only epochs={args.skill_decoder_epochs} "
+                  f"lr={args.skill_decoder_lr} H={args.skill_decoder_horizon}",
+                  flush=True)
+        else:
+            args.resume_stage  = 'two_stage'
+            args.phase2_epoch  = 0    # phase 3 immediately in both stages
+            args.phase3_epoch  = 0
+            args.epochs        = args.resume_epochs_wm + args.resume_epochs_heads
+            args.lr            = args.resume_lr_wm
+            print(f"  Two-stage resume:", flush=True)
+            print(f"    Stage 1 (WM fine-tune):  {args.resume_epochs_wm} ep"
+                  f"  lr={args.resume_lr_wm}", flush=True)
+            print(f"    Stage 2 (Head training): {args.resume_epochs_heads} ep"
+                  f"  lr={args.resume_lr_heads}", flush=True)
+            print(f"    H={cfg.td_horizon}  beta={cfg.mopo_beta}"
+                  f"  N_ens={cfg.reward_ensemble_n}", flush=True)
+        if (not args.train_skill_decoder) and args.use_goal_proposal:
             print(f"    π_goal: Phase A (ep 1~{args.warmup_goal_epochs}) = "
                   f"fixed z_g^seg  |  "
                   f"Phase B (ep {args.warmup_goal_epochs+1}~) = π_goal active",
@@ -990,6 +1115,7 @@ if __name__ == '__main__':
         ('reward_ens_head',    model.reward_ensemble_head),
         ('q_head',             model.q_head),
         ('policy_prior',       model.policy_prior),
+        ('skill_action_dec',   model.skill_action_decoder),
     ]
     for nm, mod in head_list:
         n_req = sum(p.numel() for p in mod.parameters() if p.requires_grad)

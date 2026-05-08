@@ -103,8 +103,13 @@ class OnlineConfig:
     q_reward_source:          str   = 'env'
     q_bootstrap:              float = 0.0
     pi_update_start:          int   = 10_000
+    pi_q_weight:              float = 1.0
     lambda_bc_pi:             float = 0.0
     bc_target_clip:           float = 1.0
+    lambda_q_cql_policy:      float = 0.0
+    lambda_q_rank_bc:         float = 0.0
+    lambda_q_rank_lqr:        float = 0.0
+    q_rank_margin:            float = 0.05
     lambda_lqr_pi:     float = 0.1
     lqr_horizon:       int   = 4
     lqr_aux_k:         int   = 4
@@ -622,12 +627,19 @@ class PolicyPriorOnlineTrainer:
             ).clamp(m.cfg.v_min, m.cfg.v_max)
 
         q_logits = m.q_head(z, u).permute(1, 0, 2).unsqueeze(1)
-        loss_q = q_categorical_loss(
+        loss_q_td = q_categorical_loss(
             q_logits=q_logits,
             reward_seq=torch.zeros_like(y).unsqueeze(1),
             q_target_scalar=y.unsqueeze(1),
             bins=m.q_head.bins,
             gamma=1.0,
+        )
+        combo = self._combo_q_loss(z, b_q)
+        loss_q = (
+            loss_q_td
+            + self.cfg.lambda_q_cql_policy * combo['loss_q_cql_policy']
+            + self.cfg.lambda_q_rank_bc * combo['loss_q_rank_bc']
+            + self.cfg.lambda_q_rank_lqr * combo['loss_q_rank_lqr']
         )
         self.opt_q.zero_grad()
         loss_q.backward()
@@ -648,12 +660,14 @@ class PolicyPriorOnlineTrainer:
         loss_bc = self._bc_reg_loss(u_mean, b_pi)
         pi_active = float(self.step >= self.cfg.pi_update_start)
         if pi_active:
-            loss_pi = policy_prior_loss(
-                log_pi=log_pi,
-                q_pi=q_pi,
-                rho=m.scale_tracker.rho,
-                entropy_coef=m.cfg.entropy_coef,
-            )
+            log_pi_eff = log_pi
+            if log_pi_eff.dim() > q_pi.dim():
+                log_pi_eff = log_pi_eff.sum(-1)
+            loss_pi = (
+                (m.cfg.entropy_coef * log_pi_eff
+                 - self.cfg.pi_q_weight * q_pi)
+                * m.scale_tracker.rho
+            ).mean()
             loss_pi = (
                 loss_pi
                 + self.cfg.lambda_lqr_pi * loss_lqr
@@ -669,16 +683,76 @@ class PolicyPriorOnlineTrainer:
         return {
             'loss_reward': loss_r.item(),
             'loss_q': loss_q.item(),
+            'loss_q_td': loss_q_td.item(),
+            'loss_q_cql_policy': combo['loss_q_cql_policy'].item(),
+            'loss_q_rank_bc': combo['loss_q_rank_bc'].item(),
+            'loss_q_rank_lqr': combo['loss_q_rank_lqr'].item(),
             'loss_pi': loss_pi.item(),
             'loss_lqr_pi': loss_lqr.item(),
             'loss_bc_pi': loss_bc.item(),
             'q_mean': q_pi.detach().mean().item(),
+            'q_policy_cql': combo['q_policy'].detach().mean().item(),
             'rho': m.scale_tracker.rho,
             'r_hat': r_hat.detach().mean().item(),
             'q_reward': r_q.detach().mean().item(),
             'q_target': y.detach().mean().item(),
             'q_next': q_next.detach().mean().item(),
             'pi_active': pi_active,
+        }
+
+    def _q_min_value(self, z: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+        q_logits = self.model.q_head(z, u)
+        q_vals = two_hot_decode(q_logits, self.model.q_head.bins)
+        return q_vals.min(0).values
+
+    def _policy_mean_action(self, z: torch.Tensor) -> torch.Tensor:
+        out = self.model.policy_prior.net(z)
+        mean, _ = out.chunk(2, dim=-1)
+        return torch.tanh(mean)
+
+    def _combo_q_loss(self, z: torch.Tensor,
+                      batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        zero = z.new_tensor(0.0)
+        if (self.cfg.lambda_q_cql_policy <= 0.0
+                and self.cfg.lambda_q_rank_bc <= 0.0
+                and self.cfg.lambda_q_rank_lqr <= 0.0):
+            return {
+                'loss_q_cql_policy': zero,
+                'loss_q_rank_bc': zero,
+                'loss_q_rank_lqr': zero,
+                'q_policy': zero,
+            }
+
+        u_pi = self._policy_mean_action(z).detach()
+        q_policy = self._q_min_value(z, u_pi)
+        loss_cql = q_policy.mean()
+
+        loss_rank_bc = zero
+        if self.cfg.lambda_q_rank_bc > 0.0 and 'source' in batch and 'u' in batch:
+            mask_bc = batch['source'] > 0.5
+            if mask_bc.numel() > 0 and bool(mask_bc.any()):
+                u_data = batch['u'].detach()
+                q_data = self._q_min_value(z, u_data)
+                rank_bc = F.relu(
+                    self.cfg.q_rank_margin + q_policy - q_data)
+                loss_rank_bc = rank_bc[mask_bc].mean()
+
+        loss_rank_lqr = zero
+        if (self.cfg.lambda_q_rank_lqr > 0.0
+                and 'has_lqr' in batch and 'u_lqr' in batch):
+            mask_lqr = batch['has_lqr'] > 0.5
+            if mask_lqr.numel() > 0 and bool(mask_lqr.any()):
+                u_lqr = batch['u_lqr'].detach()
+                q_lqr = self._q_min_value(z, u_lqr)
+                rank_lqr = F.relu(
+                    self.cfg.q_rank_margin + q_policy - q_lqr)
+                loss_rank_lqr = rank_lqr[mask_lqr].mean()
+
+        return {
+            'loss_q_cql_policy': loss_cql,
+            'loss_q_rank_bc': loss_rank_bc,
+            'loss_q_rank_lqr': loss_rank_lqr,
+            'q_policy': q_policy.detach(),
         }
 
     def _bc_reg_loss(self, u_mean: torch.Tensor,
@@ -1005,7 +1079,7 @@ class KODAQOnlineTrainer:
             self.opt_q.load_state_dict(ck['opt_q'])
         if 'wm_opt' in ck: self.wm.opt.load_state_dict(ck['wm_opt'])
         if 'world_model' in ck:
-            self.wm.model.load_state_dict(ck['world_model'])
+            self.wm.model.load_state_dict(ck['world_model'], strict=False)
             self.wm.model.eval()
         self.gumbel_tau = ck.get('gumbel_tau', self.cfg.gumbel_tau)
         self.step = ck.get('step', 0)
@@ -1364,8 +1438,10 @@ def train_policy_prior_online(cfg: OnlineConfig,
     ctx = EnvContext(trainer.model, device, cfg.cond_len)
     ctx.reset(obs)
     recent = {k: deque(maxlen=cfg.log_every) for k in
-              ['loss_reward', 'loss_q', 'loss_pi', 'loss_lqr_pi', 'loss_bc_pi',
-               'q_mean', 'rho', 'r_hat', 'q_reward', 'q_target', 'q_next', 'pi_active',
+              ['loss_reward', 'loss_q', 'loss_q_td', 'loss_q_cql_policy',
+               'loss_q_rank_bc', 'loss_q_rank_lqr', 'loss_pi', 'loss_lqr_pi',
+               'loss_bc_pi', 'q_mean', 'q_policy_cql', 'rho', 'r_hat',
+               'q_reward', 'q_target', 'q_next', 'pi_active',
                'ep_reward', 'ep_tasks']}
     global_step = trainer.step
     ep_r = 0.0
@@ -1380,9 +1456,13 @@ def train_policy_prior_online(cfg: OnlineConfig,
     print(f"  q batch pos/off={cfg.q_positive_fraction:.2f}/"
           f"{cfg.q_offline_fraction:.2f}  reward={cfg.q_reward_source} "
           f"boot={cfg.q_bootstrap:.2f}")
+    print(f"  q combo cql={cfg.lambda_q_cql_policy:.3f} "
+          f"rank_bc={cfg.lambda_q_rank_bc:.3f} "
+          f"rank_lqr={cfg.lambda_q_rank_lqr:.3f} "
+          f"margin={cfg.q_rank_margin:.3f}")
     print(f"  pi batch pos/off={cfg.pi_positive_fraction:.2f}/"
           f"{cfg.pi_offline_fraction:.2f}  pi_start={cfg.pi_update_start} "
-          f"bc={cfg.lambda_bc_pi:.3f}")
+          f"q_w={cfg.pi_q_weight:.2f} bc={cfg.lambda_bc_pi:.3f}")
     print(f"{'='*60}\n")
 
     while global_step < cfg.n_env_steps:
@@ -1460,6 +1540,7 @@ def train_policy_prior_online(cfg: OnlineConfig,
             t0 = time.time()
             print(f"Step {global_step:7d} | "
                   f"R={ms['loss_reward']:.3f} Q={ms['loss_q']:.3f} "
+                  f"TD={ms['loss_q_td']:.3f} CQ={ms['loss_q_cql_policy']:.3f} "
                   f"Pi={ms['loss_pi']:.3f} LQR={ms['loss_lqr_pi']:.3f} "
                   f"BC={ms['loss_bc_pi']:.3f} "
                   f"q={ms['q_mean']:.3f} "
@@ -1532,8 +1613,13 @@ def main():
                    default='env')
     p.add_argument('--q_bootstrap', type=float, default=0.0)
     p.add_argument('--pi_update_start', type=int, default=10_000)
+    p.add_argument('--pi_q_weight', type=float, default=1.0)
     p.add_argument('--lambda_bc_pi', type=float, default=0.0)
     p.add_argument('--bc_target_clip', type=float, default=1.0)
+    p.add_argument('--lambda_q_cql_policy', type=float, default=0.0)
+    p.add_argument('--lambda_q_rank_bc',     type=float, default=0.0)
+    p.add_argument('--lambda_q_rank_lqr',    type=float, default=0.0)
+    p.add_argument('--q_rank_margin',        type=float, default=0.05)
     p.add_argument('--lambda_lqr_pi',     type=float, default=0.1)
     p.add_argument('--lqr_horizon',       type=int,   default=4)
     p.add_argument('--lqr_aux_k',         type=int,   default=4)
@@ -1569,7 +1655,7 @@ def main():
     print(f"\nLoading: {args.world_ckpt}")
     ck    = torch.load(args.world_ckpt, map_location=device)
     model = KoopmanCVAE(ck['cfg'])
-    model.load_state_dict(ck['model_state'])
+    model.load_state_dict(ck['model_state'], strict=False)
     model.eval().to(device)
     z_dim    = model.cfg.koopman_dim
     n_skills = model.cfg.num_skills
@@ -1615,8 +1701,13 @@ def main():
         q_reward_source=args.q_reward_source,
         q_bootstrap=args.q_bootstrap,
         pi_update_start=args.pi_update_start,
+        pi_q_weight=args.pi_q_weight,
         lambda_bc_pi=args.lambda_bc_pi,
         bc_target_clip=args.bc_target_clip,
+        lambda_q_cql_policy=args.lambda_q_cql_policy,
+        lambda_q_rank_bc=args.lambda_q_rank_bc,
+        lambda_q_rank_lqr=args.lambda_q_rank_lqr,
+        q_rank_margin=args.q_rank_margin,
         lambda_lqr_pi=args.lambda_lqr_pi,
         lqr_horizon=args.lqr_horizon,
         lqr_aux_k=args.lqr_aux_k,
