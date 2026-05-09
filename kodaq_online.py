@@ -105,6 +105,9 @@ class OnlineConfig:
     pi_elite_fraction:        float = 0.0
     elite_buffer_size:        int   = 50_000
     elite_reward_threshold:   float = 1.0
+    lambda_elite_bc_pi:       float = 0.0
+    q_n_step:                 int   = 1
+    q_n_step_gamma:           float = 0.99
     q_reward_source:          str   = 'env'
     q_bootstrap:              float = 0.0
     pi_update_start:          int   = 10_000
@@ -458,10 +461,13 @@ class EnvContext:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class PriorReplayBuffer:
-    def __init__(self, capacity: int, device: str, h_dim: int = 0):
+    def __init__(self, capacity: int, device: str, h_dim: int = 0,
+                 action_dim: int = 0, chunk_horizon: int = 1):
         self.capacity = capacity
         self.device = device
         self.h_dim = h_dim
+        self.action_dim = int(action_dim)
+        self.chunk_horizon = max(1, int(chunk_horizon))
         self._d: Dict[str, np.ndarray] = {}
         self._ptr = 0
         self._n = 0
@@ -469,13 +475,22 @@ class PriorReplayBuffer:
     def _init(self, z_dim: int, u_dim: int):
         C = self.capacity
         h_dim = int(self.h_dim)
+        a_dim = int(self.action_dim or u_dim)
+        H = int(self.chunk_horizon)
         self._d = {
             'z': np.zeros((C, z_dim), dtype=np.float32),
             'h': np.zeros((C, h_dim), dtype=np.float32),
             'u': np.zeros((C, u_dim), dtype=np.float32),
+            'a': np.zeros((C, a_dim), dtype=np.float32),
+            'a_chunk': np.zeros((C, H, a_dim), dtype=np.float32),
+            'chunk_mask': np.zeros((C, H), dtype=np.float32),
             'r': np.zeros(C, dtype=np.float32),
+            'r_return': np.zeros(C, dtype=np.float32),
             'z_next': np.zeros((C, z_dim), dtype=np.float32),
             'h_next': np.zeros((C, h_dim), dtype=np.float32),
+            'z_boot': np.zeros((C, z_dim), dtype=np.float32),
+            'h_boot': np.zeros((C, h_dim), dtype=np.float32),
+            'discount': np.zeros(C, dtype=np.float32),
             'done': np.zeros(C, dtype=np.float32),
             'u_lqr': np.zeros((C, u_dim), dtype=np.float32),
             'u_lqr_aux': np.zeros((C, u_dim), dtype=np.float32),
@@ -485,6 +500,8 @@ class PriorReplayBuffer:
 
     def add(self, z, u, r, z_next, done,
             h=None, h_next=None,
+            a=None, a_chunk=None, chunk_mask=None,
+            r_return=None, z_boot=None, h_boot=None, discount=None,
             u_lqr=None, u_lqr_aux=None, has_lqr: float = 0.0,
             source: float = 0.0):
         if not self._d:
@@ -494,10 +511,32 @@ class PriorReplayBuffer:
         if h is not None and self.h_dim > 0:
             self._d['h'][p] = h
         self._d['u'][p] = u
+        if a is not None:
+            self._d['a'][p] = a
+        self._d['a_chunk'][p].fill(0.0)
+        self._d['chunk_mask'][p].fill(0.0)
+        if a_chunk is not None:
+            arr = np.asarray(a_chunk, dtype=np.float32)
+            n = min(arr.shape[0], self._d['a_chunk'].shape[1])
+            self._d['a_chunk'][p, :n] = arr[:n]
+            if chunk_mask is None:
+                self._d['chunk_mask'][p, :n] = 1.0
+            else:
+                mask = np.asarray(chunk_mask, dtype=np.float32)
+                self._d['chunk_mask'][p, :n] = mask[:n]
         self._d['r'][p] = r
+        self._d['r_return'][p] = float(r if r_return is None else r_return)
         self._d['z_next'][p] = z_next
         if h_next is not None and self.h_dim > 0:
             self._d['h_next'][p] = h_next
+        self._d['z_boot'][p] = z_next if z_boot is None else z_boot
+        if self.h_dim > 0:
+            if h_boot is not None:
+                self._d['h_boot'][p] = h_boot
+            elif h_next is not None:
+                self._d['h_boot'][p] = h_next
+        self._d['discount'][p] = float(0.0 if done else (
+            1.0 if discount is None else discount))
         self._d['done'][p] = float(done)
         if u_lqr is not None:
             self._d['u_lqr'][p] = u_lqr
@@ -557,10 +596,14 @@ class PolicyPriorOnlineTrainer:
             raise ValueError(
                 f"Unknown actor_mode={cfg.actor_mode!r}; "
                 "expected policy_prior or skill_decoder")
+        skill_h = int(getattr(model.cfg, 'skill_decoder_horizon',
+                              cfg.skilldec_exec_horizon))
         self.buf = PriorReplayBuffer(
-            cfg.buffer_size, device, h_dim=model.cfg.gru_hidden)
+            cfg.buffer_size, device, h_dim=model.cfg.gru_hidden,
+            action_dim=model.cfg.action_dim, chunk_horizon=skill_h)
         self.elite_buf = PriorReplayBuffer(
-            cfg.elite_buffer_size, device, h_dim=model.cfg.gru_hidden
+            cfg.elite_buffer_size, device, h_dim=model.cfg.gru_hidden,
+            action_dim=model.cfg.action_dim, chunk_horizon=skill_h
         ) if cfg.elite_buffer_size > 0 else None
         self.skill_decoder_anchor = copy.deepcopy(model.skill_action_decoder)
         self.skill_decoder_anchor.to(device).eval()
@@ -712,9 +755,49 @@ class PolicyPriorOnlineTrainer:
         if (self.elite_buf is None or not transitions
                 or ep_return < self.cfg.elite_reward_threshold):
             return 0
-        for tr in transitions:
+        H = int(self.elite_buf.chunk_horizon)
+        n_step = max(1, int(self.cfg.q_n_step))
+        gam = float(self.cfg.q_n_step_gamma)
+        actions = [
+            None if tr.get('a', None) is None
+            else np.asarray(tr['a'], dtype=np.float32)
+            for tr in transitions
+        ]
+        for i, tr in enumerate(transitions):
             elite_tr = dict(tr)
             elite_tr['source'] = 2.0
+            if actions and actions[i] is not None:
+                a_chunk = np.zeros((H, self.elite_buf.action_dim), dtype=np.float32)
+                chunk_mask = np.zeros(H, dtype=np.float32)
+                n_chunk = min(H, len(actions) - i)
+                valid = [
+                    a for a in actions[i:i + n_chunk]
+                    if a is not None
+                ]
+                if valid:
+                    a_chunk[:len(valid)] = np.stack(valid, axis=0)
+                    chunk_mask[:len(valid)] = 1.0
+                elite_tr['a_chunk'] = a_chunk
+                elite_tr['chunk_mask'] = chunk_mask
+
+            ret = 0.0
+            boot = tr
+            done_n = False
+            n_used = 0
+            for j in range(n_step):
+                k = i + j
+                if k >= len(transitions):
+                    break
+                boot = transitions[k]
+                ret += (gam ** j) * float(boot.get('r', 0.0))
+                n_used = j + 1
+                if float(boot.get('done', 0.0)) > 0.5:
+                    done_n = True
+                    break
+            elite_tr['r_return'] = float(ret)
+            elite_tr['z_boot'] = boot.get('z_next', tr['z_next'])
+            elite_tr['h_boot'] = boot.get('h_next', tr.get('h_next', None))
+            elite_tr['discount'] = float(0.0 if done_n else gam ** max(1, n_used))
             self.elite_buf.add(**elite_tr)
         return len(transitions)
 
@@ -783,13 +866,26 @@ class PolicyPriorOnlineTrainer:
         self.opt_reward.step()
 
         with torch.no_grad():
-            u_next = self._actor_u_for_q(z_next, h_next_q)
             r_q, r_hat = self._q_reward(z, u, r)
+            if self.cfg.q_reward_source.lower() == 'env':
+                r_targ = b_q.get('r_return', r).clamp(0.0, 5.0)
+                z_boot = b_q.get('z_boot', z_next)
+                h_boot = b_q.get('h_boot', h_next_q)
+                discount = b_q.get(
+                    'discount',
+                    (1 - done) * float(self.cfg.q_n_step_gamma),
+                )
+            else:
+                r_targ = r_q
+                z_boot = z_next
+                h_boot = h_next_q
+                discount = (1 - done) * float(self.cfg.q_n_step_gamma)
+            u_next = self._actor_u_for_q(z_boot, h_boot)
             q_next = m.q_head_target.expected_value(
-                z_next, u_next, return_type='min')
+                z_boot, u_next, return_type='min')
             y = (
-                r_q
-                + self.cfg.q_bootstrap * self.cfg.gamma * (1 - done) * q_next
+                r_targ
+                + self.cfg.q_bootstrap * discount * q_next
             ).clamp(m.cfg.v_min, m.cfg.v_max)
 
         q_logits = m.q_head(z, u).permute(1, 0, 2).unsqueeze(1)
@@ -824,11 +920,13 @@ class PolicyPriorOnlineTrainer:
             with torch.no_grad():
                 a_anchor_seq = self._skilldec_action_seq(z_pi, h_pi, anchor=True)
             loss_anchor = (a_pi_seq - a_anchor_seq).pow(2).mean()
+            loss_elite_bc = self._elite_chunk_bc_loss(a_pi_seq, b_pi)
             anchor_w = self._anchor_weight()
         else:
             u_pi, log_pi, mu_pi, _ = m.policy_prior(z_pi)
             u_mean = torch.tanh(mu_pi)
             loss_anchor = z_pi.new_tensor(0.0)
+            loss_elite_bc = z_pi.new_tensor(0.0)
             anchor_w = 0.0
         q_logits_pi = m._detach_q_head(z_pi, u_pi)
         q_vals_pi = two_hot_decode(q_logits_pi, m.q_head.bins)
@@ -844,6 +942,10 @@ class PolicyPriorOnlineTrainer:
                 loss_pi = (
                     -self.cfg.pi_q_weight * q_pi * m.scale_tracker.rho
                 ).mean() + anchor_w * loss_anchor
+                loss_pi = (
+                    loss_pi
+                    + self.cfg.lambda_elite_bc_pi * loss_elite_bc
+                )
             else:
                 log_pi_eff = log_pi
                 if log_pi_eff.dim() > q_pi.dim():
@@ -877,6 +979,7 @@ class PolicyPriorOnlineTrainer:
             'loss_pi': loss_pi.item(),
             'loss_lqr_pi': loss_lqr.item(),
             'loss_bc_pi': loss_bc.item(),
+            'loss_elite_bc_pi': loss_elite_bc.item(),
             'loss_skilldec_anchor': loss_anchor.item(),
             'skilldec_anchor_w': anchor_w,
             'q_mean': q_pi.detach().mean().item(),
@@ -884,7 +987,7 @@ class PolicyPriorOnlineTrainer:
             'q_data': combo['q_data'].detach().mean().item(),
             'rho': m.scale_tracker.rho,
             'r_hat': r_hat.detach().mean().item(),
-            'q_reward': r_q.detach().mean().item(),
+            'q_reward': r_targ.detach().mean().item(),
             'q_target': y.detach().mean().item(),
             'q_next': q_next.detach().mean().item(),
             'pi_active': pi_active,
@@ -968,6 +1071,27 @@ class PolicyPriorOnlineTrainer:
                                   self.cfg.bc_target_clip)
         loss = (u_mean - target).pow(2).mean(-1)
         return loss[mask].mean()
+
+    def _elite_chunk_bc_loss(
+        self,
+        a_seq: torch.Tensor,
+        batch: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        if (self.cfg.lambda_elite_bc_pi <= 0.0
+                or 'a_chunk' not in batch
+                or 'chunk_mask' not in batch
+                or 'source' not in batch):
+            return a_seq.new_tensor(0.0)
+        target = batch['a_chunk'].to(a_seq.device).clamp(-1.0, 1.0)
+        mask = batch['chunk_mask'].to(a_seq.device)
+        mask = mask * (batch['source'].to(a_seq.device) > 1.5).float().unsqueeze(-1)
+        H = min(a_seq.shape[1], target.shape[1])
+        if H <= 0:
+            return a_seq.new_tensor(0.0)
+        err = (a_seq[:, :H] - target[:, :H]).pow(2).mean(-1)
+        mask = mask[:, :H]
+        denom = mask.sum().clamp_min(1.0)
+        return (err * mask).sum() / denom
 
     def _lqr_reg_loss(self, u_mean: torch.Tensor,
                       batch: Dict[str, torch.Tensor]) -> torch.Tensor:
@@ -1091,15 +1215,38 @@ def prefill_prior_buffer_from_offline(trainer: PolicyPriorOnlineTrainer,
                 targets['main_mask'][0] | targets['aux_mask'][0]
             ).cpu().numpy().astype(np.float32)
 
+        H_chunk = int(trainer.buf.chunk_horizon)
+        n_step = max(1, int(trainer.cfg.q_n_step))
+        gam = float(trainer.cfg.q_n_step_gamma)
         for t in range(L - 1):
+            a_chunk = np.zeros((H_chunk, model.cfg.action_dim), dtype=np.float32)
+            chunk_mask = np.zeros(H_chunk, dtype=np.float32)
+            n_chunk = min(H_chunk, max(0, len(acts) - t))
+            if n_chunk > 0:
+                a_chunk[:n_chunk] = acts[t:t + n_chunk]
+                chunk_mask[:n_chunk] = 1.0
+
+            n_avail = min(n_step, (L - 1) - t)
+            r_ret = 0.0
+            for j in range(n_avail):
+                r_ret += (gam ** j) * float(r_step[t + j] > 0.0)
+            boot_idx = min(t + n_avail, L - 1)
+            done_n = boot_idx >= (L - 1)
             trainer.buf.add(
                 z=z_ep[t].cpu().numpy(),
                 h=h_pre_ep[t].cpu().numpy(),
                 u=u_ep[t].cpu().numpy(),
+                a=acts[t],
+                a_chunk=a_chunk,
+                chunk_mask=chunk_mask,
                 r=float(r_step[t] > 0.0),
+                r_return=float(r_ret),
                 z_next=z_ep[t + 1].cpu().numpy(),
                 h_next=h_pre_ep[t + 1].cpu().numpy(),
-                done=0.0,
+                z_boot=z_ep[boot_idx].cpu().numpy(),
+                h_boot=h_pre_ep[boot_idx].cpu().numpy(),
+                discount=float(0.0 if done_n else gam ** max(1, n_avail)),
+                done=float(t + 1 >= L - 1),
                 u_lqr=u_lqr_np[t],
                 u_lqr_aux=u_aux_np[t],
                 has_lqr=has_lqr_np[t],
@@ -1644,6 +1791,7 @@ def train_policy_prior_online(cfg: OnlineConfig,
               ['loss_reward', 'loss_q', 'loss_q_td', 'loss_q_cql_policy',
                'loss_q_rank_data', 'loss_q_rank_bc', 'loss_q_rank_lqr',
                'loss_pi', 'loss_lqr_pi', 'loss_bc_pi',
+               'loss_elite_bc_pi',
                'loss_skilldec_anchor', 'skilldec_anchor_w',
                 'q_mean', 'q_policy_cql', 'q_data', 'rho', 'r_hat',
                 'q_reward', 'q_target', 'q_next', 'pi_active',
@@ -1665,7 +1813,8 @@ def train_policy_prior_online(cfg: OnlineConfig,
           f"elite={cfg.reward_elite_fraction:.2f}")
     print(f"  q batch pos/off={cfg.q_positive_fraction:.2f}/"
           f"{cfg.q_offline_fraction:.2f}  reward={cfg.q_reward_source} "
-          f"boot={cfg.q_bootstrap:.2f} elite={cfg.q_elite_fraction:.2f}")
+          f"boot={cfg.q_bootstrap:.2f} n={cfg.q_n_step} "
+          f"g={cfg.q_n_step_gamma:.2f} elite={cfg.q_elite_fraction:.2f}")
     print(f"  q combo cql={cfg.lambda_q_cql_policy:.3f} "
           f"rank_data={cfg.lambda_q_rank_data:.3f} "
           f"rank_bc={cfg.lambda_q_rank_bc:.3f} "
@@ -1675,6 +1824,7 @@ def train_policy_prior_online(cfg: OnlineConfig,
           f"{cfg.pi_offline_fraction:.2f}  pi_start={cfg.pi_update_start} "
           f"elite={cfg.pi_elite_fraction:.2f} "
           f"q_w={cfg.pi_q_weight:.2f} bc={cfg.lambda_bc_pi:.3f} "
+          f"ebc={cfg.lambda_elite_bc_pi:.3f} "
           f"anchor={cfg.lambda_skilldec_anchor:.3f}->{cfg.skilldec_anchor_min:.3f}")
     print(f"  elite buffer size={cfg.elite_buffer_size} "
           f"threshold={cfg.elite_reward_threshold:.2f}")
@@ -1739,9 +1889,14 @@ def train_policy_prior_online(cfg: OnlineConfig,
                     'z': z_t.cpu().numpy()[0].copy(),
                     'h': h_t.cpu().numpy()[0].copy(),
                     'u': np.asarray(u_np, dtype=np.float32).copy(),
+                    'a': np.asarray(a_np, dtype=np.float32).copy(),
                     'r': float(r_env > 0.0),
+                    'r_return': float(r_env > 0.0),
                     'z_next': z_next_t.cpu().numpy()[0].copy(),
                     'h_next': h_next_t.cpu().numpy()[0].copy(),
+                    'z_boot': z_next_t.cpu().numpy()[0].copy(),
+                    'h_boot': h_next_t.cpu().numpy()[0].copy(),
+                    'discount': float(0.0 if done else cfg.q_n_step_gamma),
                     'done': float(done),
                     'u_lqr': None if u_lqr is None else np.asarray(u_lqr, dtype=np.float32).copy(),
                     'u_lqr_aux': None if u_lqr_aux is None else np.asarray(u_lqr_aux, dtype=np.float32).copy(),
@@ -1787,6 +1942,7 @@ def train_policy_prior_online(cfg: OnlineConfig,
                       f"TD={ms['loss_q_td']:.3f} CQ={ms['loss_q_cql_policy']:.3f} "
                       f"RD={ms['loss_q_rank_data']:.3f} "
                       f"Pi={ms['loss_pi']:.3f} Anc={ms['loss_skilldec_anchor']:.3f} "
+                      f"EBC={ms['loss_elite_bc_pi']:.3f} "
                       f"Aw={ms['skilldec_anchor_w']:.2f} "
                       f"q={ms['q_mean']:.3f} "
                       f"qd={ms['q_data']:.3f} rho={ms['rho']:.3f} rhat={ms['r_hat']:.3f} "
@@ -1863,6 +2019,9 @@ def main():
     p.add_argument('--pi_elite_fraction',        type=float, default=0.0)
     p.add_argument('--elite_buffer_size',        type=int,   default=50_000)
     p.add_argument('--elite_reward_threshold',   type=float, default=1.0)
+    p.add_argument('--lambda_elite_bc_pi',       type=float, default=0.0)
+    p.add_argument('--q_n_step',                 type=int,   default=1)
+    p.add_argument('--q_n_step_gamma',           type=float, default=0.99)
     p.add_argument('--q_reward_source', choices=['env', 'rhat', 'penalized'],
                    default='env')
     p.add_argument('--q_bootstrap', type=float, default=0.0)
@@ -1966,6 +2125,9 @@ def main():
         pi_elite_fraction=args.pi_elite_fraction,
         elite_buffer_size=args.elite_buffer_size,
         elite_reward_threshold=args.elite_reward_threshold,
+        lambda_elite_bc_pi=args.lambda_elite_bc_pi,
+        q_n_step=args.q_n_step,
+        q_n_step_gamma=args.q_n_step_gamma,
         q_reward_source=args.q_reward_source,
         q_bootstrap=args.q_bootstrap,
         pi_update_start=args.pi_update_start,
