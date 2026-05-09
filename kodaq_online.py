@@ -100,6 +100,11 @@ class OnlineConfig:
     q_offline_fraction:       float = 0.8
     pi_positive_fraction:     float = 0.02
     pi_offline_fraction:      float = 0.8
+    reward_elite_fraction:    float = 0.0
+    q_elite_fraction:         float = 0.0
+    pi_elite_fraction:        float = 0.0
+    elite_buffer_size:        int   = 50_000
+    elite_reward_threshold:   float = 1.0
     q_reward_source:          str   = 'env'
     q_bootstrap:              float = 0.0
     pi_update_start:          int   = 10_000
@@ -554,6 +559,9 @@ class PolicyPriorOnlineTrainer:
                 "expected policy_prior or skill_decoder")
         self.buf = PriorReplayBuffer(
             cfg.buffer_size, device, h_dim=model.cfg.gru_hidden)
+        self.elite_buf = PriorReplayBuffer(
+            cfg.elite_buffer_size, device, h_dim=model.cfg.gru_hidden
+        ) if cfg.elite_buffer_size > 0 else None
         self.skill_decoder_anchor = copy.deepcopy(model.skill_action_decoder)
         self.skill_decoder_anchor.to(device).eval()
         for p in self.skill_decoder_anchor.parameters():
@@ -658,24 +666,83 @@ class PolicyPriorOnlineTrainer:
         frac = min(1.0, max(0.0, self.step / decay))
         return lam_min + (lam0 - lam_min) * (1.0 - frac)
 
+    @staticmethod
+    def _concat_batches(batches: List[Dict[str, torch.Tensor]]
+                        ) -> Dict[str, torch.Tensor]:
+        if len(batches) == 1:
+            return batches[0]
+        keys = batches[0].keys()
+        return {k: torch.cat([b[k] for b in batches], dim=0) for k in keys}
+
+    def _sample_with_elite(
+        self,
+        batch_size: int,
+        positive_fraction: float,
+        offline_fraction: float,
+        elite_fraction: float,
+    ) -> Dict[str, torch.Tensor]:
+        if (self.elite_buf is None or self.elite_buf.size <= 0
+                or elite_fraction <= 0.0):
+            return self.buf.sample(
+                batch_size,
+                positive_fraction=positive_fraction,
+                offline_fraction=offline_fraction,
+            )
+
+        n_elite = int(round(
+            batch_size * max(0.0, min(1.0, elite_fraction))))
+        n_elite = min(batch_size, n_elite)
+        n_main = batch_size - n_elite
+        batches = []
+        if n_main > 0:
+            batches.append(self.buf.sample(
+                n_main,
+                positive_fraction=positive_fraction,
+                offline_fraction=offline_fraction,
+            ))
+        if n_elite > 0:
+            batches.append(self.elite_buf.sample(n_elite))
+        return self._concat_batches(batches)
+
+    def add_elite_episode(
+        self,
+        transitions: List[Dict[str, np.ndarray]],
+        ep_return: float,
+    ) -> int:
+        if (self.elite_buf is None or not transitions
+                or ep_return < self.cfg.elite_reward_threshold):
+            return 0
+        for tr in transitions:
+            elite_tr = dict(tr)
+            elite_tr['source'] = 2.0
+            self.elite_buf.add(**elite_tr)
+        return len(transitions)
+
+    @property
+    def elite_size(self) -> int:
+        return 0 if self.elite_buf is None else self.elite_buf.size
+
     def _sample_update_batches(self) -> Tuple[Dict[str, torch.Tensor],
                                               Dict[str, torch.Tensor],
                                               Dict[str, torch.Tensor]]:
         bs = self.cfg.batch_size
-        b_r = self.buf.sample(
+        b_r = self._sample_with_elite(
             bs,
             positive_fraction=self.cfg.reward_positive_fraction,
             offline_fraction=self.cfg.reward_offline_fraction,
+            elite_fraction=self.cfg.reward_elite_fraction,
         )
-        b_q = self.buf.sample(
+        b_q = self._sample_with_elite(
             bs,
             positive_fraction=self.cfg.q_positive_fraction,
             offline_fraction=self.cfg.q_offline_fraction,
+            elite_fraction=self.cfg.q_elite_fraction,
         )
-        b_pi = self.buf.sample(
+        b_pi = self._sample_with_elite(
             bs,
             positive_fraction=self.cfg.pi_positive_fraction,
             offline_fraction=self.cfg.pi_offline_fraction,
+            elite_fraction=self.cfg.pi_elite_fraction,
         )
         return b_r, b_q, b_pi
 
@@ -821,6 +888,7 @@ class PolicyPriorOnlineTrainer:
             'q_target': y.detach().mean().item(),
             'q_next': q_next.detach().mean().item(),
             'pi_active': pi_active,
+            'elite_size': float(self.elite_size),
         }
 
     def _q_min_value(self, z: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
@@ -1577,12 +1645,14 @@ def train_policy_prior_online(cfg: OnlineConfig,
                'loss_q_rank_data', 'loss_q_rank_bc', 'loss_q_rank_lqr',
                'loss_pi', 'loss_lqr_pi', 'loss_bc_pi',
                'loss_skilldec_anchor', 'skilldec_anchor_w',
-               'q_mean', 'q_policy_cql', 'q_data', 'rho', 'r_hat',
-               'q_reward', 'q_target', 'q_next', 'pi_active',
-               'ep_reward', 'ep_tasks']}
+                'q_mean', 'q_policy_cql', 'q_data', 'rho', 'r_hat',
+                'q_reward', 'q_target', 'q_next', 'pi_active',
+                'ep_reward', 'ep_tasks', 'elite_size',
+                'elite_ep_reward', 'elite_added']}
     global_step = trainer.step
     ep_r = 0.0
     ep_tasks = 0
+    episode_transitions: List[Dict[str, np.ndarray]] = []
     t0 = time.time()
 
     print(f"\n{'='*60}")
@@ -1591,10 +1661,11 @@ def train_policy_prior_online(cfg: OnlineConfig,
           f"noise={cfg.action_noise_std:.3f}")
     print(f"  batch={cfg.batch_size}  buf={cfg.buffer_size}  cond={cfg.cond_len}")
     print(f"  reward batch pos/off={cfg.reward_positive_fraction:.2f}/"
-          f"{cfg.reward_offline_fraction:.2f}")
+          f"{cfg.reward_offline_fraction:.2f} "
+          f"elite={cfg.reward_elite_fraction:.2f}")
     print(f"  q batch pos/off={cfg.q_positive_fraction:.2f}/"
           f"{cfg.q_offline_fraction:.2f}  reward={cfg.q_reward_source} "
-          f"boot={cfg.q_bootstrap:.2f}")
+          f"boot={cfg.q_bootstrap:.2f} elite={cfg.q_elite_fraction:.2f}")
     print(f"  q combo cql={cfg.lambda_q_cql_policy:.3f} "
           f"rank_data={cfg.lambda_q_rank_data:.3f} "
           f"rank_bc={cfg.lambda_q_rank_bc:.3f} "
@@ -1602,8 +1673,11 @@ def train_policy_prior_online(cfg: OnlineConfig,
           f"margin={cfg.q_rank_margin:.3f}")
     print(f"  pi batch pos/off={cfg.pi_positive_fraction:.2f}/"
           f"{cfg.pi_offline_fraction:.2f}  pi_start={cfg.pi_update_start} "
+          f"elite={cfg.pi_elite_fraction:.2f} "
           f"q_w={cfg.pi_q_weight:.2f} bc={cfg.lambda_bc_pi:.3f} "
           f"anchor={cfg.lambda_skilldec_anchor:.3f}->{cfg.skilldec_anchor_min:.3f}")
+    print(f"  elite buffer size={cfg.elite_buffer_size} "
+          f"threshold={cfg.elite_reward_threshold:.2f}")
     print(f"{'='*60}\n")
 
     while global_step < cfg.n_env_steps:
@@ -1618,10 +1692,15 @@ def train_policy_prior_online(cfg: OnlineConfig,
             if done:
                 recent['ep_reward'].append(ep_r)
                 recent['ep_tasks'].append(ep_tasks)
+                added = trainer.add_elite_episode(episode_transitions, ep_r)
+                if added > 0:
+                    recent['elite_ep_reward'].append(ep_r)
+                    recent['elite_added'].append(float(added))
                 obs = env.reset()
                 ctx.reset(obs)
                 ep_r = 0.0
                 ep_tasks = 0
+                episode_transitions = []
             continue
 
         z_plan, h_plan = cur
@@ -1656,19 +1735,23 @@ def train_policy_prior_online(cfg: OnlineConfig,
                     lqr_t = trainer.lqr_target_for_goal(z_t, h_t, z_next_t)
                     if lqr_t is not None:
                         u_lqr, u_lqr_aux, has_lqr = lqr_t
+                trans = {
+                    'z': z_t.cpu().numpy()[0].copy(),
+                    'h': h_t.cpu().numpy()[0].copy(),
+                    'u': np.asarray(u_np, dtype=np.float32).copy(),
+                    'r': float(r_env > 0.0),
+                    'z_next': z_next_t.cpu().numpy()[0].copy(),
+                    'h_next': h_next_t.cpu().numpy()[0].copy(),
+                    'done': float(done),
+                    'u_lqr': None if u_lqr is None else np.asarray(u_lqr, dtype=np.float32).copy(),
+                    'u_lqr_aux': None if u_lqr_aux is None else np.asarray(u_lqr_aux, dtype=np.float32).copy(),
+                    'has_lqr': has_lqr,
+                    'source': 0.0,
+                }
                 trainer.buf.add(
-                    z=z_t.cpu().numpy()[0],
-                    h=h_t.cpu().numpy()[0],
-                    u=u_np,
-                    r=float(r_env > 0.0),
-                    z_next=z_next_t.cpu().numpy()[0],
-                    h_next=h_next_t.cpu().numpy()[0],
-                    done=float(done),
-                    u_lqr=u_lqr,
-                    u_lqr_aux=u_lqr_aux,
-                    has_lqr=has_lqr,
-                    source=0.0,
+                    **trans,
                 )
+                episode_transitions.append(trans)
 
             trainer.step = global_step
             for _ in range(cfg.n_updates_per_step):
@@ -1683,10 +1766,15 @@ def train_policy_prior_online(cfg: OnlineConfig,
             if done:
                 recent['ep_reward'].append(ep_r)
                 recent['ep_tasks'].append(ep_tasks)
+                added = trainer.add_elite_episode(episode_transitions, ep_r)
+                if added > 0:
+                    recent['elite_ep_reward'].append(ep_r)
+                    recent['elite_added'].append(float(added))
                 obs = env.reset()
                 ctx.reset(obs)
                 ep_r = 0.0
                 ep_tasks = 0
+                episode_transitions = []
 
             if global_step % cfg.log_every == 0:
                 trainer.step = global_step
@@ -1705,6 +1793,7 @@ def train_policy_prior_online(cfg: OnlineConfig,
                       f"rQ={ms['q_reward']:.3f} y={ms['q_target']:.3f} "
                       f"pi={ms['pi_active']:.0f} | "
                       f"ep_r={ms['ep_reward']:.2f} tasks={ms['ep_tasks']:.2f} | "
+                      f"elite={trainer.elite_size} epr={ms['elite_ep_reward']:.2f} | "
                       f"{sps:.0f}sps")
                 if use_wandb:
                     wandb.log({f"prior_online/{k}": v for k, v in ms.items()},
@@ -1769,6 +1858,11 @@ def main():
     p.add_argument('--q_offline_fraction',       type=float, default=0.8)
     p.add_argument('--pi_positive_fraction',     type=float, default=0.02)
     p.add_argument('--pi_offline_fraction',      type=float, default=0.8)
+    p.add_argument('--reward_elite_fraction',    type=float, default=0.0)
+    p.add_argument('--q_elite_fraction',         type=float, default=0.0)
+    p.add_argument('--pi_elite_fraction',        type=float, default=0.0)
+    p.add_argument('--elite_buffer_size',        type=int,   default=50_000)
+    p.add_argument('--elite_reward_threshold',   type=float, default=1.0)
     p.add_argument('--q_reward_source', choices=['env', 'rhat', 'penalized'],
                    default='env')
     p.add_argument('--q_bootstrap', type=float, default=0.0)
@@ -1867,6 +1961,11 @@ def main():
         q_offline_fraction=args.q_offline_fraction,
         pi_positive_fraction=args.pi_positive_fraction,
         pi_offline_fraction=args.pi_offline_fraction,
+        reward_elite_fraction=args.reward_elite_fraction,
+        q_elite_fraction=args.q_elite_fraction,
+        pi_elite_fraction=args.pi_elite_fraction,
+        elite_buffer_size=args.elite_buffer_size,
+        elite_reward_threshold=args.elite_reward_threshold,
         q_reward_source=args.q_reward_source,
         q_bootstrap=args.q_bootstrap,
         pi_update_start=args.pi_update_start,
