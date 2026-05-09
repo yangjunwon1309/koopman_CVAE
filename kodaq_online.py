@@ -110,6 +110,11 @@ class OnlineConfig:
     q_n_step_gamma:           float = 0.99
     q_reward_source:          str   = 'env'
     q_bootstrap:              float = 0.0
+    q_success_only:           bool  = False
+    q_success_value:          float = 1.0
+    lambda_q_negative:        float = 0.0
+    lambda_q_success_rank:    float = 0.0
+    q_success_margin:         float = 0.5
     pi_update_start:          int   = 10_000
     actor_mode:               str   = 'policy_prior'  # policy_prior | skill_decoder
     pi_q_weight:              float = 1.0
@@ -1178,7 +1183,19 @@ class PolicyPriorOnlineTrainer:
 
         with torch.no_grad():
             r_q, r_hat = self._q_reward(z, b_q['u'], r)
-            if self.cfg.q_reward_source.lower() == 'env':
+            source_q = b_q.get('source', z.new_zeros(z.shape[0])).to(z.device)
+            ret_q = b_q.get('r_return', r).to(z.device)
+            success_mask = (source_q > 1.5) | (ret_q > 0.5)
+            if self.cfg.q_success_only:
+                r_targ = torch.where(
+                    success_mask,
+                    z.new_full((z.shape[0],), float(self.cfg.q_success_value)),
+                    z.new_zeros(z.shape[0]),
+                )
+                z_boot = b_q.get('z_boot', z_next)
+                h_boot = b_q.get('h_boot', h_next_q)
+                discount = z.new_zeros(z.shape[0])
+            elif self.cfg.q_reward_source.lower() == 'env':
                 r_targ = b_q.get('r_return', r).clamp(0.0, 5.0)
                 z_boot = b_q.get('z_boot', z_next)
                 h_boot = b_q.get('h_boot', h_next_q)
@@ -1207,11 +1224,39 @@ class PolicyPriorOnlineTrainer:
             bins=m.skill_arg_q_head.bins,
             gamma=1.0,
         )
+        q_vals_d = two_hot_decode(q_logits_d, m.skill_arg_q_head.bins).min(0).values
+        source_f = b_q.get('source', z.new_zeros(z.shape[0])).to(z.device)
+        ret_f = b_q.get('r_return', z.new_zeros(z.shape[0])).to(z.device)
+        success_mask_f = (source_f > 1.5) | (ret_f > 0.5)
+        neg_mask = ~success_mask_f
+        loss_q_negative = z.new_tensor(0.0)
+        if self.cfg.lambda_q_negative > 0.0 and bool(neg_mask.any()):
+            neg_logits = q_logits_d[:, neg_mask]
+            neg_logits = neg_logits.permute(1, 0, 2).unsqueeze(1)
+            neg_y = z.new_zeros(int(neg_mask.sum()))
+            loss_q_negative = q_categorical_loss(
+                q_logits=neg_logits,
+                reward_seq=torch.zeros_like(neg_y).unsqueeze(1),
+                q_target_scalar=neg_y.unsqueeze(1),
+                bins=m.skill_arg_q_head.bins,
+                gamma=1.0,
+            )
+        loss_q_success_rank = z.new_tensor(0.0)
+        if (self.cfg.lambda_q_success_rank > 0.0
+                and bool(success_mask_f.any())
+                and bool(neg_mask.any())):
+            q_succ = q_vals_d[success_mask_f]
+            q_neg = q_vals_d[neg_mask]
+            loss_q_success_rank = F.relu(
+                self.cfg.q_success_margin + q_neg - q_succ.mean()
+            ).mean()
         combo = self._combo_skillarg_q_loss(b_q)
         loss_q = (
             loss_q_td
             + self.cfg.lambda_q_cql_policy * combo['loss_q_cql_policy']
             + self.cfg.lambda_q_rank_data * combo['loss_q_rank_data']
+            + self.cfg.lambda_q_negative * loss_q_negative
+            + self.cfg.lambda_q_success_rank * loss_q_success_rank
         )
         self.opt_q.zero_grad()
         loss_q.backward()
@@ -1246,8 +1291,8 @@ class PolicyPriorOnlineTrainer:
             'loss_q_td': loss_q_td.item(),
             'loss_q_cql_policy': combo['loss_q_cql_policy'].item(),
             'loss_q_rank_data': combo['loss_q_rank_data'].item(),
-            'loss_q_rank_bc': combo['loss_q_rank_bc'].item(),
-            'loss_q_rank_lqr': combo['loss_q_rank_lqr'].item(),
+            'loss_q_rank_bc': loss_q_negative.item(),
+            'loss_q_rank_lqr': loss_q_success_rank.item(),
             'loss_pi': loss_pi.item(),
             'loss_lqr_pi': 0.0,
             'loss_bc_pi': 0.0,
@@ -2274,6 +2319,11 @@ def train_policy_prior_online(cfg: OnlineConfig,
           f"rank_bc={cfg.lambda_q_rank_bc:.3f} "
           f"rank_lqr={cfg.lambda_q_rank_lqr:.3f} "
           f"margin={cfg.q_rank_margin:.3f}")
+    print(f"  q success_only={int(cfg.q_success_only)} "
+          f"success_value={cfg.q_success_value:.2f} "
+          f"neg={cfg.lambda_q_negative:.2f} "
+          f"succ_rank={cfg.lambda_q_success_rank:.2f} "
+          f"succ_margin={cfg.q_success_margin:.2f}")
     print(f"  pi batch pos/off={cfg.pi_positive_fraction:.2f}/"
           f"{cfg.pi_offline_fraction:.2f}  pi_start={cfg.pi_update_start} "
           f"elite={cfg.pi_elite_fraction:.2f} "
@@ -2622,6 +2672,12 @@ def main():
     p.add_argument('--q_reward_source', choices=['env', 'rhat', 'penalized'],
                    default='env')
     p.add_argument('--q_bootstrap', type=float, default=0.0)
+    p.add_argument('--q_success_only', action='store_true',
+                   help='For skill_arg Q, give positive targets only to elite/success chunks and zero to others.')
+    p.add_argument('--q_success_value', type=float, default=1.0)
+    p.add_argument('--lambda_q_negative', type=float, default=0.0)
+    p.add_argument('--lambda_q_success_rank', type=float, default=0.0)
+    p.add_argument('--q_success_margin', type=float, default=0.5)
     p.add_argument('--pi_update_start', type=int, default=10_000)
     p.add_argument('--actor_mode', choices=['policy_prior', 'skill_decoder', 'skill_arg'],
                    default='policy_prior')
@@ -2729,6 +2785,11 @@ def main():
         q_n_step_gamma=args.q_n_step_gamma,
         q_reward_source=args.q_reward_source,
         q_bootstrap=args.q_bootstrap,
+        q_success_only=args.q_success_only,
+        q_success_value=args.q_success_value,
+        lambda_q_negative=args.lambda_q_negative,
+        lambda_q_success_rank=args.lambda_q_success_rank,
+        q_success_margin=args.q_success_margin,
         pi_update_start=args.pi_update_start,
         actor_mode=args.actor_mode,
         pi_q_weight=args.pi_q_weight,
