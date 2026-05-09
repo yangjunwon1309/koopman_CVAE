@@ -125,6 +125,8 @@ class OnlineConfig:
     lambda_skilldec_anchor:   float = 0.0
     skilldec_anchor_min:      float = 0.0
     skilldec_anchor_decay_steps: int = 200_000
+    skill_arg_alpha_d:        float = 0.1
+    skill_arg_alpha_z:        float = 0.01
     lambda_lqr_pi:     float = 0.0
     lqr_horizon:       int   = 4
     lqr_aux_k:         int   = 4
@@ -462,12 +464,14 @@ class EnvContext:
 
 class PriorReplayBuffer:
     def __init__(self, capacity: int, device: str, h_dim: int = 0,
-                 action_dim: int = 0, chunk_horizon: int = 1):
+                 action_dim: int = 0, chunk_horizon: int = 1,
+                 arg_dim: int = 0):
         self.capacity = capacity
         self.device = device
         self.h_dim = h_dim
         self.action_dim = int(action_dim)
         self.chunk_horizon = max(1, int(chunk_horizon))
+        self.arg_dim = int(arg_dim)
         self._d: Dict[str, np.ndarray] = {}
         self._ptr = 0
         self._n = 0
@@ -495,6 +499,9 @@ class PriorReplayBuffer:
             'u_lqr': np.zeros((C, u_dim), dtype=np.float32),
             'u_lqr_aux': np.zeros((C, u_dim), dtype=np.float32),
             'has_lqr': np.zeros(C, dtype=np.float32),
+            'skill_id': np.zeros(C, dtype=np.float32),
+            'skill_arg': np.zeros((C, int(self.arg_dim)), dtype=np.float32),
+            'has_skill_arg': np.zeros(C, dtype=np.float32),
             'source': np.zeros(C, dtype=np.float32),
         }
 
@@ -503,6 +510,7 @@ class PriorReplayBuffer:
             a=None, a_chunk=None, chunk_mask=None,
             r_return=None, z_boot=None, h_boot=None, discount=None,
             u_lqr=None, u_lqr_aux=None, has_lqr: float = 0.0,
+            skill_id=None, skill_arg=None, has_skill_arg: float = 0.0,
             source: float = 0.0):
         if not self._d:
             self._init(z.shape[-1], u.shape[-1])
@@ -543,6 +551,12 @@ class PriorReplayBuffer:
         if u_lqr_aux is not None:
             self._d['u_lqr_aux'][p] = u_lqr_aux
         self._d['has_lqr'][p] = float(has_lqr)
+        if skill_id is not None:
+            self._d['skill_id'][p] = float(skill_id)
+        if skill_arg is not None and self.arg_dim > 0:
+            self._d['skill_arg'][p] = np.asarray(skill_arg, dtype=np.float32)
+            has_skill_arg = 1.0
+        self._d['has_skill_arg'][p] = float(has_skill_arg)
         self._d['source'][p] = float(source)
         self._ptr = (p + 1) % self.capacity
         self._n = min(self._n + 1, self.capacity)
@@ -598,12 +612,15 @@ class PolicyPriorOnlineTrainer:
                 "expected policy_prior, skill_decoder, or skill_arg")
         skill_h = int(getattr(model.cfg, 'skill_decoder_horizon',
                               cfg.skilldec_exec_horizon))
+        arg_dim = int(getattr(model.cfg, 'skill_arg_dim', 0))
         self.buf = PriorReplayBuffer(
             cfg.buffer_size, device, h_dim=model.cfg.gru_hidden,
-            action_dim=model.cfg.action_dim, chunk_horizon=skill_h)
+            action_dim=model.cfg.action_dim, chunk_horizon=skill_h,
+            arg_dim=arg_dim)
         self.elite_buf = PriorReplayBuffer(
             cfg.elite_buffer_size, device, h_dim=model.cfg.gru_hidden,
-            action_dim=model.cfg.action_dim, chunk_horizon=skill_h
+            action_dim=model.cfg.action_dim, chunk_horizon=skill_h,
+            arg_dim=arg_dim
         ) if cfg.elite_buffer_size > 0 else None
         self.skill_decoder_anchor = copy.deepcopy(model.skill_action_decoder)
         self.skill_decoder_anchor.to(device).eval()
@@ -619,20 +636,28 @@ class PolicyPriorOnlineTrainer:
         if self.actor_mode == 'skill_decoder':
             actor_mod = model.skill_action_decoder
         elif self.actor_mode == 'skill_arg':
-            actor_mod = model.skill_argument_policy
+            actor_mod = nn.ModuleList([
+                model.skill_discrete_policy,
+                model.skill_argument_policy,
+            ])
         else:
             actor_mod = model.policy_prior
-        for mod in [model.reward_ensemble_head, model.q_head, actor_mod]:
+        q_mod = model.skill_arg_q_head if self.actor_mode == 'skill_arg' else model.q_head
+        for mod in [model.reward_ensemble_head, q_mod, actor_mod]:
             for p in mod.parameters():
                 p.requires_grad_(True)
             mod.train()
         model.q_head_target.eval()
         model._detach_q_head.eval()
+        if hasattr(model, 'skill_arg_q_head_target'):
+            model.skill_arg_q_head_target.eval()
+            model._detach_skill_arg_q_head.eval()
 
         self.opt_reward = torch.optim.Adam(model.reward_ensemble_head.parameters(),
                                            lr=cfg.wm_lr)
-        self.opt_q = torch.optim.Adam(model.q_head.parameters(), lr=cfg.lr)
+        self.opt_q = torch.optim.Adam(q_mod.parameters(), lr=cfg.lr)
         self.opt_pi = torch.optim.Adam(actor_mod.parameters(), lr=cfg.lr)
+        self._last_skillarg_meta: Dict[str, np.ndarray] = {}
 
     def decode_action(self, u: torch.Tensor) -> np.ndarray:
         if u.dim() == 1:
@@ -651,6 +676,59 @@ class PolicyPriorOnlineTrainer:
                 with torch.no_grad():
                     a.clamp_(-1.0, 1.0)
         return a.detach()[0].cpu().numpy()
+
+    def _skill_prior_logits(self, h: torch.Tensor) -> torch.Tensor:
+        return self.model.skill_prior(h).detach()
+
+    def _skill_policy_logits(self, z: torch.Tensor,
+                             h: torch.Tensor) -> torch.Tensor:
+        prior_logits = self._skill_prior_logits(h)
+        return self.model.skill_discrete_policy(z, h, prior_logits)
+
+    def _one_hot_skill(self, skill_id: torch.Tensor) -> torch.Tensor:
+        return F.one_hot(
+            skill_id.long(), num_classes=self.model.cfg.num_skills
+        ).float()
+
+    def _skill_arg_normal_kl(
+        self,
+        mean: torch.Tensor,
+        log_std: torch.Tensor,
+        prior_mean: torch.Tensor,
+        prior_log_std: torch.Tensor,
+    ) -> torch.Tensor:
+        var = torch.exp(2.0 * log_std)
+        prior_var = torch.exp(2.0 * prior_log_std)
+        kl = (
+            prior_log_std - log_std
+            + (var + (mean - prior_mean).pow(2)) / (2.0 * prior_var)
+            - 0.5
+        )
+        return kl.sum(-1)
+
+    def _sample_skillarg_action(
+        self,
+        z: torch.Tensor,
+        h: torch.Tensor,
+        deterministic: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        logits_d = self._skill_policy_logits(z, h)
+        probs_d = torch.softmax(logits_d, dim=-1)
+        if deterministic:
+            skill_id = probs_d.argmax(dim=-1)
+        else:
+            skill_id = torch.multinomial(probs_d, num_samples=1).squeeze(-1)
+        skill_oh = self._one_hot_skill(skill_id)
+        if deterministic:
+            arg = self.model.skill_argument_policy.mean_arg(z, h, skill_oh)
+            log_arg = z.new_zeros(z.shape[:-1])
+        else:
+            arg, log_arg, _, _ = self.model.skill_argument_policy(z, h, skill_oh)
+        a_seq = self.model.skill_argument_decoder(z, h, skill_oh, arg)
+        return a_seq, skill_id, arg, log_arg
+
+    def last_skillarg_meta(self) -> Dict[str, np.ndarray]:
+        return dict(self._last_skillarg_meta)
 
     @torch.no_grad()
     def act_sequence(
@@ -675,9 +753,13 @@ class PolicyPriorOnlineTrainer:
         if self.actor_mode == 'skill_arg':
             if h is None:
                 raise ValueError("h is required when actor_mode=skill_arg")
-            w = self.model.skill_prior.soft_weights(h)
-            arg, _, _, _ = self.model.skill_argument_policy(z, h, w)
-            a_seq = self.model.skill_argument_decoder(z, h, w, arg)[0].clamp(-1.0, 1.0)
+            a_seq_t, skill_id, arg, _ = self._sample_skillarg_action(
+                z, h, deterministic=False)
+            self._last_skillarg_meta = {
+                'skill_id': skill_id.detach().cpu().numpy().copy(),
+                'skill_arg': arg.detach().cpu().numpy().copy(),
+            }
+            a_seq = a_seq_t[0].clamp(-1.0, 1.0)
             n = max(1, int(horizon or self.cfg.skilldec_exec_horizon))
             a_seq = a_seq[:min(n, a_seq.shape[0])]
             if self.cfg.action_noise_std > 0.0:
@@ -811,7 +893,13 @@ class PolicyPriorOnlineTrainer:
         for i, tr in enumerate(transitions):
             elite_tr = dict(tr)
             elite_tr['source'] = 2.0
-            if actions and actions[i] is not None:
+            if tr.get('a_chunk', None) is not None:
+                elite_tr['a_chunk'] = np.asarray(
+                    tr['a_chunk'], dtype=np.float32)
+                if tr.get('chunk_mask', None) is not None:
+                    elite_tr['chunk_mask'] = np.asarray(
+                        tr['chunk_mask'], dtype=np.float32)
+            elif actions and actions[i] is not None:
                 a_chunk = np.zeros((H, self.elite_buf.action_dim), dtype=np.float32)
                 chunk_mask = np.zeros(H, dtype=np.float32)
                 n_chunk = min(H, len(actions) - i)
@@ -825,24 +913,30 @@ class PolicyPriorOnlineTrainer:
                 elite_tr['a_chunk'] = a_chunk
                 elite_tr['chunk_mask'] = chunk_mask
 
-            ret = 0.0
-            boot = tr
-            done_n = False
-            n_used = 0
-            for j in range(n_step):
-                k = i + j
-                if k >= len(transitions):
-                    break
-                boot = transitions[k]
-                ret += (gam ** j) * float(boot.get('r', 0.0))
-                n_used = j + 1
-                if float(boot.get('done', 0.0)) > 0.5:
-                    done_n = True
-                    break
-            elite_tr['r_return'] = float(ret)
-            elite_tr['z_boot'] = boot.get('z_next', tr['z_next'])
-            elite_tr['h_boot'] = boot.get('h_next', tr.get('h_next', None))
-            elite_tr['discount'] = float(0.0 if done_n else gam ** max(1, n_used))
+            if 'r_return' in tr and 'z_boot' in tr:
+                elite_tr['r_return'] = float(tr.get('r_return', tr.get('r', 0.0)))
+                elite_tr['z_boot'] = tr.get('z_boot', tr['z_next'])
+                elite_tr['h_boot'] = tr.get('h_boot', tr.get('h_next', None))
+                elite_tr['discount'] = float(tr.get('discount', 0.0))
+            else:
+                ret = 0.0
+                boot = tr
+                done_n = False
+                n_used = 0
+                for j in range(n_step):
+                    k = i + j
+                    if k >= len(transitions):
+                        break
+                    boot = transitions[k]
+                    ret += (gam ** j) * float(boot.get('r', 0.0))
+                    n_used = j + 1
+                    if float(boot.get('done', 0.0)) > 0.5:
+                        done_n = True
+                        break
+                elite_tr['r_return'] = float(ret)
+                elite_tr['z_boot'] = boot.get('z_next', tr['z_next'])
+                elite_tr['h_boot'] = boot.get('h_next', tr.get('h_next', None))
+                elite_tr['discount'] = float(0.0 if done_n else gam ** max(1, n_used))
             self.elite_buf.add(**elite_tr)
         return len(transitions)
 
@@ -892,6 +986,289 @@ class PolicyPriorOnlineTrainer:
             "expected env, rhat, or penalized"
         )
 
+    def _skillarg_q_logits(
+        self,
+        q_head: nn.Module,
+        z: torch.Tensor,
+        h: torch.Tensor,
+        arg: torch.Tensor,
+        skill_id: torch.Tensor,
+    ) -> torch.Tensor:
+        return q_head.gather_skill_logits(z, h, arg, skill_id)
+
+    def _skillarg_q_value(
+        self,
+        q_head: nn.Module,
+        z: torch.Tensor,
+        h: torch.Tensor,
+        arg: torch.Tensor,
+        skill_id: torch.Tensor,
+        return_type: str = 'min',
+    ) -> torch.Tensor:
+        return q_head.expected_value(
+            z, h, arg, skill_id=skill_id, return_type=return_type)
+
+    def _expand_skill_inputs(
+        self,
+        z: torch.Tensor,
+        h: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        B = z.shape[0]
+        K = self.model.cfg.num_skills
+        skill_ids = torch.arange(K, device=z.device).view(1, K).expand(B, K)
+        skill_oh = F.one_hot(skill_ids, num_classes=K).float()
+        z_rep = z[:, None].expand(B, K, z.shape[-1]).reshape(B * K, -1)
+        h_rep = h[:, None].expand(B, K, h.shape[-1]).reshape(B * K, -1)
+        skill_flat = skill_oh.reshape(B * K, K)
+        skill_id_flat = skill_ids.reshape(B * K)
+        return z_rep, h_rep, skill_flat, skill_id_flat
+
+    def _skillarg_soft_value(
+        self,
+        z: torch.Tensor,
+        h: torch.Tensor,
+        q_head: nn.Module,
+        detach_actor: bool = False,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        m = self.model
+        B = z.shape[0]
+        K = m.cfg.num_skills
+        prior_logits = self._skill_prior_logits(h)
+        logits_d = self._skill_policy_logits(z, h)
+        probs_d = torch.softmax(logits_d, dim=-1)
+        log_pi_d = F.log_softmax(logits_d, dim=-1)
+        log_p_d = F.log_softmax(prior_logits, dim=-1)
+        kl_d = (probs_d * (log_pi_d - log_p_d)).sum(-1)
+
+        z_rep, h_rep, skill_flat, skill_id_flat = self._expand_skill_inputs(z, h)
+        if detach_actor:
+            with torch.no_grad():
+                arg, _, mean_arg, log_std = m.skill_argument_policy(
+                    z_rep, h_rep, skill_flat)
+                mean_raw, log_std_raw = m.skill_argument_policy.dist_params(
+                    z_rep, h_rep, skill_flat)
+                prior_mean, prior_log_std = self.skill_arg_policy_anchor.dist_params(
+                    z_rep, h_rep, skill_flat)
+        else:
+            arg, _, mean_arg, log_std = m.skill_argument_policy(
+                z_rep, h_rep, skill_flat)
+            mean_raw, log_std_raw = m.skill_argument_policy.dist_params(
+                z_rep, h_rep, skill_flat)
+            with torch.no_grad():
+                prior_mean, prior_log_std = self.skill_arg_policy_anchor.dist_params(
+                    z_rep, h_rep, skill_flat)
+
+        kl_z = self._skill_arg_normal_kl(
+            mean_raw, log_std_raw, prior_mean, prior_log_std).reshape(B, K)
+        q = self._skillarg_q_value(
+            q_head, z_rep, h_rep, arg, skill_id_flat,
+            return_type='min').reshape(B, K)
+        v = (
+            probs_d * (q - self.cfg.skill_arg_alpha_z * kl_z)
+        ).sum(-1) - self.cfg.skill_arg_alpha_d * kl_d
+        return v, {
+            'q_by_skill': q,
+            'kl_d': kl_d,
+            'kl_z': kl_z,
+            'probs_d': probs_d,
+        }
+
+    def _skillarg_actor_loss(
+        self,
+        z: torch.Tensor,
+        h: torch.Tensor,
+        batch: Dict[str, torch.Tensor],
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        m = self.model
+        B = z.shape[0]
+        K = m.cfg.num_skills
+        prior_logits = self._skill_prior_logits(h)
+        logits_d = self._skill_policy_logits(z, h)
+        probs_d = torch.softmax(logits_d, dim=-1)
+        log_pi_d = F.log_softmax(logits_d, dim=-1)
+        log_p_d = F.log_softmax(prior_logits, dim=-1)
+        kl_d = (probs_d * (log_pi_d - log_p_d)).sum(-1)
+
+        z_rep, h_rep, skill_flat, skill_id_flat = self._expand_skill_inputs(z, h)
+        arg, _, _, _ = m.skill_argument_policy(z_rep, h_rep, skill_flat)
+        mean_raw, log_std_raw = m.skill_argument_policy.dist_params(
+            z_rep, h_rep, skill_flat)
+        with torch.no_grad():
+            prior_mean, prior_log_std = self.skill_arg_policy_anchor.dist_params(
+                z_rep, h_rep, skill_flat)
+        kl_z = self._skill_arg_normal_kl(
+            mean_raw, log_std_raw, prior_mean, prior_log_std).reshape(B, K)
+        q = self._skillarg_q_value(
+            m._detach_skill_arg_q_head, z_rep, h_rep, arg, skill_id_flat,
+            return_type='min').reshape(B, K)
+        m.scale_tracker.update(q.detach().reshape(-1))
+        objective = (
+            probs_d
+            * (self.cfg.pi_q_weight * q * m.scale_tracker.rho
+               - self.cfg.skill_arg_alpha_z * kl_z)
+        ).sum(-1) - self.cfg.skill_arg_alpha_d * kl_d
+        loss = -objective.mean()
+
+        loss_elite_bc = z.new_tensor(0.0)
+        if self.cfg.lambda_elite_bc_pi > 0.0:
+            skill_id_bc = batch.get('skill_id', None)
+            if skill_id_bc is not None:
+                skill_oh = self._one_hot_skill(skill_id_bc.long())
+                arg_bc, _, _, _ = m.skill_argument_policy(z, h, skill_oh)
+                a_seq = m.skill_argument_decoder(z, h, skill_oh, arg_bc)
+                loss_elite_bc = self._elite_chunk_bc_loss(a_seq, batch)
+                loss = loss + self.cfg.lambda_elite_bc_pi * loss_elite_bc
+
+        return loss, {
+            'q_pi': (probs_d * q).sum(-1).detach(),
+            'kl_d': kl_d.detach(),
+            'kl_z': (probs_d * kl_z).sum(-1).detach(),
+            'loss_elite_bc': loss_elite_bc.detach(),
+        }
+
+    def _combo_skillarg_q_loss(
+        self,
+        batch: Dict[str, torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        z = batch['z']
+        zero = z.new_tensor(0.0)
+        if (self.cfg.lambda_q_cql_policy <= 0.0
+                and self.cfg.lambda_q_rank_data <= 0.0):
+            return {
+                'loss_q_cql_policy': zero,
+                'loss_q_rank_data': zero,
+                'loss_q_rank_bc': zero,
+                'loss_q_rank_lqr': zero,
+                'q_policy': zero,
+                'q_data': zero,
+            }
+        h = batch['h']
+        skill_id = batch['skill_id'].long()
+        arg_data = batch['skill_arg'].detach()
+        q_data = self._skillarg_q_value(
+            self.model.skill_arg_q_head, z, h, arg_data, skill_id,
+            return_type='min')
+        v_pi, _ = self._skillarg_soft_value(
+            z, h, self.model.skill_arg_q_head, detach_actor=True)
+        q_policy = v_pi
+        loss_cql = (q_policy - q_data).mean()
+        loss_rank_data = F.relu(
+            self.cfg.q_rank_margin + q_policy - q_data).mean()
+        return {
+            'loss_q_cql_policy': loss_cql,
+            'loss_q_rank_data': loss_rank_data,
+            'loss_q_rank_bc': zero,
+            'loss_q_rank_lqr': zero,
+            'q_policy': q_policy.detach(),
+            'q_data': q_data.detach(),
+        }
+
+    def _update_skill_arg_q_pi(
+        self,
+        b_q: Dict[str, torch.Tensor],
+        b_pi: Dict[str, torch.Tensor],
+        loss_r: torch.Tensor,
+    ) -> Dict[str, float]:
+        m = self.model
+        z, h = b_q['z'], b_q['h']
+        arg = b_q['skill_arg']
+        skill_id = b_q['skill_id'].long()
+        r, z_next, done = b_q['r'], b_q['z_next'], b_q['done']
+        h_next_q = b_q.get('h_next', None)
+
+        with torch.no_grad():
+            r_q, r_hat = self._q_reward(z, b_q['u'], r)
+            if self.cfg.q_reward_source.lower() == 'env':
+                r_targ = b_q.get('r_return', r).clamp(0.0, 5.0)
+                z_boot = b_q.get('z_boot', z_next)
+                h_boot = b_q.get('h_boot', h_next_q)
+                discount = b_q.get(
+                    'discount',
+                    (1 - done) * float(self.cfg.q_n_step_gamma),
+                )
+            else:
+                r_targ = r_q
+                z_boot = z_next
+                h_boot = h_next_q
+                discount = (1 - done) * float(self.cfg.q_n_step_gamma)
+            q_next, next_info = self._skillarg_soft_value(
+                z_boot, h_boot, m.skill_arg_q_head_target, detach_actor=True)
+            y = (
+                r_targ + self.cfg.q_bootstrap * discount * q_next
+            ).clamp(m.cfg.v_min, m.cfg.v_max)
+
+        q_logits_d = self._skillarg_q_logits(
+            m.skill_arg_q_head, z, h, arg, skill_id)
+        q_logits = q_logits_d.permute(1, 0, 2).unsqueeze(1)
+        loss_q_td = q_categorical_loss(
+            q_logits=q_logits,
+            reward_seq=torch.zeros_like(y).unsqueeze(1),
+            q_target_scalar=y.unsqueeze(1),
+            bins=m.skill_arg_q_head.bins,
+            gamma=1.0,
+        )
+        combo = self._combo_skillarg_q_loss(b_q)
+        loss_q = (
+            loss_q_td
+            + self.cfg.lambda_q_cql_policy * combo['loss_q_cql_policy']
+            + self.cfg.lambda_q_rank_data * combo['loss_q_rank_data']
+        )
+        self.opt_q.zero_grad()
+        loss_q.backward()
+        nn.utils.clip_grad_norm_(m.skill_arg_q_head.parameters(),
+                                 self.cfg.grad_clip)
+        self.opt_q.step()
+        m.soft_update_target_Q()
+
+        pi_active = float(self.step >= self.cfg.pi_update_start)
+        if pi_active:
+            loss_pi, pi_info = self._skillarg_actor_loss(
+                b_pi['z'], b_pi['h'], b_pi)
+            self.opt_pi.zero_grad()
+            loss_pi.backward()
+            nn.utils.clip_grad_norm_(
+                self.opt_pi.param_groups[0]['params'], self.cfg.grad_clip)
+            self.opt_pi.step()
+        else:
+            loss_pi = z.new_tensor(0.0)
+            pi_info = {
+                'q_pi': z.new_zeros(z.shape[0]),
+                'kl_d': z.new_zeros(z.shape[0]),
+                'kl_z': z.new_zeros(z.shape[0]),
+                'loss_elite_bc': z.new_tensor(0.0),
+            }
+
+        q_data = combo['q_data']
+        q_policy = combo['q_policy']
+        return {
+            'loss_reward': loss_r.item(),
+            'loss_q': loss_q.item(),
+            'loss_q_td': loss_q_td.item(),
+            'loss_q_cql_policy': combo['loss_q_cql_policy'].item(),
+            'loss_q_rank_data': combo['loss_q_rank_data'].item(),
+            'loss_q_rank_bc': combo['loss_q_rank_bc'].item(),
+            'loss_q_rank_lqr': combo['loss_q_rank_lqr'].item(),
+            'loss_pi': loss_pi.item(),
+            'loss_lqr_pi': 0.0,
+            'loss_bc_pi': 0.0,
+            'loss_elite_bc_pi': pi_info['loss_elite_bc'].item(),
+            'loss_skilldec_anchor': (
+                self.cfg.skill_arg_alpha_d * pi_info['kl_d'].mean()
+                + self.cfg.skill_arg_alpha_z * pi_info['kl_z'].mean()
+            ).item(),
+            'skilldec_anchor_w': 0.0,
+            'q_mean': pi_info['q_pi'].detach().mean().item(),
+            'q_policy_cql': q_policy.detach().mean().item(),
+            'q_data': q_data.detach().mean().item(),
+            'rho': m.scale_tracker.rho,
+            'r_hat': r_hat.detach().mean().item(),
+            'q_reward': r_targ.detach().mean().item(),
+            'q_target': y.detach().mean().item(),
+            'q_next': q_next.detach().mean().item(),
+            'pi_active': pi_active,
+            'elite_size': float(self.elite_size),
+        }
+
     def update(self) -> Dict[str, float]:
         if self.buf.size < self.cfg.batch_size:
             return {}
@@ -909,6 +1286,9 @@ class PolicyPriorOnlineTrainer:
         nn.utils.clip_grad_norm_(m.reward_ensemble_head.parameters(),
                                  self.cfg.grad_clip)
         self.opt_reward.step()
+
+        if self.actor_mode == 'skill_arg':
+            return self._update_skill_arg_q_pi(b_q, b_pi, loss_r)
 
         with torch.no_grad():
             r_q, r_hat = self._q_reward(z, u, r)
@@ -1286,6 +1666,16 @@ def prefill_prior_buffer_from_offline(trainer: PolicyPriorOnlineTrainer,
             if n_chunk > 0:
                 a_chunk[:n_chunk] = acts[t:t + n_chunk]
                 chunk_mask[:n_chunk] = 1.0
+            skill_logits_t = model.skill_prior(h_pre_ep[t:t + 1])
+            skill_id_t = int(skill_logits_t.argmax(dim=-1).item())
+            skill_oh_t = F.one_hot(
+                torch.tensor([skill_id_t], device=dev),
+                num_classes=model.cfg.num_skills,
+            ).float()
+            a_chunk_t = torch.FloatTensor(a_chunk).unsqueeze(0).to(dev)
+            _, arg_mu_t, _ = model.skill_argument_encoder(
+                z_ep[t:t + 1], h_pre_ep[t:t + 1], skill_oh_t, a_chunk_t)
+            skill_arg_t = torch.tanh(arg_mu_t)[0].detach().cpu().numpy()
 
             n_avail = min(n_step, (L - 1) - t)
             r_ret = 0.0
@@ -1311,6 +1701,9 @@ def prefill_prior_buffer_from_offline(trainer: PolicyPriorOnlineTrainer,
                 u_lqr=u_lqr_np[t],
                 u_lqr_aux=u_aux_np[t],
                 has_lqr=has_lqr_np[t],
+                skill_id=skill_id_t,
+                skill_arg=skill_arg_t,
+                has_skill_arg=1.0,
                 source=1.0,
             )
             n_added += 1
@@ -1887,6 +2280,10 @@ def train_policy_prior_online(cfg: OnlineConfig,
           f"q_w={cfg.pi_q_weight:.2f} bc={cfg.lambda_bc_pi:.3f} "
           f"ebc={cfg.lambda_elite_bc_pi:.3f} "
           f"anchor={cfg.lambda_skilldec_anchor:.3f}->{cfg.skilldec_anchor_min:.3f}")
+    if cfg.actor_mode == 'skill_arg':
+        print(f"  skill-arg SAC alpha_d={cfg.skill_arg_alpha_d:.3f} "
+              f"alpha_z={cfg.skill_arg_alpha_z:.3f} "
+              "critic=Q(z,h,arg,d)")
     print(f"  elite buffer size={cfg.elite_buffer_size} "
           f"threshold={cfg.elite_reward_threshold:.2f}")
     print(f"{'='*60}\n")
@@ -1922,6 +2319,132 @@ def train_policy_prior_online(cfg: OnlineConfig,
         )
         a_seq_np, u_seq_np = trainer.act_sequence(
             z_plan.clone(), h_plan.clone(), horizon=exec_h)
+        skillarg_meta = trainer.last_skillarg_meta()
+
+        if cfg.actor_mode == 'skill_arg':
+            z_start = z_plan.cpu().numpy()[0].copy()
+            h_start = h_plan.cpu().numpy()[0].copy()
+            exec_actions: List[np.ndarray] = []
+            exec_us: List[np.ndarray] = []
+            exec_rewards: List[float] = []
+            z_final = None
+            h_final = None
+            done_chunk = False
+
+            for a_np, u_np in zip(a_seq_np, u_seq_np):
+                cur_step = ctx.current_latent()
+                if cur_step is None or global_step >= cfg.n_env_steps:
+                    break
+                obs_nx, r_env, done, info = env.step(a_np.clip(-1, 1))
+                ctx.step(obs_nx, a_np)
+
+                ep_r += r_env
+                ep_c = info.get('episode_task_completions',
+                                info.get('completed_tasks', []))
+                ep_tasks = max(ep_tasks, len(ep_c) if isinstance(ep_c, list)
+                               else int(ep_c) if ep_c is not None else 0)
+
+                exec_actions.append(np.asarray(a_np, dtype=np.float32).copy())
+                exec_us.append(np.asarray(u_np, dtype=np.float32).copy())
+                exec_rewards.append(float(r_env > 0.0))
+                nxt = ctx.current_latent()
+                if nxt is not None:
+                    z_next_t, h_next_t = nxt
+                    z_final = z_next_t.cpu().numpy()[0].copy()
+                    h_final = h_next_t.cpu().numpy()[0].copy()
+                obs = obs_nx
+                global_step += 1
+                trainer.step = global_step
+                done_chunk = bool(done)
+                if done:
+                    break
+
+            if exec_actions and z_final is not None:
+                H_exec = len(exec_actions)
+                r_ret = sum(
+                    (cfg.q_n_step_gamma ** j) * exec_rewards[j]
+                    for j in range(H_exec)
+                )
+                chunk_mask = np.ones(H_exec, dtype=np.float32)
+                trans = {
+                    'z': z_start,
+                    'h': h_start,
+                    'u': exec_us[0],
+                    'a': exec_actions[0],
+                    'a_chunk': np.stack(exec_actions, axis=0),
+                    'chunk_mask': chunk_mask,
+                    'r': exec_rewards[0],
+                    'r_return': float(r_ret),
+                    'z_next': z_final,
+                    'h_next': h_final,
+                    'z_boot': z_final,
+                    'h_boot': h_final,
+                    'discount': float(
+                        0.0 if done_chunk else cfg.q_n_step_gamma ** H_exec),
+                    'done': float(done_chunk),
+                    'skill_id': (
+                        None if 'skill_id' not in skillarg_meta
+                        else int(np.asarray(skillarg_meta['skill_id']).reshape(-1)[0])
+                    ),
+                    'skill_arg': (
+                        None if 'skill_arg' not in skillarg_meta
+                        else np.asarray(skillarg_meta['skill_arg'],
+                                        dtype=np.float32).reshape(-1).copy()
+                    ),
+                    'has_skill_arg': 1.0 if 'skill_arg' in skillarg_meta else 0.0,
+                    'source': 0.0,
+                }
+                trainer.buf.add(**trans)
+                episode_transitions.append(trans)
+
+                for _ in range(cfg.n_updates_per_step * H_exec):
+                    info_d = trainer.update()
+                    for k, v in info_d.items():
+                        if k in recent:
+                            recent[k].append(v)
+
+            if done_chunk:
+                recent['ep_reward'].append(ep_r)
+                recent['ep_tasks'].append(ep_tasks)
+                added = trainer.add_elite_episode(episode_transitions, ep_r)
+                if added > 0:
+                    recent['elite_ep_reward'].append(ep_r)
+                    recent['elite_added'].append(float(added))
+                obs = env.reset()
+                ctx.reset(obs)
+                ep_r = 0.0
+                ep_tasks = 0
+                episode_transitions = []
+
+            if global_step % cfg.log_every < max(1, len(exec_actions)):
+                trainer.step = global_step
+                ms = {k: np.mean(list(v)) if v else 0.0
+                      for k, v in recent.items()}
+                sps = cfg.log_every / (time.time() - t0 + 1e-6)
+                t0 = time.time()
+                print(f"Step {global_step:7d} | "
+                      f"R={ms['loss_reward']:.3f} Q={ms['loss_q']:.3f} "
+                      f"TD={ms['loss_q_td']:.3f} CQ={ms['loss_q_cql_policy']:.3f} "
+                      f"RD={ms['loss_q_rank_data']:.3f} "
+                      f"Pi={ms['loss_pi']:.3f} Anc={ms['loss_skilldec_anchor']:.3f} "
+                      f"EBC={ms['loss_elite_bc_pi']:.3f} "
+                      f"Aw={ms['skilldec_anchor_w']:.2f} "
+                      f"q={ms['q_mean']:.3f} "
+                      f"qd={ms['q_data']:.3f} rho={ms['rho']:.3f} rhat={ms['r_hat']:.3f} "
+                      f"rQ={ms['q_reward']:.3f} y={ms['q_target']:.3f} "
+                      f"pi={ms['pi_active']:.0f} | "
+                      f"ep_r={ms['ep_reward']:.2f} tasks={ms['ep_tasks']:.2f} | "
+                      f"elite={trainer.elite_size} epr={ms['elite_ep_reward']:.2f} | "
+                      f"{sps:.0f}sps")
+                if use_wandb:
+                    wandb.log({f"prior_online/{k}": v for k, v in ms.items()},
+                              step=global_step)
+
+            if global_step % cfg.save_every < max(1, len(exec_actions)):
+                trainer.step = global_step
+                trainer.save(f"{out_dir}/policy_prior_online_step{global_step}.pt")
+
+            continue
 
         for a_np, u_np in zip(a_seq_np, u_seq_np):
             cur_step = ctx.current_latent()
@@ -1966,6 +2489,15 @@ def train_policy_prior_online(cfg: OnlineConfig,
                     'u_lqr': None if u_lqr is None else np.asarray(u_lqr, dtype=np.float32).copy(),
                     'u_lqr_aux': None if u_lqr_aux is None else np.asarray(u_lqr_aux, dtype=np.float32).copy(),
                     'has_lqr': has_lqr,
+                    'skill_id': (
+                        None if 'skill_id' not in skillarg_meta
+                        else int(np.asarray(skillarg_meta['skill_id']).reshape(-1)[0])
+                    ),
+                    'skill_arg': (
+                        None if 'skill_arg' not in skillarg_meta
+                        else np.asarray(skillarg_meta['skill_arg'], dtype=np.float32).reshape(-1).copy()
+                    ),
+                    'has_skill_arg': 1.0 if 'skill_arg' in skillarg_meta else 0.0,
                     'source': 0.0,
                 }
                 trainer.buf.add(
@@ -2107,6 +2639,8 @@ def main():
     p.add_argument('--lambda_skilldec_anchor', type=float, default=0.0)
     p.add_argument('--skilldec_anchor_min', type=float, default=0.0)
     p.add_argument('--skilldec_anchor_decay_steps', type=int, default=200_000)
+    p.add_argument('--skill_arg_alpha_d', type=float, default=0.1)
+    p.add_argument('--skill_arg_alpha_z', type=float, default=0.01)
     p.add_argument('--lambda_lqr_pi',     type=float, default=0.0)
     p.add_argument('--lqr_horizon',       type=int,   default=4)
     p.add_argument('--lqr_aux_k',         type=int,   default=4)
@@ -2210,6 +2744,8 @@ def main():
         lambda_skilldec_anchor=args.lambda_skilldec_anchor,
         skilldec_anchor_min=args.skilldec_anchor_min,
         skilldec_anchor_decay_steps=args.skilldec_anchor_decay_steps,
+        skill_arg_alpha_d=args.skill_arg_alpha_d,
+        skill_arg_alpha_z=args.skill_arg_alpha_z,
         lambda_lqr_pi=args.lambda_lqr_pi,
         lqr_horizon=args.lqr_horizon,
         lqr_aux_k=args.lqr_aux_k,

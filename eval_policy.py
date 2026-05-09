@@ -8,6 +8,7 @@ os.environ.setdefault('MUJOCO_GL', 'egl')
 import argparse
 import numpy as np
 import torch
+import torch.nn.functional as F
 import matplotlib; matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from pathlib import Path
@@ -261,7 +262,11 @@ class PolicyWrapper:
         elif self.mode == 'skill_arg':
             if h_t is None:
                 raise ValueError("h_t is required for skill_arg mode")
-            w = self._model.skill_prior.soft_weights(h_t)
+            prior_logits = self._model.skill_prior(h_t).detach()
+            logits_d = self._model.skill_discrete_policy(z_t, h_t, prior_logits)
+            skill_id = logits_d.argmax(dim=-1)
+            w = F.one_hot(
+                skill_id, num_classes=self._model.cfg.num_skills).float()
             arg = self._model.skill_argument_policy.mean_arg(z_t, h_t, w)
             a_seq = self._model.skill_argument_decoder(z_t, h_t, w, arg)
             return a_seq[0].cpu().numpy()
@@ -288,6 +293,11 @@ class PolicyWrapper:
         if self.mode == 'skill_decoder':
             a_seq = self._model.skill_action_decoder(z_now, h, w)
         else:
+            prior_logits = self._model.skill_prior(h).detach()
+            logits_d = self._model.skill_discrete_policy(z_now, h, prior_logits)
+            skill_id = logits_d.argmax(dim=-1)
+            w = F.one_hot(
+                skill_id, num_classes=self._model.cfg.num_skills).float()
             arg = self._model.skill_argument_policy.mean_arg(z_now, h, w)
             a_seq = self._model.skill_argument_decoder(z_now, h, w, arg)
         return a_seq[0].cpu().numpy()

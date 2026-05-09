@@ -154,6 +154,9 @@ class KoopmanCVAEConfig:
     lambda_skill_arg_decoder:    float = 0.0
     lambda_skill_arg_kl:         float = 1e-3
     lambda_skill_arg_policy:     float = 1.0
+    use_skill_arg_q:             bool  = False
+    skill_arg_q_hidden:          int   = 512
+    skill_arg_q_layers:          int   = 3
 
     # ── v5 Policy prior ───────────────────────────────────────────────────────
     entropy_coef:  float = 0.01   # entropy regularization (α)
@@ -739,15 +742,24 @@ class SkillArgumentPolicy(nn.Module):
         self.log_std_min = cfg.log_std_min
         self.log_std_dif = cfg.log_std_max - cfg.log_std_min
 
+    def dist_params(
+        self,
+        o: torch.Tensor,
+        h: torch.Tensor,
+        skill_prob: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        out = self.net(torch.cat([o, h, skill_prob], dim=-1))
+        mean, log_std_raw = out.chunk(2, dim=-1)
+        log_std = torch.sigmoid(log_std_raw) * self.log_std_dif + self.log_std_min
+        return mean, log_std
+
     def forward(
         self,
         o: torch.Tensor,
         h: torch.Tensor,
         skill_prob: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        out = self.net(torch.cat([o, h, skill_prob], dim=-1))
-        mean, log_std_raw = out.chunk(2, dim=-1)
-        log_std = torch.sigmoid(log_std_raw) * self.log_std_dif + self.log_std_min
+        mean, log_std = self.dist_params(o, h, skill_prob)
         eps = torch.randn_like(mean)
         raw = mean + eps * log_std.exp()
         arg = torch.tanh(raw)
@@ -765,9 +777,31 @@ class SkillArgumentPolicy(nn.Module):
         h: torch.Tensor,
         skill_prob: torch.Tensor,
     ) -> torch.Tensor:
-        out = self.net(torch.cat([o, h, skill_prob], dim=-1))
-        mean, _ = out.chunk(2, dim=-1)
+        mean, _ = self.dist_params(o, h, skill_prob)
         return torch.tanh(mean)
+
+
+class SkillDiscretePolicy(nn.Module):
+    """Residual skill selector pi_d(d|o,h), initialized as the frozen skill prior."""
+
+    def __init__(self, cfg: 'KoopmanCVAEConfig'):
+        super().__init__()
+        self.cfg = cfg
+        in_dim = cfg.koopman_dim + cfg.gru_hidden
+        hidden = int(getattr(cfg, 'skill_arg_hidden', cfg.mlp_hidden))
+        layers = int(getattr(cfg, 'skill_arg_layers', 3))
+        self.residual = make_mlp(in_dim, cfg.num_skills, hidden, layers, cfg.dropout)
+        if isinstance(self.residual[-1], nn.Linear):
+            nn.init.zeros_(self.residual[-1].weight)
+            nn.init.zeros_(self.residual[-1].bias)
+
+    def forward(
+        self,
+        o: torch.Tensor,
+        h: torch.Tensor,
+        prior_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        return prior_logits.detach() + self.residual(torch.cat([o, h], dim=-1))
 
 
 class SkillArgumentActionDecoder(nn.Module):
@@ -799,6 +833,77 @@ class SkillArgumentActionDecoder(nn.Module):
         x = torch.cat([o, h, skill_prob, arg], dim=-1)
         out = self.net(x)
         return out.reshape(*x.shape[:-1], self.H, self.cfg.action_dim)
+
+
+class SkillArgQHead(nn.Module):
+    """Q(o,h,arg,d): ensemble critic with one categorical output head per skill."""
+
+    def __init__(self, cfg: 'KoopmanCVAEConfig'):
+        super().__init__()
+        arg_dim = int(getattr(cfg, 'skill_arg_dim', 16))
+        in_dim = cfg.koopman_dim + cfg.gru_hidden + arg_dim
+        hidden = int(getattr(cfg, 'skill_arg_q_hidden',
+                             getattr(cfg, 'skill_arg_hidden', cfg.mlp_hidden)))
+        layers = int(getattr(cfg, 'skill_arg_q_layers',
+                             getattr(cfg, 'skill_arg_layers', 3)))
+        out_dim = cfg.num_skills * cfg.num_bins
+        self.nets = nn.ModuleList([
+            make_mlp(in_dim, out_dim, hidden, layers, cfg.dropout)
+            for _ in range(cfg.num_q)
+        ])
+        for net in self.nets:
+            nn.init.zeros_(net[-1].weight)
+            nn.init.zeros_(net[-1].bias)
+        self.register_buffer('bins', torch.linspace(cfg.v_min, cfg.v_max,
+                                                    cfg.num_bins))
+        self.num_q = cfg.num_q
+        self.num_skills = cfg.num_skills
+        self.num_bins = cfg.num_bins
+
+    def forward(self, o: torch.Tensor, h: torch.Tensor,
+                arg: torch.Tensor) -> torch.Tensor:
+        x = torch.cat([o, h, arg], dim=-1)
+        logits = [
+            net(x).reshape(*x.shape[:-1], self.num_skills, self.num_bins)
+            for net in self.nets
+        ]
+        return torch.stack(logits, dim=0)  # (num_q, ..., K, B)
+
+    def gather_skill_logits(
+        self,
+        o: torch.Tensor,
+        h: torch.Tensor,
+        arg: torch.Tensor,
+        skill_id: torch.Tensor,
+    ) -> torch.Tensor:
+        logits = self.forward(o, h, arg)
+        idx = skill_id.long().to(o.device)
+        base_shape = idx.shape
+        gather_shape = (1,) + base_shape + (1, 1)
+        idx = idx.reshape(gather_shape).expand(
+            logits.shape[0], *base_shape, 1, self.num_bins)
+        return logits.gather(-2, idx).squeeze(-2)
+
+    def expected_value(
+        self,
+        o: torch.Tensor,
+        h: torch.Tensor,
+        arg: torch.Tensor,
+        skill_id: Optional[torch.Tensor] = None,
+        return_type: str = 'min',
+    ) -> torch.Tensor:
+        logits = (
+            self.gather_skill_logits(o, h, arg, skill_id)
+            if skill_id is not None else self.forward(o, h, arg)
+        )
+        values = two_hot_decode(logits, self.bins)
+        if return_type == 'all':
+            return values
+        idx = torch.randperm(self.num_q, device=o.device)[:min(2, self.num_q)]
+        vals = values[idx]
+        if return_type == 'min':
+            return vals.min(0).values
+        return vals.mean(0)
 
 
 class GoalProposalPolicy(nn.Module):
@@ -913,8 +1018,10 @@ class KoopmanCVAE(nn.Module):
         self.policy_prior        = PolicyPrior(cfg)
         self.skill_action_decoder = SkillActionDecoder(cfg)
         self.skill_argument_encoder = SkillArgumentEncoder(cfg)
+        self.skill_discrete_policy = SkillDiscretePolicy(cfg)
         self.skill_argument_policy = SkillArgumentPolicy(cfg)
         self.skill_argument_decoder = SkillArgumentActionDecoder(cfg)
+        self.skill_arg_q_head = SkillArgQHead(cfg)
 
         # ── Q network: three versions (TD-MPC2 §H pattern) ───────────────
         #
@@ -942,6 +1049,15 @@ class KoopmanCVAE(nn.Module):
         # params are synced manually before policy loss (no EMA — exact copy each step)
         # requires_grad=False so gradient does NOT flow into Q weights from policy loss
         for p in self._detach_q_head.parameters():
+            p.requires_grad_(False)
+
+        self.skill_arg_q_head_target = deepcopy(self.skill_arg_q_head)
+        for p in self.skill_arg_q_head_target.parameters():
+            p.requires_grad_(False)
+        self.skill_arg_q_head_target.eval()
+
+        self._detach_skill_arg_q_head = deepcopy(self.skill_arg_q_head)
+        for p in self._detach_skill_arg_q_head.parameters():
             p.requires_grad_(False)
 
         # LQR planner (set externally via model.set_lqr_planner())
@@ -1090,6 +1206,19 @@ class KoopmanCVAE(nn.Module):
             self.q_head.parameters(), self._detach_q_head.parameters()
         ):
             p_detach.data.copy_(p_online.data)
+
+        if hasattr(self, 'skill_arg_q_head'):
+            for p_online, p_target in zip(
+                self.skill_arg_q_head.parameters(),
+                self.skill_arg_q_head_target.parameters(),
+            ):
+                p_target.data.lerp_(p_online.data, tau)
+
+            for p_online, p_detach in zip(
+                self.skill_arg_q_head.parameters(),
+                self._detach_skill_arg_q_head.parameters(),
+            ):
+                p_detach.data.copy_(p_online.data)
 
     # ── Forward ──────────────────────────────────────────────────────────────
 
