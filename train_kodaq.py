@@ -218,6 +218,8 @@ class Trainer:
         'loss_reward', 'loss_q', 'loss_pi', 'loss_lqr_pi', 'loss_goal',
         'loss_skill_decoder', 'loss_skill_decoder_action',
         'loss_skill_decoder_latent',
+        'loss_skill_arg_decoder', 'loss_skill_arg_action',
+        'loss_skill_arg_kl', 'loss_skill_arg_policy',
         # v5 diagnostics
         'rho', 'q_scale',
     ]
@@ -346,12 +348,27 @@ class Trainer:
         for mod in self._skill_decoder_modules():
             yield from mod.parameters()
 
+    def _skill_arg_modules(self):
+        return [
+            self.model.skill_argument_encoder,
+            self.model.skill_argument_decoder,
+            self.model.skill_argument_policy,
+        ]
+
+    def _skill_arg_params(self):
+        for mod in self._skill_arg_modules():
+            yield from mod.parameters()
+
     def _set_all_requires_grad(self, flag: bool):
         for p in self.model.parameters():
             p.requires_grad_(flag)
 
     def _set_skill_decoder_requires_grad(self, flag: bool):
         for p in self._skill_decoder_params():
+            p.requires_grad_(flag)
+
+    def _set_skill_arg_requires_grad(self, flag: bool):
+        for p in self._skill_arg_params():
             p.requires_grad_(flag)
 
     def _set_wm_requires_grad(self, flag: bool):
@@ -465,6 +482,12 @@ class Trainer:
                 line += f"  act={metrics.get('loss_skill_decoder_action', 0.0):.4f}"
                 if metrics.get('loss_skill_decoder_latent', 0.0) != 0.0:
                     line += f"  ulat={metrics['loss_skill_decoder_latent']:.4f}"
+            elif stage_tag == 'skillarg':
+                line += f"  loss={metrics.get('loss', 0.0):.4f}"
+                line += f"  skarg={metrics['loss_skill_arg_decoder']:.4f}"
+                line += f"  act={metrics.get('loss_skill_arg_action', 0.0):.4f}"
+                line += f"  kl={metrics.get('loss_skill_arg_kl', 0.0):.4f}"
+                line += f"  pi={metrics.get('loss_skill_arg_policy', 0.0):.4f}"
             else:
                 for k in ['loss', 'loss_wm', 'loss_rec', 'loss_dyn',
                           'loss_skill', 'loss_reg']:
@@ -479,6 +502,9 @@ class Trainer:
                     line += f"  act={metrics.get('loss_skill_decoder_action', 0.0):.4f}"
                     if metrics.get('loss_skill_decoder_latent', 0.0) != 0.0:
                         line += f"  ulat={metrics['loss_skill_decoder_latent']:.4f}"
+                if metrics.get('loss_skill_arg_decoder', 0.0) != 0.0:
+                    line += f"  skarg={metrics['loss_skill_arg_decoder']:.4f}"
+                    line += f"  act={metrics.get('loss_skill_arg_action', 0.0):.4f}"
             # loss_goal: always show when use_goal_proposal (even if 0 in Phase A)
             if use_goal and 'loss_goal' in metrics:
                 line += f"  goal={metrics['loss_goal']:.4f}"
@@ -529,6 +555,11 @@ class Trainer:
 
         if getattr(self.args, 'train_skill_decoder', False):
             self._train_skill_decoder(train_loader, val_loader, t0)
+            if self.use_wandb:
+                wandb.finish()
+            return
+        if getattr(self.args, 'train_skill_arg_decoder', False):
+            self._train_skill_arg_decoder(train_loader, val_loader, t0)
             if self.use_wandb:
                 wandb.finish()
             return
@@ -596,6 +627,54 @@ class Trainer:
                        stage_tag='skilldec', t0=t0)
 
         print(f"\nSkill decoder training done.  "
+              f"time={(time.time()-t0)/60:.1f}m", flush=True)
+
+    def _train_skill_arg_decoder(self, train_loader, val_loader, t0: float):
+        n_epochs = int(self.args.skill_arg_epochs)
+        lr = float(self.args.skill_arg_lr)
+
+        print(f"\n{'='*60}", flush=True)
+        print("[Skill Argument Decoder] offline EXTRACT-style training",
+              flush=True)
+        print(f"  epochs={n_epochs}  lr={lr}  H={self.model.cfg.skill_decoder_horizon} "
+              f"arg_dim={self.model.cfg.skill_arg_dim}", flush=True)
+        print("  WM/Q/R frozen; train arg_encoder + arg_policy + arg_decoder",
+              flush=True)
+        print(f"{'='*60}", flush=True)
+
+        self._set_all_requires_grad(False)
+        self._set_skill_arg_requires_grad(True)
+        self.train_heads = False
+        self.freeze_world_model = True
+
+        self.model.cfg.use_skill_decoder = False
+        self.model.cfg.use_skill_arg_decoder = True
+        self.model.cfg.lambda_wm = 0.0
+        self.model.cfg.lambda_reward = 0.0
+        self.model.cfg.lambda_q = 0.0
+        self.model.cfg.lambda_pi = 0.0
+        self.model.cfg.lambda_goal = 0.0
+        self.model.cfg.lambda_lqr_pi = 0.0
+        self.model.cfg.lambda_skill_decoder = 0.0
+        self.model.cfg.lambda_skill_arg_decoder = (
+            self.args.lambda_skill_arg_decoder)
+        self.model.cfg.lambda_skill_arg_kl = self.args.lambda_skill_arg_kl
+        self.model.cfg.lambda_skill_arg_policy = (
+            self.args.lambda_skill_arg_policy)
+        self.model.cfg.phase = 3
+        self.phase2_epoch = 0
+        self.phase3_epoch = 0
+
+        self._rebuild_optimizer(self._skill_arg_params(), lr=lr)
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=max(1, n_epochs)
+        )
+
+        self._run_loop(train_loader, val_loader,
+                       n_epochs=n_epochs, epoch_offset=0,
+                       stage_tag='skillarg', t0=t0)
+
+        print(f"\nSkill argument decoder training done.  "
               f"time={(time.time()-t0)/60:.1f}m", flush=True)
 
     def _train_two_stage(self, train_loader, val_loader, t0: float):
@@ -794,6 +873,16 @@ def parse_args():
     p.add_argument('--skill_decoder_no_h', action='store_true')
     p.add_argument('--skill_decoder_no_o', action='store_true')
     p.add_argument('--skill_decoder_no_skill', action='store_true')
+    p.add_argument('--train_skill_arg_decoder', action='store_true',
+                   help='Train EXTRACT-style skill argument decoder/policy.')
+    p.add_argument('--skill_arg_epochs', type=int, default=100)
+    p.add_argument('--skill_arg_lr', type=float, default=1e-4)
+    p.add_argument('--skill_arg_dim', type=int, default=16)
+    p.add_argument('--skill_arg_hidden', type=int, default=512)
+    p.add_argument('--skill_arg_layers', type=int, default=3)
+    p.add_argument('--lambda_skill_arg_decoder', type=float, default=1.0)
+    p.add_argument('--lambda_skill_arg_kl', type=float, default=1e-3)
+    p.add_argument('--lambda_skill_arg_policy', type=float, default=1.0)
 
     # ── resume (two-stage fine-tuning) ──────────────────────────────────
     p.add_argument('--resume_ckpt',        type=str,   default=None,
@@ -894,6 +983,14 @@ if __name__ == '__main__':
     cfg.lambda_skill_decoder = (
         args.lambda_skill_decoder if args.train_skill_decoder else 0.0)
     cfg.lambda_skill_decoder_latent = args.lambda_skill_decoder_latent
+    cfg.use_skill_arg_decoder = args.train_skill_arg_decoder
+    cfg.skill_arg_dim = args.skill_arg_dim
+    cfg.skill_arg_hidden = args.skill_arg_hidden
+    cfg.skill_arg_layers = args.skill_arg_layers
+    cfg.lambda_skill_arg_decoder = (
+        args.lambda_skill_arg_decoder if args.train_skill_arg_decoder else 0.0)
+    cfg.lambda_skill_arg_kl = args.lambda_skill_arg_kl
+    cfg.lambda_skill_arg_policy = args.lambda_skill_arg_policy
     cfg.use_lqr_policy = args.use_lqr_policy
     cfg.lqr_horizon    = args.lqr_horizon
     cfg.lambda_lqr_pi = args.lambda_lqr_pi if args.use_lqr_policy else 0.0
@@ -920,8 +1017,8 @@ if __name__ == '__main__':
 
     # ── Resume: load WM from checkpoint, reset Q/reward_ens/policy ─────────────
     is_resume = (args.resume_ckpt is not None)
-    if args.train_skill_decoder and not is_resume:
-        raise ValueError("--train_skill_decoder requires --resume_ckpt with a trained world model.")
+    if (args.train_skill_decoder or args.train_skill_arg_decoder) and not is_resume:
+        raise ValueError("--train_skill_decoder/--train_skill_arg_decoder require --resume_ckpt.")
     if is_resume:
         print(f"\n[Resume] Loading checkpoint: {args.resume_ckpt}", flush=True)
         ckpt = torch.load(args.resume_ckpt, map_location='cpu')
@@ -987,6 +1084,14 @@ if __name__ == '__main__':
         resume_cfg.lambda_skill_decoder = (
             args.lambda_skill_decoder if args.train_skill_decoder else 0.0)
         resume_cfg.lambda_skill_decoder_latent = args.lambda_skill_decoder_latent
+        resume_cfg.use_skill_arg_decoder = args.train_skill_arg_decoder
+        resume_cfg.skill_arg_dim = args.skill_arg_dim
+        resume_cfg.skill_arg_hidden = args.skill_arg_hidden
+        resume_cfg.skill_arg_layers = args.skill_arg_layers
+        resume_cfg.lambda_skill_arg_decoder = (
+            args.lambda_skill_arg_decoder if args.train_skill_arg_decoder else 0.0)
+        resume_cfg.lambda_skill_arg_kl = args.lambda_skill_arg_kl
+        resume_cfg.lambda_skill_arg_policy = args.lambda_skill_arg_policy
         resume_cfg.phase               = 3
         cfg = resume_cfg
 
@@ -1052,6 +1157,16 @@ if __name__ == '__main__':
             print(f"  Skill decoder resume:", flush=True)
             print(f"    decoder-only epochs={args.skill_decoder_epochs} "
                   f"lr={args.skill_decoder_lr} H={args.skill_decoder_horizon}",
+                  flush=True)
+        elif args.train_skill_arg_decoder:
+            args.resume_stage = None
+            args.phase2_epoch = 0
+            args.phase3_epoch = 0
+            args.epochs = args.skill_arg_epochs
+            args.lr = args.skill_arg_lr
+            print(f"  Skill argument decoder resume:", flush=True)
+            print(f"    epochs={args.skill_arg_epochs} lr={args.skill_arg_lr} "
+                  f"H={args.skill_decoder_horizon} arg_dim={args.skill_arg_dim}",
                   flush=True)
         else:
             args.resume_stage  = 'two_stage'

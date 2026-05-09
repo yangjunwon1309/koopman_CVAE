@@ -195,6 +195,23 @@ class PolicyWrapper:
         pw.H_lo = H
         return pw, model, None
 
+    @classmethod
+    def load_skill_arg(cls, world_ckpt, device):
+        dev = device
+        print(f"\n[SkillArg] world: {world_ckpt}")
+        wc    = torch.load(world_ckpt, map_location=dev)
+        model = KoopmanCVAE(wc['cfg'])
+        model.load_state_dict(wc['model_state'], strict=False)
+        model.eval().to(dev)
+        H = int(getattr(model.cfg, 'skill_decoder_horizon', 4))
+        arg_dim = int(getattr(model.cfg, 'skill_arg_dim', 16))
+        print(f"  m={model.cfg.koopman_dim}  h={model.cfg.gru_hidden}  "
+              f"H={H}  arg_dim={arg_dim}  action_dim={model.cfg.action_dim}")
+        pw = cls('skill_arg', device)
+        pw._model = model
+        pw.H_lo = H
+        return pw, model, None
+
     @torch.no_grad()
     def _prior_u(self, z_t):
         if self._deterministic:
@@ -241,6 +258,13 @@ class PolicyWrapper:
             w = self._model.skill_prior.soft_weights(h_t)
             a_seq = self._model.skill_action_decoder(z_t, h_t, w)
             return a_seq[0].cpu().numpy()
+        elif self.mode == 'skill_arg':
+            if h_t is None:
+                raise ValueError("h_t is required for skill_arg mode")
+            w = self._model.skill_prior.soft_weights(h_t)
+            arg = self._model.skill_argument_policy.mean_arg(z_t, h_t, w)
+            a_seq = self._model.skill_argument_decoder(z_t, h_t, w, arg)
+            return a_seq[0].cpu().numpy()
         else:
             trainer = self._trainer; cfg = self._cfg
             if self._hi_timer == 0:
@@ -252,16 +276,20 @@ class PolicyWrapper:
 
     @torch.no_grad()
     def act_from_context(self, ctx):
-        if self.mode != 'skill_decoder':
+        if self.mode not in ('skill_decoder', 'skill_arg'):
             return self.act(ctx.z_t, ctx.h_t)
         if ctx.h_t is None or not ctx.obs_buf:
-            raise ValueError("EnvContext is not ready for skill_decoder mode")
+            raise ValueError(f"EnvContext is not ready for {self.mode} mode")
         dev = torch.device(self.device)
         h = ctx.h_t.to(dev)
         x_now = torch.FloatTensor(ctx._obs_to_x(ctx.obs_buf[-1])).unsqueeze(0).to(dev)
         z_now, _, _ = self._model.posterior.sample(x_now, h)
         w = self._model.skill_prior.soft_weights(h)
-        a_seq = self._model.skill_action_decoder(z_now, h, w)
+        if self.mode == 'skill_decoder':
+            a_seq = self._model.skill_action_decoder(z_now, h, w)
+        else:
+            arg = self._model.skill_argument_policy.mean_arg(z_now, h, w)
+            a_seq = self._model.skill_argument_decoder(z_now, h, w, arg)
         return a_seq[0].cpu().numpy()
 
     @property
@@ -566,7 +594,7 @@ def analyze_reward_distribution(results_with_extra, wm, out_path, device):
 
 def main():
     p=argparse.ArgumentParser()
-    p.add_argument('--mode',        choices=['iql','online','prior','skill_decoder'], default='online')
+    p.add_argument('--mode',        choices=['iql','online','prior','skill_decoder','skill_arg'], default='online')
     p.add_argument('--world_ckpt',  required=True)
     p.add_argument('--policy_ckpt', default=None)
     p.add_argument('--cat_ckpt',    default=None)
@@ -600,6 +628,10 @@ def main():
         cond_len=OnlineConfig().cond_len
     elif args.mode=='skill_decoder':
         policy, model, wm = PolicyWrapper.load_skill_decoder(
+            args.world_ckpt, args.device)
+        cond_len=OnlineConfig().cond_len
+    elif args.mode=='skill_arg':
+        policy, model, wm = PolicyWrapper.load_skill_arg(
             args.world_ckpt, args.device)
         cond_len=OnlineConfig().cond_len
     else:

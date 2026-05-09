@@ -592,10 +592,10 @@ class PolicyPriorOnlineTrainer:
         self.action_inv_lr = action_inv_lr
         self.lqr_planner = lqr_planner
         self.actor_mode = cfg.actor_mode.lower()
-        if self.actor_mode not in ('policy_prior', 'skill_decoder'):
+        if self.actor_mode not in ('policy_prior', 'skill_decoder', 'skill_arg'):
             raise ValueError(
                 f"Unknown actor_mode={cfg.actor_mode!r}; "
-                "expected policy_prior or skill_decoder")
+                "expected policy_prior, skill_decoder, or skill_arg")
         skill_h = int(getattr(model.cfg, 'skill_decoder_horizon',
                               cfg.skilldec_exec_horizon))
         self.buf = PriorReplayBuffer(
@@ -609,12 +609,19 @@ class PolicyPriorOnlineTrainer:
         self.skill_decoder_anchor.to(device).eval()
         for p in self.skill_decoder_anchor.parameters():
             p.requires_grad_(False)
+        self.skill_arg_policy_anchor = copy.deepcopy(model.skill_argument_policy)
+        self.skill_arg_policy_anchor.to(device).eval()
+        for p in self.skill_arg_policy_anchor.parameters():
+            p.requires_grad_(False)
 
         for p in model.parameters():
             p.requires_grad_(False)
-        actor_mod = (model.skill_action_decoder
-                     if self.actor_mode == 'skill_decoder'
-                     else model.policy_prior)
+        if self.actor_mode == 'skill_decoder':
+            actor_mod = model.skill_action_decoder
+        elif self.actor_mode == 'skill_arg':
+            actor_mod = model.skill_argument_policy
+        else:
+            actor_mod = model.policy_prior
         for mod in [model.reward_ensemble_head, model.q_head, actor_mod]:
             for p in mod.parameters():
                 p.requires_grad_(True)
@@ -665,6 +672,20 @@ class PolicyPriorOnlineTrainer:
                 ).clamp(-1.0, 1.0)
             u_seq = self.model.action_encoder(a_seq)
             return a_seq.cpu().numpy(), u_seq.detach().cpu().numpy()
+        if self.actor_mode == 'skill_arg':
+            if h is None:
+                raise ValueError("h is required when actor_mode=skill_arg")
+            w = self.model.skill_prior.soft_weights(h)
+            arg, _, _, _ = self.model.skill_argument_policy(z, h, w)
+            a_seq = self.model.skill_argument_decoder(z, h, w, arg)[0].clamp(-1.0, 1.0)
+            n = max(1, int(horizon or self.cfg.skilldec_exec_horizon))
+            a_seq = a_seq[:min(n, a_seq.shape[0])]
+            if self.cfg.action_noise_std > 0.0:
+                a_seq = (
+                    a_seq + self.cfg.action_noise_std * torch.randn_like(a_seq)
+                ).clamp(-1.0, 1.0)
+            u_seq = self.model.action_encoder(a_seq)
+            return a_seq.cpu().numpy(), u_seq.detach().cpu().numpy()
         u, _, _, _ = self.model.policy_prior(z)
         a = self.decode_action(u)
         return a[None], u[0:1].detach().cpu().numpy()
@@ -685,6 +706,23 @@ class PolicyPriorOnlineTrainer:
         dec = self.skill_decoder_anchor if anchor else self.model.skill_action_decoder
         return dec(z, h, w)
 
+    def _skillarg_action_seq(
+        self,
+        z: torch.Tensor,
+        h: torch.Tensor,
+        anchor: bool = False,
+        deterministic: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        w = self.model.skill_prior.soft_weights(h)
+        policy = self.skill_arg_policy_anchor if anchor else self.model.skill_argument_policy
+        if anchor or deterministic:
+            arg = policy.mean_arg(z, h, w)
+            log_pi = None
+        else:
+            arg, log_pi, _, _ = policy(z, h, w)
+        a_seq = self.model.skill_argument_decoder(z, h, w, arg)
+        return a_seq, arg, log_pi
+
     def _actor_u_for_q(
         self,
         z: torch.Tensor,
@@ -695,6 +733,13 @@ class PolicyPriorOnlineTrainer:
             if h is None:
                 raise ValueError("h is required when actor_mode=skill_decoder")
             a_seq = self._skilldec_action_seq(z, h, anchor=False)
+            a0 = a_seq[:, 0].clamp(-1.0, 1.0)
+            return self.model.action_encoder(a0)
+        if self.actor_mode == 'skill_arg':
+            if h is None:
+                raise ValueError("h is required when actor_mode=skill_arg")
+            a_seq, _, _ = self._skillarg_action_seq(
+                z, h, anchor=False, deterministic=deterministic)
             a0 = a_seq[:, 0].clamp(-1.0, 1.0)
             return self.model.action_encoder(a0)
         if deterministic:
@@ -922,6 +967,20 @@ class PolicyPriorOnlineTrainer:
             loss_anchor = (a_pi_seq - a_anchor_seq).pow(2).mean()
             loss_elite_bc = self._elite_chunk_bc_loss(a_pi_seq, b_pi)
             anchor_w = self._anchor_weight()
+        elif self.actor_mode == 'skill_arg':
+            a_pi_seq, arg_pi, log_pi = self._skillarg_action_seq(
+                z_pi, h_pi, anchor=False, deterministic=False)
+            u_pi = m.action_encoder(a_pi_seq[:, 0].clamp(-1.0, 1.0))
+            u_mean = u_pi
+            with torch.no_grad():
+                a_anchor_seq, arg_anchor, _ = self._skillarg_action_seq(
+                    z_pi, h_pi, anchor=True, deterministic=True)
+            loss_anchor = (
+                (a_pi_seq - a_anchor_seq).pow(2).mean()
+                + 0.1 * (arg_pi - arg_anchor).pow(2).mean()
+            )
+            loss_elite_bc = self._elite_chunk_bc_loss(a_pi_seq, b_pi)
+            anchor_w = self._anchor_weight()
         else:
             u_pi, log_pi, mu_pi, _ = m.policy_prior(z_pi)
             u_mean = torch.tanh(mu_pi)
@@ -938,7 +997,7 @@ class PolicyPriorOnlineTrainer:
         loss_bc = self._bc_reg_loss(u_mean, b_pi)
         pi_active = float(self.step >= self.cfg.pi_update_start)
         if pi_active:
-            if self.actor_mode == 'skill_decoder':
+            if self.actor_mode in ('skill_decoder', 'skill_arg'):
                 loss_pi = (
                     -self.cfg.pi_q_weight * q_pi * m.scale_tracker.rho
                 ).mean() + anchor_w * loss_anchor
@@ -946,6 +1005,8 @@ class PolicyPriorOnlineTrainer:
                     loss_pi
                     + self.cfg.lambda_elite_bc_pi * loss_elite_bc
                 )
+                if log_pi is not None:
+                    loss_pi = loss_pi + m.cfg.entropy_coef * log_pi.mean()
             else:
                 log_pi_eff = log_pi
                 if log_pi_eff.dim() > q_pi.dim():
@@ -1854,7 +1915,11 @@ def train_policy_prior_online(cfg: OnlineConfig,
             continue
 
         z_plan, h_plan = cur
-        exec_h = cfg.skilldec_exec_horizon if cfg.actor_mode == 'skill_decoder' else 1
+        exec_h = (
+            cfg.skilldec_exec_horizon
+            if cfg.actor_mode in ('skill_decoder', 'skill_arg')
+            else 1
+        )
         a_seq_np, u_seq_np = trainer.act_sequence(
             z_plan.clone(), h_plan.clone(), horizon=exec_h)
 
@@ -2026,7 +2091,7 @@ def main():
                    default='env')
     p.add_argument('--q_bootstrap', type=float, default=0.0)
     p.add_argument('--pi_update_start', type=int, default=10_000)
-    p.add_argument('--actor_mode', choices=['policy_prior', 'skill_decoder'],
+    p.add_argument('--actor_mode', choices=['policy_prior', 'skill_decoder', 'skill_arg'],
                    default='policy_prior')
     p.add_argument('--pi_q_weight', type=float, default=1.0)
     p.add_argument('--action_noise_std', type=float, default=0.0)

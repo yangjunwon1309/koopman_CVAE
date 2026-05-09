@@ -143,6 +143,18 @@ class KoopmanCVAEConfig:
     lambda_skill_decoder_latent: float = 0.0
     skill_decoder_detach_latents: bool = True
 
+    # EXTRACT-style skill argument decoder. Offline learns:
+    #   encoder q(arg | state, skill, action chunk)
+    #   frozen decoder D(state, skill, arg) -> action chunk
+    #   policy p(arg | state, skill)
+    use_skill_arg_decoder:       bool  = False
+    skill_arg_dim:               int   = 16
+    skill_arg_hidden:            int   = 512
+    skill_arg_layers:            int   = 3
+    lambda_skill_arg_decoder:    float = 0.0
+    lambda_skill_arg_kl:         float = 1e-3
+    lambda_skill_arg_policy:     float = 1.0
+
     # ── v5 Policy prior ───────────────────────────────────────────────────────
     entropy_coef:  float = 0.01   # entropy regularization (α)
     log_std_min:   float = -5.0
@@ -678,6 +690,117 @@ class SkillActionDecoder(nn.Module):
         return out.reshape(*x.shape[:-1], self.H, cfg.action_dim)
 
 
+class SkillArgumentEncoder(nn.Module):
+    """Infer a bounded skill argument from a demonstrated action chunk."""
+
+    def __init__(self, cfg: 'KoopmanCVAEConfig'):
+        super().__init__()
+        self.cfg = cfg
+        self.H = int(getattr(cfg, 'skill_decoder_horizon', 4))
+        arg_dim = int(getattr(cfg, 'skill_arg_dim', 16))
+        in_dim = (
+            cfg.koopman_dim
+            + cfg.gru_hidden
+            + cfg.num_skills
+            + self.H * cfg.action_dim
+        )
+        hidden = int(getattr(cfg, 'skill_arg_hidden', cfg.mlp_hidden))
+        layers = int(getattr(cfg, 'skill_arg_layers', 3))
+        self.net = make_mlp(in_dim, 2 * arg_dim, hidden, layers, cfg.dropout)
+
+    def forward(
+        self,
+        o: torch.Tensor,
+        h: torch.Tensor,
+        skill_prob: torch.Tensor,
+        action_chunk: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        flat_a = action_chunk.reshape(*action_chunk.shape[:-2], -1)
+        out = self.net(torch.cat([o, h, skill_prob, flat_a], dim=-1))
+        mu, logvar = out.chunk(2, dim=-1)
+        logvar = logvar.clamp(-10, 2)
+        eps = torch.randn_like(mu)
+        raw = mu + eps * torch.exp(0.5 * logvar)
+        arg = torch.tanh(raw)
+        return arg, mu, logvar
+
+
+class SkillArgumentPolicy(nn.Module):
+    """High-level policy over the continuous skill argument."""
+
+    def __init__(self, cfg: 'KoopmanCVAEConfig'):
+        super().__init__()
+        self.cfg = cfg
+        arg_dim = int(getattr(cfg, 'skill_arg_dim', 16))
+        in_dim = cfg.koopman_dim + cfg.gru_hidden + cfg.num_skills
+        hidden = int(getattr(cfg, 'skill_arg_hidden', cfg.mlp_hidden))
+        layers = int(getattr(cfg, 'skill_arg_layers', 3))
+        self.net = make_mlp(in_dim, 2 * arg_dim, hidden, layers, cfg.dropout)
+        self.log_std_min = cfg.log_std_min
+        self.log_std_dif = cfg.log_std_max - cfg.log_std_min
+
+    def forward(
+        self,
+        o: torch.Tensor,
+        h: torch.Tensor,
+        skill_prob: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        out = self.net(torch.cat([o, h, skill_prob], dim=-1))
+        mean, log_std_raw = out.chunk(2, dim=-1)
+        log_std = torch.sigmoid(log_std_raw) * self.log_std_dif + self.log_std_min
+        eps = torch.randn_like(mean)
+        raw = mean + eps * log_std.exp()
+        arg = torch.tanh(raw)
+        log_prob_gauss = -0.5 * (
+            eps.pow(2) + 2 * log_std + math.log(2 * math.pi)
+        ).sum(-1)
+        log_prob = log_prob_gauss - torch.log(
+            F.relu(1 - arg.pow(2)) + 1e-6
+        ).sum(-1)
+        return arg, log_prob, torch.tanh(mean), log_std
+
+    def mean_arg(
+        self,
+        o: torch.Tensor,
+        h: torch.Tensor,
+        skill_prob: torch.Tensor,
+    ) -> torch.Tensor:
+        out = self.net(torch.cat([o, h, skill_prob], dim=-1))
+        mean, _ = out.chunk(2, dim=-1)
+        return torch.tanh(mean)
+
+
+class SkillArgumentActionDecoder(nn.Module):
+    """Frozen low-level executor D(o, h, skill, arg) -> action chunk."""
+
+    def __init__(self, cfg: 'KoopmanCVAEConfig'):
+        super().__init__()
+        self.cfg = cfg
+        self.H = int(getattr(cfg, 'skill_decoder_horizon', 4))
+        arg_dim = int(getattr(cfg, 'skill_arg_dim', 16))
+        in_dim = cfg.koopman_dim + cfg.gru_hidden + cfg.num_skills + arg_dim
+        hidden = int(getattr(cfg, 'skill_arg_hidden', cfg.mlp_hidden))
+        layers = int(getattr(cfg, 'skill_arg_layers', 3))
+        self.net = make_mlp(
+            in_dim,
+            self.H * cfg.action_dim,
+            hidden,
+            layers,
+            cfg.dropout,
+        )
+
+    def forward(
+        self,
+        o: torch.Tensor,
+        h: torch.Tensor,
+        skill_prob: torch.Tensor,
+        arg: torch.Tensor,
+    ) -> torch.Tensor:
+        x = torch.cat([o, h, skill_prob, arg], dim=-1)
+        out = self.net(x)
+        return out.reshape(*x.shape[:-1], self.H, self.cfg.action_dim)
+
+
 class GoalProposalPolicy(nn.Module):
     """
     π_goal(z_g | z_t, h_t) — Gaussian goal latent proposal.
@@ -789,6 +912,9 @@ class KoopmanCVAE(nn.Module):
         self.q_head              = QHead(cfg)
         self.policy_prior        = PolicyPrior(cfg)
         self.skill_action_decoder = SkillActionDecoder(cfg)
+        self.skill_argument_encoder = SkillArgumentEncoder(cfg)
+        self.skill_argument_policy = SkillArgumentPolicy(cfg)
+        self.skill_argument_decoder = SkillArgumentActionDecoder(cfg)
 
         # ── Q network: three versions (TD-MPC2 §H pattern) ───────────────
         #
@@ -1148,6 +1274,57 @@ class KoopmanCVAE(nn.Module):
         )
         return loss, loss_action, loss_latent
 
+    def _compute_skill_arg_decoder_loss(
+        self,
+        o_seq: torch.Tensor,
+        h_pre_seq: torch.Tensor,
+        skill_logits: torch.Tensor,
+        actions: torch.Tensor,
+        mask: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        cfg = self.cfg
+        H = int(getattr(cfg, 'skill_decoder_horizon', 4))
+        B, T, _ = actions.shape
+        device = actions.device
+        if H <= 0 or T < H:
+            zero = actions.new_tensor(0.0)
+            return zero, zero, zero, zero
+
+        N = T - H + 1
+        o_in = o_seq[:, :N]
+        h_in = h_pre_seq[:, :N]
+        w_in = torch.softmax(skill_logits[:, :N], dim=-1)
+        target_a = torch.stack(
+            [actions[:, k:k + N] for k in range(H)], dim=2
+        )
+        valid = self._chunk_valid_mask(mask, B, N, H, device)
+
+        if getattr(cfg, 'skill_decoder_detach_latents', True):
+            o_in = o_in.detach()
+            h_in = h_in.detach()
+            w_in = w_in.detach()
+
+        arg, mu, logvar = self.skill_argument_encoder(
+            o_in, h_in, w_in, target_a)
+        pred_a = self.skill_argument_decoder(o_in, h_in, w_in, arg)
+        action_err = (pred_a - target_a).pow(2).mean(dim=(-1, -2))
+        loss_action = self._masked_mean(action_err, valid)
+
+        kl = 0.5 * (logvar.exp() + mu.pow(2) - 1.0 - logvar).sum(-1)
+        loss_kl = self._masked_mean(kl, valid)
+
+        arg_target = torch.tanh(mu).detach()
+        arg_mean = self.skill_argument_policy.mean_arg(o_in, h_in, w_in)
+        pol_err = (arg_mean - arg_target).pow(2).mean(-1)
+        loss_policy = self._masked_mean(pol_err, valid)
+
+        loss = (
+            loss_action
+            + getattr(cfg, 'lambda_skill_arg_kl', 1e-3) * loss_kl
+            + getattr(cfg, 'lambda_skill_arg_policy', 1.0) * loss_policy
+        )
+        return loss, loss_action, loss_kl, loss_policy
+
     def _compute_losses(
         self,
         x_batch:      torch.Tensor,          # (B, T, x_dim)
@@ -1216,6 +1393,10 @@ class KoopmanCVAE(nn.Module):
         loss_skill_decoder = torch.tensor(0.0, device=device)
         loss_skill_decoder_action = torch.tensor(0.0, device=device)
         loss_skill_decoder_latent = torch.tensor(0.0, device=device)
+        loss_skill_arg_decoder = torch.tensor(0.0, device=device)
+        loss_skill_arg_action = torch.tensor(0.0, device=device)
+        loss_skill_arg_kl = torch.tensor(0.0, device=device)
+        loss_skill_arg_policy = torch.tensor(0.0, device=device)
         if (getattr(cfg, 'use_skill_decoder', False)
                 and getattr(cfg, 'lambda_skill_decoder', 0.0) > 0.0
                 and h_pre_seq is not None
@@ -1228,6 +1409,20 @@ class KoopmanCVAE(nn.Module):
                 skill_logits=skill_logits,
                 actions=actions,
                 u_seq=u_seq,
+                mask=mask,
+            )
+        if (getattr(cfg, 'use_skill_arg_decoder', False)
+                and getattr(cfg, 'lambda_skill_arg_decoder', 0.0) > 0.0
+                and h_pre_seq is not None
+                and actions is not None):
+            (loss_skill_arg_decoder,
+             loss_skill_arg_action,
+             loss_skill_arg_kl,
+             loss_skill_arg_policy) = self._compute_skill_arg_decoder_loss(
+                o_seq=o_seq,
+                h_pre_seq=h_pre_seq,
+                skill_logits=skill_logits,
+                actions=actions,
                 mask=mask,
             )
 
@@ -1568,6 +1763,7 @@ class KoopmanCVAE(nn.Module):
             + getattr(cfg, 'lambda_lqr_pi', 0.0) * loss_lqr_pi
             + cfg.lambda_goal   * loss_goal
             + getattr(cfg, 'lambda_skill_decoder', 0.0) * loss_skill_decoder
+            + getattr(cfg, 'lambda_skill_arg_decoder', 0.0) * loss_skill_arg_decoder
         )
 
         return {
@@ -1593,6 +1789,10 @@ class KoopmanCVAE(nn.Module):
             'loss_skill_decoder':        loss_skill_decoder,
             'loss_skill_decoder_action': loss_skill_decoder_action,
             'loss_skill_decoder_latent': loss_skill_decoder_latent,
+            'loss_skill_arg_decoder':    loss_skill_arg_decoder,
+            'loss_skill_arg_action':     loss_skill_arg_action,
+            'loss_skill_arg_kl':         loss_skill_arg_kl,
+            'loss_skill_arg_policy':     loss_skill_arg_policy,
             'rho':              torch.tensor(self.scale_tracker.rho, device=device),
             'q_scale':          torch.tensor(self.scale_tracker.scale, device=device),
         }
