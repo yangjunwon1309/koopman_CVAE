@@ -106,6 +106,8 @@ class OnlineConfig:
     elite_buffer_size:        int   = 50_000
     elite_reward_threshold:   float = 1.0
     lambda_elite_bc_pi:       float = 0.0
+    lambda_elite_skill_bc_pi: float = 0.0
+    lambda_elite_arg_bc_pi:   float = 0.0
     q_n_step:                 int   = 1
     q_n_step_gamma:           float = 0.99
     q_reward_source:          str   = 'env'
@@ -132,6 +134,7 @@ class OnlineConfig:
     skilldec_anchor_decay_steps: int = 200_000
     skill_arg_alpha_d:        float = 0.1
     skill_arg_alpha_z:        float = 0.01
+    skill_d_no_h:             bool  = False
     lambda_lqr_pi:     float = 0.0
     lqr_horizon:       int   = 4
     lqr_aux_k:         int   = 4
@@ -683,12 +686,15 @@ class PolicyPriorOnlineTrainer:
         return a.detach()[0].cpu().numpy()
 
     def _skill_prior_logits(self, h: torch.Tensor) -> torch.Tensor:
+        if self.cfg.skill_d_no_h:
+            return h.new_zeros((*h.shape[:-1], self.model.cfg.num_skills))
         return self.model.skill_prior(h).detach()
 
     def _skill_policy_logits(self, z: torch.Tensor,
                              h: torch.Tensor) -> torch.Tensor:
         prior_logits = self._skill_prior_logits(h)
-        return self.model.skill_discrete_policy(z, h, prior_logits)
+        h_policy = torch.zeros_like(h) if self.cfg.skill_d_no_h else h
+        return self.model.skill_discrete_policy(z, h_policy, prior_logits)
 
     def _one_hot_skill(self, skill_id: torch.Tensor) -> torch.Tensor:
         return F.one_hot(
@@ -1115,11 +1121,40 @@ class PolicyPriorOnlineTrainer:
         loss = -objective.mean()
 
         loss_elite_bc = z.new_tensor(0.0)
-        if self.cfg.lambda_elite_bc_pi > 0.0:
-            skill_id_bc = batch.get('skill_id', None)
-            if skill_id_bc is not None:
+        loss_elite_skill_bc = z.new_tensor(0.0)
+        loss_elite_arg_bc = z.new_tensor(0.0)
+        skill_id_bc = batch.get('skill_id', None)
+        elite_mask = batch.get('source', z.new_zeros(z.shape[0])).to(z.device) > 1.5
+        if skill_id_bc is not None and bool(elite_mask.any()):
+            skill_id_bc = skill_id_bc.long()
+            if self.cfg.lambda_elite_skill_bc_pi > 0.0:
+                loss_elite_skill_bc = F.cross_entropy(
+                    logits_d[elite_mask], skill_id_bc[elite_mask])
+                loss = (
+                    loss
+                    + self.cfg.lambda_elite_skill_bc_pi * loss_elite_skill_bc
+                )
+            if (self.cfg.lambda_elite_arg_bc_pi > 0.0
+                    or self.cfg.lambda_elite_bc_pi > 0.0):
                 skill_oh = self._one_hot_skill(skill_id_bc.long())
-                arg_bc, _, _, _ = m.skill_argument_policy(z, h, skill_oh)
+                arg_bc = m.skill_argument_policy.mean_arg(z, h, skill_oh)
+            if self.cfg.lambda_elite_arg_bc_pi > 0.0:
+                arg_target = batch.get('skill_arg', None)
+                if arg_target is not None:
+                    arg_mask = elite_mask
+                    has_arg = batch.get('has_skill_arg', None)
+                    if has_arg is not None:
+                        arg_mask = arg_mask & (has_arg.to(z.device) > 0.5)
+                    if bool(arg_mask.any()):
+                        arg_target = arg_target.to(z.device).clamp(-1.0, 1.0)
+                        loss_elite_arg_bc = (
+                            arg_bc[arg_mask] - arg_target[arg_mask]
+                        ).pow(2).mean()
+                        loss = (
+                            loss
+                            + self.cfg.lambda_elite_arg_bc_pi * loss_elite_arg_bc
+                        )
+            if self.cfg.lambda_elite_bc_pi > 0.0:
                 a_seq = m.skill_argument_decoder(z, h, skill_oh, arg_bc)
                 loss_elite_bc = self._elite_chunk_bc_loss(a_seq, batch)
                 loss = loss + self.cfg.lambda_elite_bc_pi * loss_elite_bc
@@ -1129,6 +1164,8 @@ class PolicyPriorOnlineTrainer:
             'kl_d': kl_d.detach(),
             'kl_z': (probs_d * kl_z).sum(-1).detach(),
             'loss_elite_bc': loss_elite_bc.detach(),
+            'loss_elite_skill_bc': loss_elite_skill_bc.detach(),
+            'loss_elite_arg_bc': loss_elite_arg_bc.detach(),
         }
 
     def _combo_skillarg_q_loss(
@@ -1281,6 +1318,8 @@ class PolicyPriorOnlineTrainer:
                 'kl_d': z.new_zeros(z.shape[0]),
                 'kl_z': z.new_zeros(z.shape[0]),
                 'loss_elite_bc': z.new_tensor(0.0),
+                'loss_elite_skill_bc': z.new_tensor(0.0),
+                'loss_elite_arg_bc': z.new_tensor(0.0),
             }
 
         q_data = combo['q_data']
@@ -1297,6 +1336,8 @@ class PolicyPriorOnlineTrainer:
             'loss_lqr_pi': 0.0,
             'loss_bc_pi': 0.0,
             'loss_elite_bc_pi': pi_info['loss_elite_bc'].item(),
+            'loss_elite_skill_bc_pi': pi_info['loss_elite_skill_bc'].item(),
+            'loss_elite_arg_bc_pi': pi_info['loss_elite_arg_bc'].item(),
             'loss_skilldec_anchor': (
                 self.cfg.skill_arg_alpha_d * pi_info['kl_d'].mean()
                 + self.cfg.skill_arg_alpha_z * pi_info['kl_z'].mean()
@@ -1466,6 +1507,8 @@ class PolicyPriorOnlineTrainer:
             'loss_lqr_pi': loss_lqr.item(),
             'loss_bc_pi': loss_bc.item(),
             'loss_elite_bc_pi': loss_elite_bc.item(),
+            'loss_elite_skill_bc_pi': 0.0,
+            'loss_elite_arg_bc_pi': 0.0,
             'loss_skilldec_anchor': loss_anchor.item(),
             'skilldec_anchor_w': anchor_w,
             'q_mean': q_pi.detach().mean().item(),
@@ -2290,7 +2333,8 @@ def train_policy_prior_online(cfg: OnlineConfig,
               ['loss_reward', 'loss_q', 'loss_q_td', 'loss_q_cql_policy',
                'loss_q_rank_data', 'loss_q_rank_bc', 'loss_q_rank_lqr',
                'loss_pi', 'loss_lqr_pi', 'loss_bc_pi',
-               'loss_elite_bc_pi',
+               'loss_elite_bc_pi', 'loss_elite_skill_bc_pi',
+               'loss_elite_arg_bc_pi',
                'loss_skilldec_anchor', 'skilldec_anchor_w',
                 'q_mean', 'q_policy_cql', 'q_data', 'rho', 'r_hat',
                 'q_reward', 'q_target', 'q_next', 'pi_active',
@@ -2329,10 +2373,13 @@ def train_policy_prior_online(cfg: OnlineConfig,
           f"elite={cfg.pi_elite_fraction:.2f} "
           f"q_w={cfg.pi_q_weight:.2f} bc={cfg.lambda_bc_pi:.3f} "
           f"ebc={cfg.lambda_elite_bc_pi:.3f} "
+          f"eskill={cfg.lambda_elite_skill_bc_pi:.3f} "
+          f"earg={cfg.lambda_elite_arg_bc_pi:.3f} "
           f"anchor={cfg.lambda_skilldec_anchor:.3f}->{cfg.skilldec_anchor_min:.3f}")
     if cfg.actor_mode == 'skill_arg':
         print(f"  skill-arg SAC alpha_d={cfg.skill_arg_alpha_d:.3f} "
               f"alpha_z={cfg.skill_arg_alpha_z:.3f} "
+              f"skill_d_no_h={int(cfg.skill_d_no_h)} "
               "critic=Q(z,h,arg,d)")
     print(f"  elite buffer size={cfg.elite_buffer_size} "
           f"threshold={cfg.elite_reward_threshold:.2f}")
@@ -2478,6 +2525,8 @@ def train_policy_prior_online(cfg: OnlineConfig,
                       f"RD={ms['loss_q_rank_data']:.3f} "
                       f"Pi={ms['loss_pi']:.3f} Anc={ms['loss_skilldec_anchor']:.3f} "
                       f"EBC={ms['loss_elite_bc_pi']:.3f} "
+                      f"ESK={ms['loss_elite_skill_bc_pi']:.3f} "
+                      f"ARG={ms['loss_elite_arg_bc_pi']:.3f} "
                       f"Aw={ms['skilldec_anchor_w']:.2f} "
                       f"q={ms['q_mean']:.3f} "
                       f"qd={ms['q_data']:.3f} rho={ms['rho']:.3f} rhat={ms['r_hat']:.3f} "
@@ -2590,6 +2639,8 @@ def train_policy_prior_online(cfg: OnlineConfig,
                       f"RD={ms['loss_q_rank_data']:.3f} "
                       f"Pi={ms['loss_pi']:.3f} Anc={ms['loss_skilldec_anchor']:.3f} "
                       f"EBC={ms['loss_elite_bc_pi']:.3f} "
+                      f"ESK={ms['loss_elite_skill_bc_pi']:.3f} "
+                      f"ARG={ms['loss_elite_arg_bc_pi']:.3f} "
                       f"Aw={ms['skilldec_anchor_w']:.2f} "
                       f"q={ms['q_mean']:.3f} "
                       f"qd={ms['q_data']:.3f} rho={ms['rho']:.3f} rhat={ms['r_hat']:.3f} "
@@ -2667,6 +2718,8 @@ def main():
     p.add_argument('--elite_buffer_size',        type=int,   default=50_000)
     p.add_argument('--elite_reward_threshold',   type=float, default=1.0)
     p.add_argument('--lambda_elite_bc_pi',       type=float, default=0.0)
+    p.add_argument('--lambda_elite_skill_bc_pi', type=float, default=0.0)
+    p.add_argument('--lambda_elite_arg_bc_pi',   type=float, default=0.0)
     p.add_argument('--q_n_step',                 type=int,   default=1)
     p.add_argument('--q_n_step_gamma',           type=float, default=0.99)
     p.add_argument('--q_reward_source', choices=['env', 'rhat', 'penalized'],
@@ -2697,6 +2750,8 @@ def main():
     p.add_argument('--skilldec_anchor_decay_steps', type=int, default=200_000)
     p.add_argument('--skill_arg_alpha_d', type=float, default=0.1)
     p.add_argument('--skill_arg_alpha_z', type=float, default=0.01)
+    p.add_argument('--skill_d_no_h', action='store_true',
+                   help='For skill_arg actor, condition pi_d on z only by zeroing h and using a uniform skill prior.')
     p.add_argument('--lambda_lqr_pi',     type=float, default=0.0)
     p.add_argument('--lqr_horizon',       type=int,   default=4)
     p.add_argument('--lqr_aux_k',         type=int,   default=4)
@@ -2781,6 +2836,8 @@ def main():
         elite_buffer_size=args.elite_buffer_size,
         elite_reward_threshold=args.elite_reward_threshold,
         lambda_elite_bc_pi=args.lambda_elite_bc_pi,
+        lambda_elite_skill_bc_pi=args.lambda_elite_skill_bc_pi,
+        lambda_elite_arg_bc_pi=args.lambda_elite_arg_bc_pi,
         q_n_step=args.q_n_step,
         q_n_step_gamma=args.q_n_step_gamma,
         q_reward_source=args.q_reward_source,
@@ -2807,6 +2864,7 @@ def main():
         skilldec_anchor_decay_steps=args.skilldec_anchor_decay_steps,
         skill_arg_alpha_d=args.skill_arg_alpha_d,
         skill_arg_alpha_z=args.skill_arg_alpha_z,
+        skill_d_no_h=args.skill_d_no_h,
         lambda_lqr_pi=args.lambda_lqr_pi,
         lqr_horizon=args.lqr_horizon,
         lqr_aux_k=args.lqr_aux_k,
