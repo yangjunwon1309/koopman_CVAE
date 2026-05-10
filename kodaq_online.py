@@ -2379,7 +2379,7 @@ def train_policy_prior_online(cfg: OnlineConfig,
     if cfg.actor_mode == 'skill_arg':
         print(f"  skill-arg SAC alpha_d={cfg.skill_arg_alpha_d:.3f} "
               f"alpha_z={cfg.skill_arg_alpha_z:.3f} "
-              f"arg_use_h={int(getattr(model.cfg, 'skill_arg_use_h', True))} "
+              f"arg_use_h={int(getattr(trainer.model.cfg, 'skill_arg_use_h', True))} "
               f"skill_d_no_h={int(cfg.skill_d_no_h)} "
               "critic=Q(z,h,arg,d)")
     print(f"  elite buffer size={cfg.elite_buffer_size} "
