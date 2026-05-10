@@ -105,6 +105,7 @@ class OnlineConfig:
     pi_elite_fraction:        float = 0.0
     elite_buffer_size:        int   = 50_000
     elite_reward_threshold:   float = 1.0
+    offline_elite_threshold:  float = 2.0
     lambda_elite_bc_pi:       float = 0.0
     lambda_elite_skill_bc_pi: float = 0.0
     lambda_elite_arg_bc_pi:   float = 0.0
@@ -135,6 +136,7 @@ class OnlineConfig:
     skill_arg_alpha_d:        float = 0.1
     skill_arg_alpha_z:        float = 0.01
     skill_d_no_h:             bool  = False
+    skill_arg_mean_after_pi_start: bool = True
     lambda_lqr_pi:     float = 0.0
     lqr_horizon:       int   = 4
     lqr_aux_k:         int   = 4
@@ -473,13 +475,14 @@ class EnvContext:
 class PriorReplayBuffer:
     def __init__(self, capacity: int, device: str, h_dim: int = 0,
                  action_dim: int = 0, chunk_horizon: int = 1,
-                 arg_dim: int = 0):
+                 arg_dim: int = 0, skill_dim: int = 0):
         self.capacity = capacity
         self.device = device
         self.h_dim = h_dim
         self.action_dim = int(action_dim)
         self.chunk_horizon = max(1, int(chunk_horizon))
         self.arg_dim = int(arg_dim)
+        self.skill_dim = int(skill_dim)
         self._d: Dict[str, np.ndarray] = {}
         self._ptr = 0
         self._n = 0
@@ -508,6 +511,7 @@ class PriorReplayBuffer:
             'u_lqr_aux': np.zeros((C, u_dim), dtype=np.float32),
             'has_lqr': np.zeros(C, dtype=np.float32),
             'skill_id': np.zeros(C, dtype=np.float32),
+            'skill_prob': np.zeros((C, int(self.skill_dim)), dtype=np.float32),
             'skill_arg': np.zeros((C, int(self.arg_dim)), dtype=np.float32),
             'has_skill_arg': np.zeros(C, dtype=np.float32),
             'source': np.zeros(C, dtype=np.float32),
@@ -518,7 +522,8 @@ class PriorReplayBuffer:
             a=None, a_chunk=None, chunk_mask=None,
             r_return=None, z_boot=None, h_boot=None, discount=None,
             u_lqr=None, u_lqr_aux=None, has_lqr: float = 0.0,
-            skill_id=None, skill_arg=None, has_skill_arg: float = 0.0,
+            skill_id=None, skill_prob=None,
+            skill_arg=None, has_skill_arg: float = 0.0,
             source: float = 0.0):
         if not self._d:
             self._init(z.shape[-1], u.shape[-1])
@@ -559,8 +564,18 @@ class PriorReplayBuffer:
         if u_lqr_aux is not None:
             self._d['u_lqr_aux'][p] = u_lqr_aux
         self._d['has_lqr'][p] = float(has_lqr)
+        if self.skill_dim > 0:
+            self._d['skill_prob'][p].fill(0.0)
         if skill_id is not None:
             self._d['skill_id'][p] = float(skill_id)
+            if self.skill_dim > 0:
+                sid = int(skill_id)
+                if 0 <= sid < self.skill_dim:
+                    self._d['skill_prob'][p, sid] = 1.0
+        if skill_prob is not None and self.skill_dim > 0:
+            prob = np.asarray(skill_prob, dtype=np.float32)
+            n = min(prob.shape[-1], self.skill_dim)
+            self._d['skill_prob'][p, :n] = prob[:n]
         if skill_arg is not None and self.arg_dim > 0:
             self._d['skill_arg'][p] = np.asarray(skill_arg, dtype=np.float32)
             has_skill_arg = 1.0
@@ -624,11 +639,11 @@ class PolicyPriorOnlineTrainer:
         self.buf = PriorReplayBuffer(
             cfg.buffer_size, device, h_dim=model.cfg.gru_hidden,
             action_dim=model.cfg.action_dim, chunk_horizon=skill_h,
-            arg_dim=arg_dim)
+            arg_dim=arg_dim, skill_dim=model.cfg.num_skills)
         self.elite_buf = PriorReplayBuffer(
             cfg.elite_buffer_size, device, h_dim=model.cfg.gru_hidden,
             action_dim=model.cfg.action_dim, chunk_horizon=skill_h,
-            arg_dim=arg_dim
+            arg_dim=arg_dim, skill_dim=model.cfg.num_skills
         ) if cfg.elite_buffer_size > 0 else None
         self.skill_decoder_anchor = copy.deepcopy(model.skill_action_decoder)
         self.skill_decoder_anchor.to(device).eval()
@@ -722,6 +737,7 @@ class PolicyPriorOnlineTrainer:
         z: torch.Tensor,
         h: torch.Tensor,
         deterministic: bool = False,
+        mean_arg: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         logits_d = self._skill_policy_logits(z, h)
         probs_d = torch.softmax(logits_d, dim=-1)
@@ -730,7 +746,7 @@ class PolicyPriorOnlineTrainer:
         else:
             skill_id = torch.multinomial(probs_d, num_samples=1).squeeze(-1)
         skill_oh = self._one_hot_skill(skill_id)
-        if deterministic:
+        if deterministic or mean_arg:
             arg = self.model.skill_argument_policy.mean_arg(z, h, skill_oh)
             log_arg = z.new_zeros(z.shape[:-1])
         else:
@@ -764,8 +780,12 @@ class PolicyPriorOnlineTrainer:
         if self.actor_mode == 'skill_arg':
             if h is None:
                 raise ValueError("h is required when actor_mode=skill_arg")
+            use_mean_arg = (
+                self.cfg.skill_arg_mean_after_pi_start
+                and self.step >= self.cfg.pi_update_start
+            )
             a_seq_t, skill_id, arg, _ = self._sample_skillarg_action(
-                z, h, deterministic=False)
+                z, h, deterministic=False, mean_arg=use_mean_arg)
             self._last_skillarg_meta = {
                 'skill_id': skill_id.detach().cpu().numpy().copy(),
                 'skill_arg': arg.detach().cpu().numpy().copy(),
@@ -1124,12 +1144,31 @@ class PolicyPriorOnlineTrainer:
         loss_elite_skill_bc = z.new_tensor(0.0)
         loss_elite_arg_bc = z.new_tensor(0.0)
         skill_id_bc = batch.get('skill_id', None)
+        skill_prob_bc = batch.get('skill_prob', None)
         elite_mask = batch.get('source', z.new_zeros(z.shape[0])).to(z.device) > 1.5
         if skill_id_bc is not None and bool(elite_mask.any()):
             skill_id_bc = skill_id_bc.long()
+            if skill_prob_bc is not None:
+                skill_prob_bc = skill_prob_bc.to(z.device)
+                has_soft_skill = skill_prob_bc.sum(-1) > 0.5
+            else:
+                has_soft_skill = torch.zeros_like(elite_mask)
             if self.cfg.lambda_elite_skill_bc_pi > 0.0:
-                loss_elite_skill_bc = F.cross_entropy(
-                    logits_d[elite_mask], skill_id_bc[elite_mask])
+                log_pi_bc = F.log_softmax(logits_d, dim=-1)
+                soft_mask = elite_mask & has_soft_skill
+                hard_mask = elite_mask & (~has_soft_skill)
+                parts = []
+                if bool(soft_mask.any()):
+                    target = skill_prob_bc[soft_mask]
+                    target = target / target.sum(-1, keepdim=True).clamp_min(1e-6)
+                    parts.append(-(target * log_pi_bc[soft_mask]).sum(-1).mean())
+                if bool(hard_mask.any()):
+                    parts.append(F.cross_entropy(
+                        logits_d[hard_mask], skill_id_bc[hard_mask]))
+                loss_elite_skill_bc = (
+                    torch.stack(parts).mean()
+                    if parts else z.new_tensor(0.0)
+                )
                 loss = (
                     loss
                     + self.cfg.lambda_elite_skill_bc_pi * loss_elite_skill_bc
@@ -1137,6 +1176,9 @@ class PolicyPriorOnlineTrainer:
             if (self.cfg.lambda_elite_arg_bc_pi > 0.0
                     or self.cfg.lambda_elite_bc_pi > 0.0):
                 skill_oh = self._one_hot_skill(skill_id_bc.long())
+                if skill_prob_bc is not None:
+                    soft_mask = has_soft_skill.view(-1, 1)
+                    skill_oh = torch.where(soft_mask, skill_prob_bc, skill_oh)
                 arg_bc = m.skill_argument_policy.mean_arg(z, h, skill_oh)
             if self.cfg.lambda_elite_arg_bc_pi > 0.0:
                 arg_target = batch.get('skill_arg', None)
@@ -1697,6 +1739,8 @@ def prefill_prior_buffer_from_offline(trainer: PolicyPriorOnlineTrainer,
     np.random.shuffle(episodes)
 
     n_added = 0
+    n_elite_added = 0
+    n_elite_eps = 0
     print(f"\n[Prior Offline Pre-fill] {x_cache_path}")
     for ep in episodes:
         if n_added >= max_transitions:
@@ -1723,6 +1767,7 @@ def prefill_prior_buffer_from_offline(trainer: PolicyPriorOnlineTrainer,
         else:
             r_step = rews
         r_step = np.clip(r_step, 0.0, 1.0).astype(np.float32)
+        ep_return = float((r_step > 0.0).sum())
 
         u_lqr_np = np.zeros((L - 1, model.cfg.action_latent), dtype=np.float32)
         u_aux_np = np.zeros_like(u_lqr_np)
@@ -1747,6 +1792,7 @@ def prefill_prior_buffer_from_offline(trainer: PolicyPriorOnlineTrainer,
         H_chunk = int(trainer.buf.chunk_horizon)
         n_step = max(1, int(trainer.cfg.q_n_step))
         gam = float(trainer.cfg.q_n_step_gamma)
+        episode_transitions: List[Dict[str, np.ndarray]] = []
         for t in range(L - 1):
             a_chunk = np.zeros((H_chunk, model.cfg.action_dim), dtype=np.float32)
             chunk_mask = np.zeros(H_chunk, dtype=np.float32)
@@ -1755,15 +1801,13 @@ def prefill_prior_buffer_from_offline(trainer: PolicyPriorOnlineTrainer,
                 a_chunk[:n_chunk] = acts[t:t + n_chunk]
                 chunk_mask[:n_chunk] = 1.0
             skill_logits_t = model.skill_prior(h_pre_ep[t:t + 1])
-            skill_id_t = int(skill_logits_t.argmax(dim=-1).item())
-            skill_oh_t = F.one_hot(
-                torch.tensor([skill_id_t], device=dev),
-                num_classes=model.cfg.num_skills,
-            ).float()
+            skill_prob_t = torch.softmax(skill_logits_t, dim=-1)
+            skill_id_t = int(skill_prob_t.argmax(dim=-1).item())
             a_chunk_t = torch.FloatTensor(a_chunk).unsqueeze(0).to(dev)
             _, arg_mu_t, _ = model.skill_argument_encoder(
-                z_ep[t:t + 1], h_pre_ep[t:t + 1], skill_oh_t, a_chunk_t)
+                z_ep[t:t + 1], h_pre_ep[t:t + 1], skill_prob_t, a_chunk_t)
             skill_arg_t = torch.tanh(arg_mu_t)[0].detach().cpu().numpy()
+            skill_prob_np = skill_prob_t[0].detach().cpu().numpy().astype(np.float32)
 
             n_avail = min(n_step, (L - 1) - t)
             r_ret = 0.0
@@ -1771,34 +1815,49 @@ def prefill_prior_buffer_from_offline(trainer: PolicyPriorOnlineTrainer,
                 r_ret += (gam ** j) * float(r_step[t + j] > 0.0)
             boot_idx = min(t + n_avail, L - 1)
             done_n = boot_idx >= (L - 1)
-            trainer.buf.add(
-                z=z_ep[t].cpu().numpy(),
-                h=h_pre_ep[t].cpu().numpy(),
-                u=u_ep[t].cpu().numpy(),
-                a=acts[t],
-                a_chunk=a_chunk,
-                chunk_mask=chunk_mask,
-                r=float(r_step[t] > 0.0),
-                r_return=float(r_ret),
-                z_next=z_ep[t + 1].cpu().numpy(),
-                h_next=h_pre_ep[t + 1].cpu().numpy(),
-                z_boot=z_ep[boot_idx].cpu().numpy(),
-                h_boot=h_pre_ep[boot_idx].cpu().numpy(),
-                discount=float(0.0 if done_n else gam ** max(1, n_avail)),
-                done=float(t + 1 >= L - 1),
-                u_lqr=u_lqr_np[t],
-                u_lqr_aux=u_aux_np[t],
-                has_lqr=has_lqr_np[t],
-                skill_id=skill_id_t,
-                skill_arg=skill_arg_t,
-                has_skill_arg=1.0,
-                source=1.0,
-            )
+            trans = {
+                'z': z_ep[t].cpu().numpy(),
+                'h': h_pre_ep[t].cpu().numpy(),
+                'u': u_ep[t].cpu().numpy(),
+                'a': acts[t],
+                'a_chunk': a_chunk,
+                'chunk_mask': chunk_mask,
+                'r': float(r_step[t] > 0.0),
+                'r_return': float(r_ret),
+                'z_next': z_ep[t + 1].cpu().numpy(),
+                'h_next': h_pre_ep[t + 1].cpu().numpy(),
+                'z_boot': z_ep[boot_idx].cpu().numpy(),
+                'h_boot': h_pre_ep[boot_idx].cpu().numpy(),
+                'discount': float(0.0 if done_n else gam ** max(1, n_avail)),
+                'done': float(t + 1 >= L - 1),
+                'u_lqr': u_lqr_np[t],
+                'u_lqr_aux': u_aux_np[t],
+                'has_lqr': has_lqr_np[t],
+                'skill_id': skill_id_t,
+                'skill_prob': skill_prob_np,
+                'skill_arg': skill_arg_t,
+                'has_skill_arg': 1.0,
+                'source': 1.0,
+            }
+            trainer.buf.add(**trans)
+            episode_transitions.append(trans)
             n_added += 1
             if n_added >= max_transitions:
                 break
+        if (episode_transitions
+                and ep_return >= trainer.cfg.offline_elite_threshold):
+            n_elite_added += trainer.add_elite_episode(
+                episode_transitions,
+                max(ep_return, trainer.cfg.elite_reward_threshold),
+            )
+            n_elite_eps += 1
 
-    print(f"[Prior Offline Pre-fill] added {n_added}  buf={trainer.buf.size}")
+    print(
+        f"[Prior Offline Pre-fill] added {n_added}  buf={trainer.buf.size} "
+        f"offline_elite={n_elite_added} eps={n_elite_eps} "
+        f"thr={trainer.cfg.offline_elite_threshold:.2f} "
+        f"elite_buf={trainer.elite_size}"
+    )
     return n_added
 
 
@@ -2381,9 +2440,11 @@ def train_policy_prior_online(cfg: OnlineConfig,
               f"alpha_z={cfg.skill_arg_alpha_z:.3f} "
               f"arg_use_h={int(getattr(trainer.model.cfg, 'skill_arg_use_h', True))} "
               f"skill_d_no_h={int(cfg.skill_d_no_h)} "
+              f"mean_after_pi={int(cfg.skill_arg_mean_after_pi_start)} "
               "critic=Q(z,h,arg,d)")
     print(f"  elite buffer size={cfg.elite_buffer_size} "
-          f"threshold={cfg.elite_reward_threshold:.2f}")
+          f"threshold={cfg.elite_reward_threshold:.2f} "
+          f"offline_threshold={cfg.offline_elite_threshold:.2f}")
     print(f"{'='*60}\n")
 
     while global_step < cfg.n_env_steps:
@@ -2718,6 +2779,7 @@ def main():
     p.add_argument('--pi_elite_fraction',        type=float, default=0.0)
     p.add_argument('--elite_buffer_size',        type=int,   default=50_000)
     p.add_argument('--elite_reward_threshold',   type=float, default=1.0)
+    p.add_argument('--offline_elite_threshold',  type=float, default=2.0)
     p.add_argument('--lambda_elite_bc_pi',       type=float, default=0.0)
     p.add_argument('--lambda_elite_skill_bc_pi', type=float, default=0.0)
     p.add_argument('--lambda_elite_arg_bc_pi',   type=float, default=0.0)
@@ -2753,6 +2815,8 @@ def main():
     p.add_argument('--skill_arg_alpha_z', type=float, default=0.01)
     p.add_argument('--skill_d_no_h', action='store_true',
                    help='For skill_arg actor, condition pi_d on z only by zeroing h and using a uniform skill prior.')
+    p.add_argument('--skill_arg_sample_after_pi_start', action='store_true',
+                   help='Keep sampling c after pi_start instead of using mean_arg for rollout.')
     p.add_argument('--lambda_lqr_pi',     type=float, default=0.0)
     p.add_argument('--lqr_horizon',       type=int,   default=4)
     p.add_argument('--lqr_aux_k',         type=int,   default=4)
@@ -2836,6 +2900,7 @@ def main():
         pi_elite_fraction=args.pi_elite_fraction,
         elite_buffer_size=args.elite_buffer_size,
         elite_reward_threshold=args.elite_reward_threshold,
+        offline_elite_threshold=args.offline_elite_threshold,
         lambda_elite_bc_pi=args.lambda_elite_bc_pi,
         lambda_elite_skill_bc_pi=args.lambda_elite_skill_bc_pi,
         lambda_elite_arg_bc_pi=args.lambda_elite_arg_bc_pi,
@@ -2866,6 +2931,7 @@ def main():
         skill_arg_alpha_d=args.skill_arg_alpha_d,
         skill_arg_alpha_z=args.skill_arg_alpha_z,
         skill_d_no_h=args.skill_d_no_h,
+        skill_arg_mean_after_pi_start=not args.skill_arg_sample_after_pi_start,
         lambda_lqr_pi=args.lambda_lqr_pi,
         lqr_horizon=args.lqr_horizon,
         lqr_aux_k=args.lqr_aux_k,
