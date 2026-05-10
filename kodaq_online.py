@@ -123,6 +123,9 @@ class OnlineConfig:
     pi_update_start:          int   = 10_000
     actor_mode:               str   = 'policy_prior'  # policy_prior | skill_decoder
     pi_q_weight:              float = 1.0
+    pi_q_guide_loss_threshold: float = -1.0
+    pi_q_guide_min_step:      int   = 0
+    pi_q_guide_ema_beta:      float = 0.99
     action_noise_std:         float = 0.0
     skilldec_exec_horizon:    int   = 1
     lambda_bc_pi:             float = 0.0
@@ -627,6 +630,8 @@ class PolicyPriorOnlineTrainer:
         self.model = model
         self.device = device
         self.step = 0
+        self.q_loss_ema: Optional[float] = None
+        self.q_guide_active = cfg.pi_q_guide_loss_threshold <= 0.0
         self.action_inv_steps = action_inv_steps
         self.action_inv_lr = action_inv_lr
         self.lqr_planner = lqr_planner
@@ -1041,6 +1046,24 @@ class PolicyPriorOnlineTrainer:
         return q_head.expected_value(
             z, h, arg, skill_id=skill_id, return_type=return_type)
 
+    def _update_q_guide_gate(self, loss_q: torch.Tensor) -> float:
+        q_loss = float(loss_q.detach().item())
+        beta = max(0.0, min(0.9999, float(self.cfg.pi_q_guide_ema_beta)))
+        if self.q_loss_ema is None:
+            self.q_loss_ema = q_loss
+        else:
+            self.q_loss_ema = beta * self.q_loss_ema + (1.0 - beta) * q_loss
+        threshold = float(self.cfg.pi_q_guide_loss_threshold)
+        if threshold <= 0.0:
+            self.q_guide_active = True
+        elif (self.step >= int(self.cfg.pi_q_guide_min_step)
+              and self.q_loss_ema <= threshold):
+            self.q_guide_active = True
+        return self.q_loss_ema
+
+    def _effective_pi_q_weight(self) -> float:
+        return float(self.cfg.pi_q_weight) if self.q_guide_active else 0.0
+
     def _expand_skill_inputs(
         self,
         z: torch.Tensor,
@@ -1111,6 +1134,7 @@ class PolicyPriorOnlineTrainer:
         z: torch.Tensor,
         h: torch.Tensor,
         batch: Dict[str, torch.Tensor],
+        q_weight: Optional[float] = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         m = self.model
         B = z.shape[0]
@@ -1135,9 +1159,10 @@ class PolicyPriorOnlineTrainer:
             m._detach_skill_arg_q_head, z_rep, h_rep, arg, skill_id_flat,
             return_type='min').reshape(B, K)
         m.scale_tracker.update(q.detach().reshape(-1))
+        q_w = self.cfg.pi_q_weight if q_weight is None else float(q_weight)
         objective = (
             probs_d
-            * (self.cfg.pi_q_weight * q * m.scale_tracker.rho
+            * (q_w * q * m.scale_tracker.rho
                - self.cfg.skill_arg_alpha_z * kl_z)
         ).sum(-1) - self.cfg.skill_arg_alpha_d * kl_d
         loss = -objective.mean()
@@ -1349,11 +1374,14 @@ class PolicyPriorOnlineTrainer:
                                  self.cfg.grad_clip)
         self.opt_q.step()
         m.soft_update_target_Q()
+        q_loss_ema = self._update_q_guide_gate(loss_q)
+        pi_q_weight_eff = self._effective_pi_q_weight()
 
         pi_active = float(self.step >= self.cfg.pi_update_start)
         if pi_active:
             loss_pi, pi_info = self._skillarg_actor_loss(
-                b_pi['z'], b_pi['h'], b_pi)
+                b_pi['z'], b_pi['h'], b_pi,
+                q_weight=pi_q_weight_eff)
             self.opt_pi.zero_grad()
             loss_pi.backward()
             nn.utils.clip_grad_norm_(
@@ -1400,6 +1428,9 @@ class PolicyPriorOnlineTrainer:
             'q_target': y.detach().mean().item(),
             'q_next': q_next.detach().mean().item(),
             'pi_active': pi_active,
+            'pi_q_weight_eff': pi_q_weight_eff,
+            'q_loss_ema': q_loss_ema,
+            'q_guide_active': float(self.q_guide_active),
             'elite_size': float(self.elite_size),
         }
 
@@ -1715,6 +1746,8 @@ class PolicyPriorOnlineTrainer:
             'opt_q': self.opt_q.state_dict(),
             'opt_pi': self.opt_pi.state_dict(),
             'scale_tracker': self.model.scale_tracker.state_dict(),
+            'q_loss_ema': self.q_loss_ema,
+            'q_guide_active': self.q_guide_active,
         }, path)
         print(f"  Saved: {path}")
 
@@ -1727,6 +1760,9 @@ class PolicyPriorOnlineTrainer:
             self.opt_pi.load_state_dict(ck['opt_pi'])
         if 'scale_tracker' in ck:
             self.model.scale_tracker.load_state_dict(ck['scale_tracker'])
+        self.q_loss_ema = ck.get('q_loss_ema', self.q_loss_ema)
+        self.q_guide_active = bool(
+            ck.get('q_guide_active', self.q_guide_active))
         self.step = int(ck.get('step', 0))
         return self.step
 
@@ -2403,6 +2439,7 @@ def train_policy_prior_online(cfg: OnlineConfig,
                'loss_skilldec_anchor', 'skilldec_anchor_w',
                 'q_mean', 'q_policy_cql', 'q_data', 'rho', 'r_hat',
                 'q_reward', 'q_target', 'q_next', 'pi_active',
+                'pi_q_weight_eff', 'q_loss_ema', 'q_guide_active',
                 'ep_reward', 'ep_tasks', 'elite_size',
                 'elite_ep_reward', 'elite_added']}
     global_step = trainer.step
@@ -2438,7 +2475,9 @@ def train_policy_prior_online(cfg: OnlineConfig,
     print(f"  pi batch pos/off={cfg.pi_positive_fraction:.2f}/"
           f"{cfg.pi_offline_fraction:.2f}  pi_start={cfg.pi_update_start} "
           f"elite={cfg.pi_elite_fraction:.2f} "
-          f"q_w={cfg.pi_q_weight:.2f} bc={cfg.lambda_bc_pi:.3f} "
+          f"q_w={cfg.pi_q_weight:.3f} "
+          f"q_gate={cfg.pi_q_guide_loss_threshold:.3f}/"
+          f"{cfg.pi_q_guide_min_step} bc={cfg.lambda_bc_pi:.3f} "
           f"ebc={cfg.lambda_elite_bc_pi:.3f} "
           f"eskill={cfg.lambda_elite_skill_bc_pi:.3f} "
           f"earg={cfg.lambda_elite_arg_bc_pi:.3f} "
@@ -2597,11 +2636,13 @@ def train_policy_prior_online(cfg: OnlineConfig,
                       f"EBC={ms['loss_elite_bc_pi']:.3f} "
                       f"ESK={ms['loss_elite_skill_bc_pi']:.3f} "
                       f"ARG={ms['loss_elite_arg_bc_pi']:.3f} "
+                      f"QW={ms['pi_q_weight_eff']:.3f} "
                       f"Aw={ms['skilldec_anchor_w']:.2f} "
                       f"q={ms['q_mean']:.3f} "
                       f"qd={ms['q_data']:.3f} rho={ms['rho']:.3f} rhat={ms['r_hat']:.3f} "
                       f"rQ={ms['q_reward']:.3f} y={ms['q_target']:.3f} "
-                      f"pi={ms['pi_active']:.0f} | "
+                      f"pi={ms['pi_active']:.0f} qg={ms['q_guide_active']:.0f} "
+                      f"qema={ms['q_loss_ema']:.3f} | "
                       f"ep_r={ms['ep_reward']:.2f} tasks={ms['ep_tasks']:.2f} | "
                       f"elite={trainer.elite_size} epr={ms['elite_ep_reward']:.2f} | "
                       f"{sps:.0f}sps")
@@ -2711,11 +2752,13 @@ def train_policy_prior_online(cfg: OnlineConfig,
                       f"EBC={ms['loss_elite_bc_pi']:.3f} "
                       f"ESK={ms['loss_elite_skill_bc_pi']:.3f} "
                       f"ARG={ms['loss_elite_arg_bc_pi']:.3f} "
+                      f"QW={ms['pi_q_weight_eff']:.3f} "
                       f"Aw={ms['skilldec_anchor_w']:.2f} "
                       f"q={ms['q_mean']:.3f} "
                       f"qd={ms['q_data']:.3f} rho={ms['rho']:.3f} rhat={ms['r_hat']:.3f} "
                       f"rQ={ms['q_reward']:.3f} y={ms['q_target']:.3f} "
-                      f"pi={ms['pi_active']:.0f} | "
+                      f"pi={ms['pi_active']:.0f} qg={ms['q_guide_active']:.0f} "
+                      f"qema={ms['q_loss_ema']:.3f} | "
                       f"ep_r={ms['ep_reward']:.2f} tasks={ms['ep_tasks']:.2f} | "
                       f"elite={trainer.elite_size} epr={ms['elite_ep_reward']:.2f} | "
                       f"{sps:.0f}sps")
@@ -2810,6 +2853,11 @@ def main():
     p.add_argument('--actor_mode', choices=['policy_prior', 'skill_decoder', 'skill_arg'],
                    default='policy_prior')
     p.add_argument('--pi_q_weight', type=float, default=1.0)
+    p.add_argument('--pi_q_guide_loss_threshold', type=float, default=-1.0,
+                   help='If >0, keep skill_arg actor Q guide off until Q loss EMA is below this threshold.')
+    p.add_argument('--pi_q_guide_min_step', type=int, default=0,
+                   help='Minimum env step before enabling Q guide from the Q-loss gate.')
+    p.add_argument('--pi_q_guide_ema_beta', type=float, default=0.99)
     p.add_argument('--action_noise_std', type=float, default=0.0)
     p.add_argument('--skilldec_exec_horizon', type=int, default=1,
                    help='Number of decoded skill actions to execute open-loop before replanning.')
@@ -2930,6 +2978,9 @@ def main():
         pi_update_start=args.pi_update_start,
         actor_mode=args.actor_mode,
         pi_q_weight=args.pi_q_weight,
+        pi_q_guide_loss_threshold=args.pi_q_guide_loss_threshold,
+        pi_q_guide_min_step=args.pi_q_guide_min_step,
+        pi_q_guide_ema_beta=args.pi_q_guide_ema_beta,
         action_noise_std=args.action_noise_std,
         skilldec_exec_horizon=args.skilldec_exec_horizon,
         lambda_bc_pi=args.lambda_bc_pi,
