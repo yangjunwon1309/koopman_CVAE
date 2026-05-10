@@ -106,6 +106,7 @@ class OnlineConfig:
     elite_buffer_size:        int   = 50_000
     elite_reward_threshold:   float = 1.0
     offline_elite_threshold:  float = 2.0
+    offline_elite_verify_env: bool  = False
     lambda_elite_bc_pi:       float = 0.0
     lambda_elite_skill_bc_pi: float = 0.0
     lambda_elite_arg_bc_pi:   float = 0.0
@@ -632,6 +633,9 @@ class PolicyPriorOnlineTrainer:
         self.step = 0
         self.q_loss_ema: Optional[float] = None
         self.q_guide_active = cfg.pi_q_guide_loss_threshold <= 0.0
+        self.elite_return_ema: float = 0.0
+        self.elite_return_last: float = 0.0
+        self.elite_episode_count: int = 0
         self.action_inv_steps = action_inv_steps
         self.action_inv_lr = action_inv_lr
         self.lqr_planner = lqr_planner
@@ -920,6 +924,14 @@ class PolicyPriorOnlineTrainer:
         if (self.elite_buf is None or not transitions
                 or ep_return < self.cfg.elite_reward_threshold):
             return 0
+        self.elite_return_last = float(ep_return)
+        self.elite_episode_count += 1
+        if self.elite_episode_count == 1:
+            self.elite_return_ema = float(ep_return)
+        else:
+            self.elite_return_ema = (
+                0.95 * self.elite_return_ema + 0.05 * float(ep_return)
+            )
         H = int(self.elite_buf.chunk_horizon)
         n_step = max(1, int(self.cfg.q_n_step))
         gam = float(self.cfg.q_n_step_gamma)
@@ -1748,6 +1760,9 @@ class PolicyPriorOnlineTrainer:
             'scale_tracker': self.model.scale_tracker.state_dict(),
             'q_loss_ema': self.q_loss_ema,
             'q_guide_active': self.q_guide_active,
+            'elite_return_ema': self.elite_return_ema,
+            'elite_return_last': self.elite_return_last,
+            'elite_episode_count': self.elite_episode_count,
         }, path)
         print(f"  Saved: {path}")
 
@@ -1763,21 +1778,90 @@ class PolicyPriorOnlineTrainer:
         self.q_loss_ema = ck.get('q_loss_ema', self.q_loss_ema)
         self.q_guide_active = bool(
             ck.get('q_guide_active', self.q_guide_active))
+        self.elite_return_ema = float(
+            ck.get('elite_return_ema', self.elite_return_ema))
+        self.elite_return_last = float(
+            ck.get('elite_return_last', self.elite_return_last))
+        self.elite_episode_count = int(
+            ck.get('elite_episode_count', self.elite_episode_count))
         self.step = int(ck.get('step', 0))
         return self.step
+
+@torch.no_grad()
+def verify_offline_elite_returns(
+    env_name: str,
+    episodes: List[Dict],
+    candidate_returns: Dict[int, float],
+    threshold: float,
+) -> Dict[int, float]:
+    """Replay offline actions in the real env and keep only verified elites."""
+    import gym
+    import d4rl  # noqa: F401
+
+    env = gym.make(env_name)
+    verified: Dict[int, float] = {}
+    candidates = set(candidate_returns.keys())
+    n_candidates = len(candidates)
+    for ep in sorted(episodes, key=lambda e: int(e['start_t'])):
+        start_t = int(ep['start_t'])
+        if start_t not in candidates:
+            continue
+        env.reset()
+        total_r = 0.0
+        done = False
+        acts = ep['actions'].astype(np.float32)
+        for a in acts:
+            _, r, done, _ = env.step(a.clip(-1.0, 1.0))
+            total_r += float(r)
+            if done:
+                break
+        if total_r >= threshold:
+            verified[start_t] = total_r
+    try:
+        env.close()
+    except Exception:
+        pass
+    print(
+        f"[Prior Offline Elite Verify] env={env_name} "
+        f"candidates={n_candidates} verified={len(verified)} "
+        f"thr={threshold:.2f}"
+    )
+    return verified
+
 
 @torch.no_grad()
 def prefill_prior_buffer_from_offline(trainer: PolicyPriorOnlineTrainer,
                                       x_cache_path: str,
                                       quality: str = 'mixed',
                                       max_transitions: int = 50_000,
-                                      device: str = 'cuda') -> int:
+                                      device: str = 'cuda',
+                                      env_name: str = 'kitchen-mixed-v0') -> int:
     """Offline data prefill for --prior_online with LQR regularization targets."""
     dev = torch.device(device)
     model = trainer.model
     model.eval()
     x_seq_full, _, _ = load_x_sequences(x_cache_path)
     episodes, _ = load_kitchen_episodes(quality=quality, min_len=trainer.cfg.cond_len + 2)
+    verified_elite_returns: Dict[int, float] = {}
+    if trainer.cfg.offline_elite_verify_env:
+        candidate_returns: Dict[int, float] = {}
+        for ep in episodes:
+            rews = ep['rewards'].astype(np.float32)
+            rew_max = float(rews.max()) if len(rews) else 0.0
+            if len(rews) > 1 and np.all(np.diff(rews) >= -1e-6) and rew_max > 1.0:
+                r_step = np.diff(rews, prepend=rews[0])
+            else:
+                r_step = rews
+            r_step = np.clip(r_step, 0.0, 1.0).astype(np.float32)
+            ep_return = float((r_step > 0.0).sum())
+            if ep_return >= trainer.cfg.offline_elite_threshold:
+                candidate_returns[int(ep['start_t'])] = ep_return
+        verified_elite_returns = verify_offline_elite_returns(
+            env_name,
+            episodes,
+            candidate_returns,
+            trainer.cfg.offline_elite_threshold,
+        )
     np.random.shuffle(episodes)
 
     n_added = 0
@@ -1886,11 +1970,14 @@ def prefill_prior_buffer_from_offline(trainer: PolicyPriorOnlineTrainer,
             n_added += 1
             if n_added >= max_transitions:
                 break
+        elite_return = ep_return
+        if trainer.cfg.offline_elite_verify_env:
+            elite_return = verified_elite_returns.get(int(ep['start_t']), -1.0)
         if (episode_transitions
-                and ep_return >= trainer.cfg.offline_elite_threshold):
+                and elite_return >= trainer.cfg.offline_elite_threshold):
             n_elite_added += trainer.add_elite_episode(
                 episode_transitions,
-                max(ep_return, trainer.cfg.elite_reward_threshold),
+                max(elite_return, trainer.cfg.elite_reward_threshold),
             )
             n_elite_eps += 1
 
@@ -1898,6 +1985,7 @@ def prefill_prior_buffer_from_offline(trainer: PolicyPriorOnlineTrainer,
         f"[Prior Offline Pre-fill] added {n_added}  buf={trainer.buf.size} "
         f"offline_elite={n_elite_added} eps={n_elite_eps} "
         f"thr={trainer.cfg.offline_elite_threshold:.2f} "
+        f"verify={int(trainer.cfg.offline_elite_verify_env)} "
         f"elite_buf={trainer.elite_size}"
     )
     return n_added
@@ -2482,6 +2570,19 @@ def train_policy_prior_online(cfg: OnlineConfig,
           f"eskill={cfg.lambda_elite_skill_bc_pi:.3f} "
           f"earg={cfg.lambda_elite_arg_bc_pi:.3f} "
           f"anchor={cfg.lambda_skilldec_anchor:.3f}->{cfg.skilldec_anchor_min:.3f}")
+    if cfg.pi_q_guide_loss_threshold > 0.0:
+        print(
+            "  phase P0=critic-only before pi_start | "
+            "P1=elite BC only(QW=0) until "
+            f"step>={cfg.pi_q_guide_min_step} and "
+            f"qema<={cfg.pi_q_guide_loss_threshold:.3f} | "
+            f"P2=elite BC + Q guide(QW={cfg.pi_q_weight:.3f})"
+        )
+    else:
+        print(
+            "  phase P0=critic-only before pi_start | "
+            f"P2=actor uses Q guide after pi_start(QW={cfg.pi_q_weight:.3f})"
+        )
     if cfg.actor_mode == 'skill_arg':
         print(f"  skill-arg SAC alpha_d={cfg.skill_arg_alpha_d:.3f} "
               f"alpha_z={cfg.skill_arg_alpha_z:.3f} "
@@ -2491,7 +2592,8 @@ def train_policy_prior_online(cfg: OnlineConfig,
               "critic=Q(z,h,arg,d)")
     print(f"  elite buffer size={cfg.elite_buffer_size} "
           f"threshold={cfg.elite_reward_threshold:.2f} "
-          f"offline_threshold={cfg.offline_elite_threshold:.2f}")
+          f"offline_threshold={cfg.offline_elite_threshold:.2f} "
+          f"offline_verify={int(cfg.offline_elite_verify_env)}")
     print(f"{'='*60}\n")
 
     while global_step < cfg.n_env_steps:
@@ -2626,6 +2728,9 @@ def train_policy_prior_online(cfg: OnlineConfig,
                 trainer.step = global_step
                 ms = {k: np.mean(list(v)) if v else 0.0
                       for k, v in recent.items()}
+                elite_epr = (ms['elite_ep_reward']
+                             if ms['elite_ep_reward'] > 0.0
+                             else trainer.elite_return_ema)
                 sps = cfg.log_every / (time.time() - t0 + 1e-6)
                 t0 = time.time()
                 print(f"Step {global_step:7d} | "
@@ -2644,7 +2749,7 @@ def train_policy_prior_online(cfg: OnlineConfig,
                       f"pi={ms['pi_active']:.0f} qg={ms['q_guide_active']:.0f} "
                       f"qema={ms['q_loss_ema']:.3f} | "
                       f"ep_r={ms['ep_reward']:.2f} tasks={ms['ep_tasks']:.2f} | "
-                      f"elite={trainer.elite_size} epr={ms['elite_ep_reward']:.2f} | "
+                      f"elite={trainer.elite_size} epr={elite_epr:.2f} | "
                       f"{sps:.0f}sps")
                 if use_wandb:
                     wandb.log({f"prior_online/{k}": v for k, v in ms.items()},
@@ -2742,6 +2847,9 @@ def train_policy_prior_online(cfg: OnlineConfig,
                 trainer.step = global_step
                 ms = {k: np.mean(list(v)) if v else 0.0
                       for k, v in recent.items()}
+                elite_epr = (ms['elite_ep_reward']
+                             if ms['elite_ep_reward'] > 0.0
+                             else trainer.elite_return_ema)
                 sps = cfg.log_every / (time.time() - t0 + 1e-6)
                 t0 = time.time()
                 print(f"Step {global_step:7d} | "
@@ -2760,7 +2868,7 @@ def train_policy_prior_online(cfg: OnlineConfig,
                       f"pi={ms['pi_active']:.0f} qg={ms['q_guide_active']:.0f} "
                       f"qema={ms['q_loss_ema']:.3f} | "
                       f"ep_r={ms['ep_reward']:.2f} tasks={ms['ep_tasks']:.2f} | "
-                      f"elite={trainer.elite_size} epr={ms['elite_ep_reward']:.2f} | "
+                      f"elite={trainer.elite_size} epr={elite_epr:.2f} | "
                       f"{sps:.0f}sps")
                 if use_wandb:
                     wandb.log({f"prior_online/{k}": v for k, v in ms.items()},
@@ -2831,6 +2939,8 @@ def main():
     p.add_argument('--elite_buffer_size',        type=int,   default=50_000)
     p.add_argument('--elite_reward_threshold',   type=float, default=1.0)
     p.add_argument('--offline_elite_threshold',  type=float, default=2.0)
+    p.add_argument('--offline_elite_verify_env', action='store_true',
+                   help='Replay offline actions in the real env and only add verified successful episodes to elite buffer.')
     p.add_argument('--lambda_elite_bc_pi',       type=float, default=0.0)
     p.add_argument('--lambda_elite_skill_bc_pi', type=float, default=0.0)
     p.add_argument('--lambda_elite_arg_bc_pi',   type=float, default=0.0)
@@ -2961,6 +3071,7 @@ def main():
         elite_buffer_size=args.elite_buffer_size,
         elite_reward_threshold=args.elite_reward_threshold,
         offline_elite_threshold=args.offline_elite_threshold,
+        offline_elite_verify_env=args.offline_elite_verify_env,
         lambda_elite_bc_pi=args.lambda_elite_bc_pi,
         lambda_elite_skill_bc_pi=args.lambda_elite_skill_bc_pi,
         lambda_elite_arg_bc_pi=args.lambda_elite_arg_bc_pi,
@@ -3035,7 +3146,8 @@ def main():
                 quality = 'complete'
             prefill_prior_buffer_from_offline(
                 trainer, args.x_cache, quality=quality,
-                max_transitions=args.prefill_size, device=device)
+                max_transitions=args.prefill_size, device=device,
+                env_name=args.env)
         train_policy_prior_online(
             cfg, trainer, args.env, args.out_dir, device, use_wandb)
         if use_wandb:
