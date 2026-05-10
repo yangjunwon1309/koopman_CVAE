@@ -115,6 +115,8 @@ class OnlineConfig:
     q_bootstrap:              float = 0.0
     q_success_only:           bool  = False
     q_success_value:          float = 1.0
+    q_success_threshold:      float = 0.5
+    q_success_include_source: bool  = False
     lambda_q_negative:        float = 0.0
     lambda_q_success_rank:    float = 0.0
     q_success_margin:         float = 0.5
@@ -1264,7 +1266,9 @@ class PolicyPriorOnlineTrainer:
             r_q, r_hat = self._q_reward(z, b_q['u'], r)
             source_q = b_q.get('source', z.new_zeros(z.shape[0])).to(z.device)
             ret_q = b_q.get('r_return', r).to(z.device)
-            success_mask = (source_q > 1.5) | (ret_q > 0.5)
+            success_mask = ret_q > self.cfg.q_success_threshold
+            if self.cfg.q_success_include_source:
+                success_mask = success_mask | (source_q > 1.5)
             if self.cfg.q_success_only:
                 r_targ = torch.where(
                     success_mask,
@@ -1306,7 +1310,9 @@ class PolicyPriorOnlineTrainer:
         q_vals_d = two_hot_decode(q_logits_d, m.skill_arg_q_head.bins).min(0).values
         source_f = b_q.get('source', z.new_zeros(z.shape[0])).to(z.device)
         ret_f = b_q.get('r_return', z.new_zeros(z.shape[0])).to(z.device)
-        success_mask_f = (source_f > 1.5) | (ret_f > 0.5)
+        success_mask_f = ret_f > self.cfg.q_success_threshold
+        if self.cfg.q_success_include_source:
+            success_mask_f = success_mask_f | (source_f > 1.5)
         neg_mask = ~success_mask_f
         loss_q_negative = z.new_tensor(0.0)
         if self.cfg.lambda_q_negative > 0.0 and bool(neg_mask.any()):
@@ -2426,7 +2432,9 @@ def train_policy_prior_online(cfg: OnlineConfig,
           f"success_value={cfg.q_success_value:.2f} "
           f"neg={cfg.lambda_q_negative:.2f} "
           f"succ_rank={cfg.lambda_q_success_rank:.2f} "
-          f"succ_margin={cfg.q_success_margin:.2f}")
+          f"succ_margin={cfg.q_success_margin:.2f} "
+          f"succ_thr={cfg.q_success_threshold:.2f} "
+          f"succ_src={int(cfg.q_success_include_source)}")
     print(f"  pi batch pos/off={cfg.pi_positive_fraction:.2f}/"
           f"{cfg.pi_offline_fraction:.2f}  pi_start={cfg.pi_update_start} "
           f"elite={cfg.pi_elite_fraction:.2f} "
@@ -2791,6 +2799,10 @@ def main():
     p.add_argument('--q_success_only', action='store_true',
                    help='For skill_arg Q, give positive targets only to elite/success chunks and zero to others.')
     p.add_argument('--q_success_value', type=float, default=1.0)
+    p.add_argument('--q_success_threshold', type=float, default=0.5,
+                   help='For skill_arg success-only Q, mark a chunk positive only when r_return exceeds this threshold.')
+    p.add_argument('--q_success_include_source', action='store_true',
+                   help='Also mark source>1.5 elite chunks positive for Q. Off by default; BC still uses source.')
     p.add_argument('--lambda_q_negative', type=float, default=0.0)
     p.add_argument('--lambda_q_success_rank', type=float, default=0.0)
     p.add_argument('--q_success_margin', type=float, default=0.5)
@@ -2910,6 +2922,8 @@ def main():
         q_bootstrap=args.q_bootstrap,
         q_success_only=args.q_success_only,
         q_success_value=args.q_success_value,
+        q_success_threshold=args.q_success_threshold,
+        q_success_include_source=args.q_success_include_source,
         lambda_q_negative=args.lambda_q_negative,
         lambda_q_success_rank=args.lambda_q_success_rank,
         q_success_margin=args.q_success_margin,
