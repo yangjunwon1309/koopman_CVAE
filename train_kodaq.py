@@ -220,6 +220,7 @@ class Trainer:
         'loss_skill_decoder_latent',
         'loss_skill_arg_decoder', 'loss_skill_arg_action',
         'loss_skill_arg_kl', 'loss_skill_arg_policy',
+        'loss_skill_arg_progress',
         # v5 diagnostics
         'rho', 'q_scale',
     ]
@@ -488,6 +489,7 @@ class Trainer:
                 line += f"  act={metrics.get('loss_skill_arg_action', 0.0):.4f}"
                 line += f"  kl={metrics.get('loss_skill_arg_kl', 0.0):.4f}"
                 line += f"  pi={metrics.get('loss_skill_arg_policy', 0.0):.4f}"
+                line += f"  prog={metrics.get('loss_skill_arg_progress', 0.0):.4f}"
             else:
                 for k in ['loss', 'loss_wm', 'loss_rec', 'loss_dyn',
                           'loss_skill', 'loss_reg']:
@@ -505,6 +507,7 @@ class Trainer:
                 if metrics.get('loss_skill_arg_decoder', 0.0) != 0.0:
                     line += f"  skarg={metrics['loss_skill_arg_decoder']:.4f}"
                     line += f"  act={metrics.get('loss_skill_arg_action', 0.0):.4f}"
+                    line += f"  prog={metrics.get('loss_skill_arg_progress', 0.0):.4f}"
             # loss_goal: always show when use_goal_proposal (even if 0 in Phase A)
             if use_goal and 'loss_goal' in metrics:
                 line += f"  goal={metrics['loss_goal']:.4f}"
@@ -644,7 +647,10 @@ class Trainer:
             f"  use_h={self.model.cfg.skill_arg_use_h} "
             f"enc_state={int(getattr(self.model.cfg, 'skill_arg_encoder_use_state', True))} "
             f"pol_state={int(getattr(self.model.cfg, 'skill_arg_policy_use_state', True))} "
-            f"dec_state={int(getattr(self.model.cfg, 'skill_arg_decoder_use_state', True))}",
+            f"dec_state={int(getattr(self.model.cfg, 'skill_arg_decoder_use_state', True))} "
+            f"label_onehot={int(getattr(self.model.cfg, 'skill_arg_use_label_onehot', False))} "
+            f"progress={int(getattr(self.model.cfg, 'skill_arg_predict_progress', False))} "
+            f"pthr={float(getattr(self.model.cfg, 'skill_arg_progress_threshold', 0.5)):.2f}",
             flush=True,
         )
         print(f"{'='*60}", flush=True)
@@ -897,9 +903,15 @@ def parse_args():
                    help='Do not feed z_t/h_t to D(...).')
     p.add_argument('--skill_arg_policy_no_state', action='store_true',
                    help='Do not feed z_t/h_t to pi(c|...). Mostly for ablations.')
+    p.add_argument('--skill_arg_soft_skills', action='store_true',
+                   help='Use frozen soft skill prior instead of cluster-label one-hot skills.')
+    p.add_argument('--skill_arg_predict_progress', action='store_true',
+                   help='Predict binary skill termination/progress from cluster label transitions.')
+    p.add_argument('--skill_arg_progress_threshold', type=float, default=0.5)
     p.add_argument('--lambda_skill_arg_decoder', type=float, default=1.0)
     p.add_argument('--lambda_skill_arg_kl', type=float, default=1e-3)
     p.add_argument('--lambda_skill_arg_policy', type=float, default=1.0)
+    p.add_argument('--lambda_skill_arg_progress', type=float, default=1.0)
 
     # ── resume (two-stage fine-tuning) ──────────────────────────────────
     p.add_argument('--resume_ckpt',        type=str,   default=None,
@@ -1010,10 +1022,14 @@ if __name__ == '__main__':
     cfg.skill_arg_decoder_use_state = not (
         args.skill_arg_extract_style or args.skill_arg_decoder_no_state)
     cfg.skill_arg_policy_use_state = not args.skill_arg_policy_no_state
+    cfg.skill_arg_use_label_onehot = not args.skill_arg_soft_skills
+    cfg.skill_arg_predict_progress = args.skill_arg_predict_progress
+    cfg.skill_arg_progress_threshold = args.skill_arg_progress_threshold
     cfg.lambda_skill_arg_decoder = (
         args.lambda_skill_arg_decoder if args.train_skill_arg_decoder else 0.0)
     cfg.lambda_skill_arg_kl = args.lambda_skill_arg_kl
     cfg.lambda_skill_arg_policy = args.lambda_skill_arg_policy
+    cfg.lambda_skill_arg_progress = args.lambda_skill_arg_progress
     cfg.use_lqr_policy = args.use_lqr_policy
     cfg.lqr_horizon    = args.lqr_horizon
     cfg.lambda_lqr_pi = args.lambda_lqr_pi if args.use_lqr_policy else 0.0
@@ -1117,10 +1133,14 @@ if __name__ == '__main__':
         resume_cfg.skill_arg_decoder_use_state = not (
             args.skill_arg_extract_style or args.skill_arg_decoder_no_state)
         resume_cfg.skill_arg_policy_use_state = not args.skill_arg_policy_no_state
+        resume_cfg.skill_arg_use_label_onehot = not args.skill_arg_soft_skills
+        resume_cfg.skill_arg_predict_progress = args.skill_arg_predict_progress
+        resume_cfg.skill_arg_progress_threshold = args.skill_arg_progress_threshold
         resume_cfg.lambda_skill_arg_decoder = (
             args.lambda_skill_arg_decoder if args.train_skill_arg_decoder else 0.0)
         resume_cfg.lambda_skill_arg_kl = args.lambda_skill_arg_kl
         resume_cfg.lambda_skill_arg_policy = args.lambda_skill_arg_policy
+        resume_cfg.lambda_skill_arg_progress = args.lambda_skill_arg_progress
         resume_cfg.phase               = 3
         cfg = resume_cfg
 
@@ -1208,7 +1228,10 @@ if __name__ == '__main__':
                   f"use_h={not args.skill_arg_no_h} "
                   f"enc_state={int(not (args.skill_arg_extract_style or args.skill_arg_encoder_no_state))} "
                   f"pol_state={int(not args.skill_arg_policy_no_state)} "
-                  f"dec_state={int(not (args.skill_arg_extract_style or args.skill_arg_decoder_no_state))}",
+                  f"dec_state={int(not (args.skill_arg_extract_style or args.skill_arg_decoder_no_state))} "
+                  f"label_onehot={int(not args.skill_arg_soft_skills)} "
+                  f"progress={int(args.skill_arg_predict_progress)} "
+                  f"pthr={args.skill_arg_progress_threshold:.2f}",
                   flush=True)
         else:
             args.resume_stage  = 'two_stage'

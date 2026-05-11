@@ -277,7 +277,17 @@ class PolicyWrapper:
             w = F.one_hot(
                 skill_id, num_classes=self._model.cfg.num_skills).float()
             arg = self._model.skill_argument_policy.mean_arg(z_t, h_t, w)
-            a_seq = self._model.skill_argument_decoder(z_t, h_t, w, arg)
+            if bool(getattr(self._model.cfg, 'skill_arg_predict_progress', False)):
+                a_seq, progress = self._model.skill_argument_decoder(
+                    z_t, h_t, w, arg, return_progress=True)
+                p_term = torch.sigmoid(progress[0])
+                threshold = float(getattr(
+                    self._model.cfg, 'skill_arg_progress_threshold', 0.5))
+                hits = torch.nonzero(p_term >= threshold, as_tuple=False)
+                if hits.numel() > 0:
+                    a_seq = a_seq[:, :int(hits[0, 0].item()) + 1]
+            else:
+                a_seq = self._model.skill_argument_decoder(z_t, h_t, w, arg)
             return a_seq[0].cpu().numpy()
         else:
             trainer = self._trainer; cfg = self._cfg
@@ -312,7 +322,17 @@ class PolicyWrapper:
             w = F.one_hot(
                 skill_id, num_classes=self._model.cfg.num_skills).float()
             arg = self._model.skill_argument_policy.mean_arg(z_now, h, w)
-            a_seq = self._model.skill_argument_decoder(z_now, h, w, arg)
+            if bool(getattr(self._model.cfg, 'skill_arg_predict_progress', False)):
+                a_seq, progress = self._model.skill_argument_decoder(
+                    z_now, h, w, arg, return_progress=True)
+                p_term = torch.sigmoid(progress[0])
+                threshold = float(getattr(
+                    self._model.cfg, 'skill_arg_progress_threshold', 0.5))
+                hits = torch.nonzero(p_term >= threshold, as_tuple=False)
+                if hits.numel() > 0:
+                    a_seq = a_seq[:, :int(hits[0, 0].item()) + 1]
+            else:
+                a_seq = self._model.skill_argument_decoder(z_now, h, w, arg)
         return a_seq[0].cpu().numpy()
 
     @property

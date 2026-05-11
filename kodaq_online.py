@@ -759,7 +759,8 @@ class PolicyPriorOnlineTrainer:
         h: torch.Tensor,
         deterministic: bool = False,
         mean_arg: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return_progress: bool = False,
+    ) -> Tuple[torch.Tensor, ...]:
         logits_d = self._skill_policy_logits(z, h)
         probs_d = torch.softmax(logits_d, dim=-1)
         if deterministic:
@@ -772,6 +773,10 @@ class PolicyPriorOnlineTrainer:
             log_arg = z.new_zeros(z.shape[:-1])
         else:
             arg, log_arg, _, _ = self.model.skill_argument_policy(z, h, skill_oh)
+        if return_progress:
+            a_seq, progress = self.model.skill_argument_decoder(
+                z, h, skill_oh, arg, return_progress=True)
+            return a_seq, skill_id, arg, log_arg, progress
         a_seq = self.model.skill_argument_decoder(z, h, skill_oh, arg)
         return a_seq, skill_id, arg, log_arg
 
@@ -805,14 +810,22 @@ class PolicyPriorOnlineTrainer:
                 self.cfg.skill_arg_mean_after_pi_start
                 and self.step >= self.cfg.pi_update_start
             )
-            a_seq_t, skill_id, arg, _ = self._sample_skillarg_action(
-                z, h, deterministic=False, mean_arg=use_mean_arg)
+            a_seq_t, skill_id, arg, _, progress_t = self._sample_skillarg_action(
+                z, h, deterministic=False, mean_arg=use_mean_arg,
+                return_progress=True)
             self._last_skillarg_meta = {
                 'skill_id': skill_id.detach().cpu().numpy().copy(),
                 'skill_arg': arg.detach().cpu().numpy().copy(),
             }
             a_seq = a_seq_t[0].clamp(-1.0, 1.0)
             n = max(1, int(horizon or self.cfg.skilldec_exec_horizon))
+            if bool(getattr(self.model.cfg, 'skill_arg_predict_progress', False)):
+                p_term = torch.sigmoid(progress_t[0])
+                threshold = float(getattr(
+                    self.model.cfg, 'skill_arg_progress_threshold', 0.5))
+                hits = torch.nonzero(p_term >= threshold, as_tuple=False)
+                if hits.numel() > 0:
+                    n = min(n, int(hits[0, 0].item()) + 1)
             a_seq = a_seq[:min(n, a_seq.shape[0])]
             if self.cfg.action_noise_std > 0.0:
                 a_seq = (
@@ -848,6 +861,10 @@ class PolicyPriorOnlineTrainer:
         deterministic: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         w = self.model.skill_prior.soft_weights(h)
+        if bool(getattr(self.model.cfg, 'skill_arg_use_label_onehot', False)):
+            w = F.one_hot(
+                w.argmax(dim=-1), num_classes=self.model.cfg.num_skills
+            ).float()
         policy = self.skill_arg_policy_anchor if anchor else self.model.skill_argument_policy
         if anchor or deterministic:
             arg = policy.mean_arg(z, h, w)
@@ -2033,6 +2050,11 @@ def prefill_prior_buffer_from_offline(trainer: PolicyPriorOnlineTrainer,
             skill_logits_t = model.skill_prior(h_pre_ep[t:t + 1])
             skill_prob_t = torch.softmax(skill_logits_t, dim=-1)
             skill_id_t = int(skill_prob_t.argmax(dim=-1).item())
+            if bool(getattr(model.cfg, 'skill_arg_use_label_onehot', False)):
+                skill_prob_t = F.one_hot(
+                    torch.tensor([skill_id_t], device=dev),
+                    num_classes=model.cfg.num_skills,
+                ).float()
             a_chunk_t = torch.FloatTensor(a_chunk).unsqueeze(0).to(dev)
             _, arg_mu_t, _ = model.skill_argument_encoder(
                 z_ep[t:t + 1], h_pre_ep[t:t + 1], skill_prob_t, a_chunk_t)
@@ -2705,6 +2727,9 @@ def train_policy_prior_online(cfg: OnlineConfig,
               f"enc_state={int(getattr(trainer.model.cfg, 'skill_arg_encoder_use_state', True))} "
               f"pol_state={int(getattr(trainer.model.cfg, 'skill_arg_policy_use_state', True))} "
               f"dec_state={int(getattr(trainer.model.cfg, 'skill_arg_decoder_use_state', True))} "
+              f"label_onehot={int(getattr(trainer.model.cfg, 'skill_arg_use_label_onehot', False))} "
+              f"progress={int(getattr(trainer.model.cfg, 'skill_arg_predict_progress', False))} "
+              f"pthr={float(getattr(trainer.model.cfg, 'skill_arg_progress_threshold', 0.5)):.2f} "
               f"skill_d_no_h={int(cfg.skill_d_no_h)} "
               f"mean_after_pi={int(cfg.skill_arg_mean_after_pi_start)} "
               "critic=Q(z,h,arg,d)")

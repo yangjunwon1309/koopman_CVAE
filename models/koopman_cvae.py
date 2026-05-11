@@ -153,9 +153,13 @@ class KoopmanCVAEConfig:
     skill_arg_encoder_use_state: bool  = True
     skill_arg_policy_use_state:  bool  = True
     skill_arg_decoder_use_state: bool  = True
+    skill_arg_use_label_onehot:  bool  = False
+    skill_arg_predict_progress:  bool  = False
+    skill_arg_progress_threshold: float = 0.5
     lambda_skill_arg_decoder:    float = 0.0
     lambda_skill_arg_kl:         float = 1e-3
     lambda_skill_arg_policy:     float = 1.0
+    lambda_skill_arg_progress:   float = 1.0
     use_skill_arg_q:             bool  = False
     skill_arg_q_hidden:          int   = 512
     skill_arg_q_layers:          int   = 3
@@ -835,6 +839,9 @@ class SkillArgumentActionDecoder(nn.Module):
         arg_dim = int(getattr(cfg, 'skill_arg_dim', 16))
         self.use_h = bool(getattr(cfg, 'skill_arg_use_h', True))
         self.use_state = bool(getattr(cfg, 'skill_arg_decoder_use_state', True))
+        self.predict_progress = bool(
+            getattr(cfg, 'skill_arg_predict_progress', False))
+        self.out_dim = cfg.action_dim + (1 if self.predict_progress else 0)
         in_dim = cfg.num_skills + arg_dim
         if self.use_state:
             in_dim += cfg.koopman_dim
@@ -844,7 +851,7 @@ class SkillArgumentActionDecoder(nn.Module):
         layers = int(getattr(cfg, 'skill_arg_layers', 3))
         self.net = make_mlp(
             in_dim,
-            self.H * cfg.action_dim,
+            self.H * self.out_dim,
             hidden,
             layers,
             cfg.dropout,
@@ -856,6 +863,7 @@ class SkillArgumentActionDecoder(nn.Module):
         h: torch.Tensor,
         skill_prob: torch.Tensor,
         arg: torch.Tensor,
+        return_progress: bool = False,
     ) -> torch.Tensor:
         parts = []
         if self.use_state:
@@ -865,7 +873,15 @@ class SkillArgumentActionDecoder(nn.Module):
         parts.extend([skill_prob, arg])
         x = torch.cat(parts, dim=-1)
         out = self.net(x)
-        return out.reshape(*x.shape[:-1], self.H, self.cfg.action_dim)
+        out = out.reshape(*x.shape[:-1], self.H, self.out_dim)
+        actions = out[..., :self.cfg.action_dim]
+        if not return_progress:
+            return actions
+        if self.predict_progress:
+            progress = out[..., self.cfg.action_dim]
+        else:
+            progress = out.new_zeros(*out.shape[:-1])
+        return actions, progress
 
 
 class SkillArgQHead(nn.Module):
@@ -1441,25 +1457,58 @@ class KoopmanCVAE(nn.Module):
         o_seq: torch.Tensor,
         h_pre_seq: torch.Tensor,
         skill_logits: torch.Tensor,
+        skill_labels: Optional[torch.Tensor],
         actions: torch.Tensor,
         mask: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         cfg = self.cfg
         H = int(getattr(cfg, 'skill_decoder_horizon', 4))
         B, T, _ = actions.shape
         device = actions.device
         if H <= 0 or T < H:
             zero = actions.new_tensor(0.0)
-            return zero, zero, zero, zero
+            return zero, zero, zero, zero, zero
 
         N = T - H + 1
         o_in = o_seq[:, :N]
         h_in = h_pre_seq[:, :N]
-        w_in = torch.softmax(skill_logits[:, :N], dim=-1)
+        if (getattr(cfg, 'skill_arg_use_label_onehot', False)
+                and skill_labels is not None):
+            start_labels = skill_labels[:, :N].long().clamp(
+                0, cfg.num_skills - 1)
+            w_in = F.one_hot(start_labels, num_classes=cfg.num_skills).float()
+        else:
+            start_labels = None
+            w_in = torch.softmax(skill_logits[:, :N], dim=-1)
         target_a = torch.stack(
             [actions[:, k:k + N] for k in range(H)], dim=2
         )
         valid = self._chunk_valid_mask(mask, B, N, H, device)
+        step_valid = torch.ones(B, N, H, dtype=torch.bool, device=device)
+        if mask is not None:
+            m = mask.to(device).bool()
+            for k in range(H):
+                step_valid[:, :, k] = m[:, k:k + N]
+
+        if start_labels is not None:
+            label_chunks = torch.stack(
+                [skill_labels[:, k:k + N] for k in range(H)], dim=2
+            ).to(device).long()
+            same_skill = label_chunks.eq(start_labels.unsqueeze(-1))
+            action_step_mask = step_valid & same_skill
+            valid = action_step_mask.any(dim=-1)
+            progress_target = torch.zeros(B, N, H, device=device)
+            progress_mask = action_step_mask.float()
+            for k in range(H - 1):
+                cur = skill_labels[:, k:k + N].to(device)
+                nxt = skill_labels[:, k + 1:k + 1 + N].to(device)
+                progress_target[:, :, k] = (
+                    cur.long() != nxt.long()).float()
+            progress_target = progress_target * progress_mask
+        else:
+            action_step_mask = step_valid
+            progress_target = torch.zeros(B, N, H, device=device)
+            progress_mask = step_valid.float()
 
         if getattr(cfg, 'skill_decoder_detach_latents', True):
             o_in = o_in.detach()
@@ -1468,9 +1517,14 @@ class KoopmanCVAE(nn.Module):
 
         arg, mu, logvar = self.skill_argument_encoder(
             o_in, h_in, w_in, target_a)
-        pred_a = self.skill_argument_decoder(o_in, h_in, w_in, arg)
-        action_err = (pred_a - target_a).pow(2).mean(dim=(-1, -2))
-        loss_action = self._masked_mean(action_err, valid)
+        pred_a, pred_progress = self.skill_argument_decoder(
+            o_in, h_in, w_in, arg, return_progress=True)
+
+        # EXTRACT uses NLL under a unit-variance Gaussian. The constant term is
+        # omitted because it has no gradient; this is 0.5 * MSE with masks.
+        action_nll = 0.5 * (pred_a - target_a).pow(2).mean(dim=-1)
+        denom = action_step_mask.float().sum().clamp_min(1.0)
+        loss_action = (action_nll * action_step_mask.float()).sum() / denom
 
         kl = 0.5 * (logvar.exp() + mu.pow(2) - 1.0 - logvar).sum(-1)
         loss_kl = self._masked_mean(kl, valid)
@@ -1480,12 +1534,21 @@ class KoopmanCVAE(nn.Module):
         pol_err = (arg_mean - arg_target).pow(2).mean(-1)
         loss_policy = self._masked_mean(pol_err, valid)
 
+        if getattr(cfg, 'skill_arg_predict_progress', False):
+            progress_bce = F.binary_cross_entropy_with_logits(
+                pred_progress, progress_target, reduction='none')
+            loss_progress = (
+                progress_bce * progress_mask).sum() / progress_mask.sum().clamp_min(1.0)
+        else:
+            loss_progress = actions.new_tensor(0.0)
+
         loss = (
             loss_action
             + getattr(cfg, 'lambda_skill_arg_kl', 1e-3) * loss_kl
             + getattr(cfg, 'lambda_skill_arg_policy', 1.0) * loss_policy
+            + getattr(cfg, 'lambda_skill_arg_progress', 1.0) * loss_progress
         )
-        return loss, loss_action, loss_kl, loss_policy
+        return loss, loss_action, loss_kl, loss_policy, loss_progress
 
     def _compute_losses(
         self,
@@ -1559,6 +1622,7 @@ class KoopmanCVAE(nn.Module):
         loss_skill_arg_action = torch.tensor(0.0, device=device)
         loss_skill_arg_kl = torch.tensor(0.0, device=device)
         loss_skill_arg_policy = torch.tensor(0.0, device=device)
+        loss_skill_arg_progress = torch.tensor(0.0, device=device)
         if (getattr(cfg, 'use_skill_decoder', False)
                 and getattr(cfg, 'lambda_skill_decoder', 0.0) > 0.0
                 and h_pre_seq is not None
@@ -1580,10 +1644,12 @@ class KoopmanCVAE(nn.Module):
             (loss_skill_arg_decoder,
              loss_skill_arg_action,
              loss_skill_arg_kl,
-             loss_skill_arg_policy) = self._compute_skill_arg_decoder_loss(
+             loss_skill_arg_policy,
+             loss_skill_arg_progress) = self._compute_skill_arg_decoder_loss(
                 o_seq=o_seq,
                 h_pre_seq=h_pre_seq,
                 skill_logits=skill_logits,
+                skill_labels=skill_labels,
                 actions=actions,
                 mask=mask,
             )
@@ -1955,6 +2021,7 @@ class KoopmanCVAE(nn.Module):
             'loss_skill_arg_action':     loss_skill_arg_action,
             'loss_skill_arg_kl':         loss_skill_arg_kl,
             'loss_skill_arg_policy':     loss_skill_arg_policy,
+            'loss_skill_arg_progress':   loss_skill_arg_progress,
             'rho':              torch.tensor(self.scale_tracker.rho, device=device),
             'q_scale':          torch.tensor(self.scale_tracker.scale, device=device),
         }
