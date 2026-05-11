@@ -5,12 +5,12 @@ train.py — KODAQ v5 Training Script
 v5 changes over v4:
   - After each optimizer step: model.soft_update_target_Q()  (EMA target Q)
   - LOG_KEYS extended: loss_reward, loss_q, loss_pi, rho, q_scale
-  - rewards = step reward {0,1} (not accumulated)
+  - reward crop/head training disabled for clean world-model pretraining
   - Policy prior training starts at phase 2 (controlled inside model)
   - wandb logging (--wandb_project / --wandb_run, iql_koopman.py 패턴)
 
 Phase schedule:
-  Phase 1: WM rec + L_R + L_Q   (world model + Q/reward heads, no pi)
+  Phase 1: WM rec only
   Phase 2: + L_dyn + L_skill + L_pi
   Phase 3: + L_reg
 
@@ -194,7 +194,7 @@ def load_dataset(args, cfg: KoopmanCVAEConfig):
             pca_dim=args.pca_dim,
             device=args.device,
             mode='window',
-            reward_crop=None if args.reward_crop < 0 else args.reward_crop,
+            reward_crop=None,
         )
         # goal_z_seq is computed on-the-fly from skill_labels inside model.forward()
         # No external npz needed: skill_labels already in dataset (4-tuple)
@@ -292,7 +292,9 @@ class Trainer:
         if mask    is not None: mask    = mask.to(self.device)
         if rewards is not None: rewards = rewards.to(self.device)
         if goal_z_seq is not None: goal_z_seq = goal_z_seq.to(self.device)
-        if not self.train_heads:
+        # Reward-head supervision is removed. Keep rewards only for explicit
+        # resumed Q-head training; fresh WM pretraining never sees reward crops.
+        if not self.train_heads or self.model.cfg.lambda_q <= 0.0:
             rewards = None
 
         return self.model(
@@ -330,8 +332,6 @@ class Trainer:
 
     def _head_modules(self):
         return [
-            self.model.reward_head,
-            self.model.reward_ensemble_head,
             self.model.q_head,
             self.model.policy_prior,
             self.model.goal_proposal,
@@ -381,7 +381,7 @@ class Trainer:
             p.requires_grad_(flag)
 
     def _set_head_loss_weights(self, reward=None, q=None, pi=None, goal=None, lqr_pi=None):
-        if reward is not None: self.model.cfg.lambda_reward = reward
+        if reward is not None: self.model.cfg.lambda_reward = 0.0
         if q      is not None: self.model.cfg.lambda_q      = q
         if pi     is not None: self.model.cfg.lambda_pi     = pi
         if goal   is not None: self.model.cfg.lambda_goal   = goal
@@ -818,9 +818,8 @@ def parse_args():
     p.add_argument('--pca_dim',      type=int,   default=64)
     p.add_argument('--skill_dir',    type=str,   default='checkpoints/skill_pretrain')
     p.add_argument('--n_synthetic',  type=int,   default=2000)
-    p.add_argument('--reward_crop',  type=float, default=2.0,
-                   help='Use each episode only until cumulative reward reaches this value. '
-                        'Set negative to disable cropping.')
+    p.add_argument('--reward_crop',  type=float, default=-1.0,
+                   help='Deprecated and ignored; reward cropping is disabled.')
 
     # architecture
     p.add_argument('--koopman_dim',   type=int,   default=None)
@@ -838,7 +837,7 @@ def parse_args():
     p.add_argument('--lambda3',  type=float, default=None)
     p.add_argument('--lambda4',  type=float, default=None)
     p.add_argument('--no_multistep_dyn', action='store_true')
-    p.add_argument('--dyn_horizon',  type=int,   default=8)
+    p.add_argument('--dyn_horizon',  type=int,   default=4)
     p.add_argument('--dyn_alpha',    type=float, default=0.95)
 
     # v5 Q / Reward / Policy
@@ -852,9 +851,10 @@ def parse_args():
     p.add_argument('--entropy_coef',  type=float, default=0.01)
     p.add_argument('--log_std_min',   type=float, default=-5.0)
     p.add_argument('--log_std_max',   type=float, default=2.0)
-    p.add_argument('--lambda_reward', type=float, default=1.0)
-    p.add_argument('--lambda_q',      type=float, default=1.0)
-    p.add_argument('--lambda_pi',     type=float, default=0.1)
+    p.add_argument('--lambda_reward', type=float, default=0.0,
+                   help='Deprecated; reward-head loss is disabled.')
+    p.add_argument('--lambda_q',      type=float, default=0.0)
+    p.add_argument('--lambda_pi',     type=float, default=0.0)
 
     # phase
     p.add_argument('--phase2_epoch',  type=int,   default=60)
@@ -990,6 +990,10 @@ if __name__ == '__main__':
 
     cfg = build_config(args)
 
+    cfg.multistep_dyn = not args.no_multistep_dyn
+    cfg.dyn_horizon = args.dyn_horizon
+    cfg.dyn_alpha = args.dyn_alpha
+
     # v5 config overrides
     cfg.num_bins      = args.num_bins
     cfg.v_max         = args.v_max
@@ -999,7 +1003,8 @@ if __name__ == '__main__':
     cfg.entropy_coef  = args.entropy_coef
     cfg.log_std_min   = args.log_std_min
     cfg.log_std_max   = args.log_std_max
-    cfg.lambda_reward = args.lambda_reward
+    cfg.use_reward_head = False
+    cfg.lambda_reward = 0.0
     cfg.lambda_q      = args.lambda_q
     cfg.lambda_pi     = args.lambda_pi
     cfg.use_skill_decoder = args.train_skill_decoder
@@ -1047,6 +1052,7 @@ if __name__ == '__main__':
     print(f"  gamma={cfg.gamma}  entropy_coef={cfg.entropy_coef}")
     print(f"  loss: lam_R={cfg.lambda_reward} lam_Q={cfg.lambda_q}"
           f" lam_pi={cfg.lambda_pi}")
+    print(f"  reward: crop=off head=off")
     print(f"  loss: lam1={cfg.lambda1} lam2={cfg.lambda2}"
           f" lam3={cfg.lambda3} lam4={cfg.lambda4}")
     print(f"  phase: 1->{args.phase2_epoch}  2->{args.phase3_epoch}"
@@ -1085,9 +1091,13 @@ if __name__ == '__main__':
         for f in v4_fields:
             if hasattr(ckpt_cfg_raw, f):
                 setattr(resume_cfg, f, getattr(ckpt_cfg_raw, f))
+        resume_cfg.multistep_dyn = not args.no_multistep_dyn
+        resume_cfg.dyn_horizon = args.dyn_horizon
+        resume_cfg.dyn_alpha = args.dyn_alpha
 
         # Apply v5 + resume-specific overrides from args
-        resume_cfg.use_ensemble_reward = True
+        resume_cfg.use_reward_head     = False
+        resume_cfg.use_ensemble_reward = False
         resume_cfg.td_horizon          = args.td_horizon
         resume_cfg.mopo_beta           = args.mopo_beta
         resume_cfg.reward_ensemble_n   = args.reward_ensemble_n
@@ -1110,7 +1120,7 @@ if __name__ == '__main__':
         resume_cfg.lambda_goal         = args.lambda_goal
         resume_cfg.warmup_goal_epochs  = args.warmup_goal_epochs
         resume_cfg.recon_delta_e       = not args.no_recon_delta_e
-        resume_cfg.lambda_reward       = args.lambda_reward
+        resume_cfg.lambda_reward       = 0.0
         resume_cfg.lambda_q            = args.lambda_q
         resume_cfg.lambda_pi           = args.lambda_pi
         resume_cfg.use_skill_decoder   = args.train_skill_decoder

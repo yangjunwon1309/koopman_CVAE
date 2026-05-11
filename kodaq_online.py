@@ -360,9 +360,9 @@ class KoopmanWorldModelWrapper:
         for p in model.koopman.parameters():     p.requires_grad_(False)
         for p in model.decoder.parameters():     p.requires_grad_(False)
 
-        # Active: posterior, recurrent, skill_prior, reward_head
+        # Active: posterior, recurrent, skill_prior. Reward heads are deprecated.
         reward_params = []
-        if getattr(model.cfg, 'use_reward_head', True):
+        if getattr(model.cfg, 'use_reward_head', False):
             head = getattr(model.decoder, 'head_reward',
                            getattr(model, 'reward_head', None))
             if head is not None:
@@ -382,13 +382,15 @@ class KoopmanWorldModelWrapper:
 
     def _r_hat_event(self, z: torch.Tensor) -> float:
         """P(task completion | z_t) via BCE head."""
-        if not getattr(self.model.cfg, 'use_reward_head', True): return 0.0
+        if not getattr(self.model.cfg, 'use_reward_head', False): return 0.0
         logit = self._bce_head(z)
         return torch.sigmoid(logit).mean().item() if logit is not None else 0.0
 
     def _r_hat_accumulated(self, z0: torch.Tensor, h0: torch.Tensor,
                            a_seq: torch.Tensor) -> float:
         """Σ_{k=0}^{H-1} γ^k * E[R | z_{k+1}] via Koopman rollout."""
+        if not getattr(self.model.cfg, 'use_reward_head', False):
+            return 0.0
         m   = self.model
         H   = min(self.reward_H, len(a_seq))
         gm  = self.reward_gamma
@@ -412,7 +414,7 @@ class KoopmanWorldModelWrapper:
 
     def update(self, x_b: torch.Tensor, r_env_b: torch.Tensor) -> float:
         """Fine-tune reward head with BCE loss."""
-        if not self.model.cfg.use_reward_head: return 0.0
+        if not getattr(self.model.cfg, 'use_reward_head', False): return 0.0
         m = self.model; m.train()
         h0 = torch.zeros(x_b.shape[0], m.cfg.gru_hidden, device=self.device)
         z, _ = m.posterior(x_b, h0)
@@ -687,7 +689,10 @@ class PolicyPriorOnlineTrainer:
         else:
             actor_mod = model.policy_prior
         q_mod = model.skill_arg_q_head if self.actor_mode == 'skill_arg' else model.q_head
-        for mod in [model.reward_ensemble_head, q_mod, actor_mod]:
+        train_mods = [q_mod, actor_mod]
+        if getattr(model.cfg, 'use_reward_head', False):
+            train_mods.insert(0, model.reward_ensemble_head)
+        for mod in train_mods:
             for p in mod.parameters():
                 p.requires_grad_(True)
             mod.train()
@@ -697,8 +702,11 @@ class PolicyPriorOnlineTrainer:
             model.skill_arg_q_head_target.eval()
             model._detach_skill_arg_q_head.eval()
 
-        self.opt_reward = torch.optim.Adam(model.reward_ensemble_head.parameters(),
-                                           lr=cfg.wm_lr)
+        self.opt_reward = (
+            torch.optim.Adam(model.reward_ensemble_head.parameters(),
+                             lr=cfg.wm_lr)
+            if getattr(model.cfg, 'use_reward_head', False) else None
+        )
         self.opt_q = torch.optim.Adam(q_mod.parameters(), lr=cfg.lr)
         self.opt_pi = torch.optim.Adam(actor_mod.parameters(), lr=cfg.lr)
         self._last_skillarg_meta: Dict[str, np.ndarray] = {}
@@ -1046,6 +1054,8 @@ class PolicyPriorOnlineTrainer:
         return b_r, b_q, b_pi
 
     def _plain_r_hat(self, z: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+        if not getattr(self.model.cfg, 'use_reward_head', False):
+            return z.new_zeros(z.shape[0])
         return self.model.reward_ensemble_head.member_probs(z, u).mean(0).clamp(0.0, 1.0)
 
     def _q_reward(self, z: torch.Tensor, u: torch.Tensor,
@@ -1057,6 +1067,8 @@ class PolicyPriorOnlineTrainer:
         if source == 'rhat':
             return r_hat, r_hat
         if source == 'penalized':
+            if not getattr(self.model.cfg, 'use_reward_head', False):
+                return r_env.new_zeros(r_env.shape), r_hat
             return self.model.reward_ensemble_head.penalized_reward(z, u), r_hat
         raise ValueError(
             f"Unknown q_reward_source={self.cfg.q_reward_source!r}; "
@@ -1561,13 +1573,16 @@ class PolicyPriorOnlineTrainer:
         r, z_next, done = b_q['r'], b_q['z_next'], b_q['done']
         m = self.model
 
-        loss_r = m.reward_ensemble_head.ensemble_loss(
-            z_r, u_r, r_r.clamp(0.0, 1.0))
-        self.opt_reward.zero_grad()
-        loss_r.backward()
-        nn.utils.clip_grad_norm_(m.reward_ensemble_head.parameters(),
-                                 self.cfg.grad_clip)
-        self.opt_reward.step()
+        if self.opt_reward is not None and getattr(m.cfg, 'use_reward_head', False):
+            loss_r = m.reward_ensemble_head.ensemble_loss(
+                z_r, u_r, r_r.clamp(0.0, 1.0))
+            self.opt_reward.zero_grad()
+            loss_r.backward()
+            nn.utils.clip_grad_norm_(m.reward_ensemble_head.parameters(),
+                                     self.cfg.grad_clip)
+            self.opt_reward.step()
+        else:
+            loss_r = z_r.new_tensor(0.0)
 
         if self.actor_mode == 'skill_arg':
             return self._update_skill_arg_q_pi(b_q, b_pi, loss_r)
@@ -1865,7 +1880,10 @@ class PolicyPriorOnlineTrainer:
             'step': self.step,
             'cfg': self.model.cfg,
             'model_state': self.model.state_dict(),
-            'opt_reward': self.opt_reward.state_dict(),
+            'opt_reward': (
+                self.opt_reward.state_dict()
+                if self.opt_reward is not None else None
+            ),
             'opt_q': self.opt_q.state_dict(),
             'opt_pi': self.opt_pi.state_dict(),
             'scale_tracker': self.model.scale_tracker.state_dict(),
@@ -1881,9 +1899,11 @@ class PolicyPriorOnlineTrainer:
     def load(self, path: str) -> int:
         ck = torch.load(path, map_location=self.device)
         self.model.load_state_dict(ck['model_state'], strict=False)
-        if 'opt_reward' in ck:
+        if 'opt_reward' in ck and self.opt_reward is not None and ck['opt_reward'] is not None:
             self.opt_reward.load_state_dict(ck['opt_reward'])
+        if 'opt_q' in ck:
             self.opt_q.load_state_dict(ck['opt_q'])
+        if 'opt_pi' in ck:
             self.opt_pi.load_state_dict(ck['opt_pi'])
         if 'scale_tracker' in ck:
             self.model.scale_tracker.load_state_dict(ck['scale_tracker'])
@@ -3192,21 +3212,19 @@ def main():
     print(f"\nLoading: {args.world_ckpt}")
     ck    = torch.load(args.world_ckpt, map_location=device)
     model = KoopmanCVAE(ck['cfg'])
+    model.cfg.use_reward_head = False
+    model.cfg.lambda_reward = 0.0
+    model.cfg.use_ensemble_reward = False
     model.load_state_dict(ck['model_state'], strict=False)
     model.eval().to(device)
     z_dim    = model.cfg.koopman_dim
     n_skills = model.cfg.num_skills
     a_dim    = model.cfg.action_dim
     print(f"  K={n_skills}  m={z_dim}  action_dim={a_dim}")
+    print("  reward_head=off")
 
-    # cat_head
+    # Reward-head/categorical reward models are disabled in this training path.
     cat_head = None
-    cat_path = args.cat_ckpt or str(
-        Path(args.world_ckpt).parent / 'cat_reward' / 'final.pt')
-    if Path(cat_path).exists():
-        from train_reward_head import load_cat_reward_model
-        _, cat_head = load_cat_reward_model(cat_path, device)
-        print(f"  CategoricalRewardHead loaded")
 
     cfg = OnlineConfig(
         H_hi=args.H_hi, H_lo=args.H_lo, gamma=args.gamma,

@@ -82,7 +82,7 @@ def koopman_consistency_loss(mu_next, o_pred):
 
 
 def multistep_koopman_consistency_loss(
-    mu_seq, o_seq, A_bar_seq, B_bar_seq, u_seq, H=8, alpha=0.95
+    mu_seq, o_seq, A_bar_seq, B_bar_seq, u_seq, H=4, alpha=0.95
 ):
     B, T, m = mu_seq.shape
     T_seq   = T - 1

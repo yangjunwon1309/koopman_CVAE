@@ -3,13 +3,13 @@ koopman_cvae.py — KODAQ v5
 ============================
 
 v5 changes over v4:
-  1. RewardCategoricalHead : step reward {0,1}, Two-Hot CE, bins [0, 5], B=16
+  1. Reward heads are kept only for legacy checkpoint compatibility and disabled by default
   2. QHead                 : Bellman TD target, Two-Hot CE, bins [0, 5], ensemble
   3. PolicyPrior           : Gaussian pi(u|o), TD-MPC2 policy loss
   4. Target Q network      : EMA copy of QHead (tau=0.005)
   5. MovingPercentileScale : rho normalization for entropy/Q balance
   6. Zero-init last layer  : reward head & Q head (uniform initial distribution)
-  7. Joint loss            : L_total = L_wm + lam_R*L_R + lam_Q*L_Q + lam_pi*L_pi
+  7. Joint loss            : L_total = L_wm + optional head losses
 
 Bin design [v_min=0, v_max=5], B=16 bins:
   - reward head: predicts step r_t in {0,1} — always within [0,5], no clamp
@@ -98,7 +98,8 @@ class KoopmanCVAEConfig:
     v_max:         float = 5.0    # bin range max — covers H-step TD target
     num_q:         int   = 2      # Q ensemble size
 
-    # ── v5.1 Reward Ensemble Head (MOPO-style) ────────────────────────────────
+    # ── v5.1 Reward Ensemble Head (deprecated; disabled by default) ───────────
+    use_reward_head:    bool  = False
     reward_ensemble_n:   int   = 5      # N: reward ensemble members
     td_horizon:          int   = 4      # H: rollout steps for H-step TD (4 or 8)
     mopo_beta:           float = 0.0    # beta: MOPO penalty (mean - beta*std)
@@ -126,9 +127,9 @@ class KoopmanCVAEConfig:
     gamma:         float = 0.99   # discount
 
     # ── v5 Loss weights ───────────────────────────────────────────────────────
-    lambda_reward: float = 1.0    # L_R categorical reward head
-    lambda_q:      float = 1.0    # L_Q Bellman TD
-    lambda_pi:     float = 0.1    # L_pi policy prior
+    lambda_reward: float = 0.0    # L_R categorical reward head
+    lambda_q:      float = 0.0    # L_Q Bellman TD
+    lambda_pi:     float = 0.0    # L_pi policy prior
     lambda_wm:     float = 1.0    # L_wm multiplier; set 0 for decoder-only fitting
 
     # v5.4 Skill action decoder: supervised action chunk prior from frozen latents.
@@ -171,7 +172,7 @@ class KoopmanCVAEConfig:
 
     # ── Multi-step L_dyn ──────────────────────────────────────────────────────
     multistep_dyn: bool  = True
-    dyn_horizon:   int   = 8
+    dyn_horizon:   int   = 4
     dyn_alpha:     float = 0.95
 
     # ── Training phase ────────────────────────────────────────────────────────
@@ -1682,7 +1683,7 @@ class KoopmanCVAE(nn.Module):
         # We pair o_t = o_seq[:, :-1], u_t = u_seq[:, :-1] with r_t = rewards[:, :-1]
         # (rewards[:, t] is the step reward obtained at timestep t, before transition)
         loss_reward = torch.tensor(0.0, device=device)
-        if rewards is not None:
+        if getattr(cfg, 'use_reward_head', False) and rewards is not None:
             o_in      = o_seq[:, :-1]      # (B, T-1, d_o)
             u_in      = u_seq[:, :-1]      # (B, T-1, d_u)
             r_targets = rewards[:, :-1]    # (B, T-1)  step reward {0,1} at t
@@ -1718,7 +1719,7 @@ class KoopmanCVAE(nn.Module):
         #   - world model freeze-safe: A_bar/B_bar are from frozen koopman
         #
         loss_q = torch.tensor(0.0, device=device)
-        if rewards is not None:
+        if rewards is not None and getattr(cfg, 'lambda_q', 0.0) > 0.0:
             o_t = o_seq[:, :-1]    # (B, T-1, d_o)
             u_t = u_seq[:, :-1]    # (B, T-1, d_u)
             r_t = rewards[:, :-1]  # (B, T-1)  step reward at t
@@ -2084,6 +2085,8 @@ class KoopmanCVAE(nn.Module):
     @torch.no_grad()
     def predict_reward(self, o: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
         """Scalar reward estimate."""
+        if not getattr(self.cfg, 'use_reward_head', False):
+            return torch.zeros(o.shape[:-1], device=o.device, dtype=o.dtype)
         return self.reward_head.expected_value(o, u)
 
     @torch.no_grad()
