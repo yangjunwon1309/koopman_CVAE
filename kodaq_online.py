@@ -2702,6 +2702,9 @@ def train_policy_prior_online(cfg: OnlineConfig,
         print(f"  skill-arg SAC alpha_d={cfg.skill_arg_alpha_d:.3f} "
               f"alpha_z={cfg.skill_arg_alpha_z:.3f} "
               f"arg_use_h={int(getattr(trainer.model.cfg, 'skill_arg_use_h', True))} "
+              f"enc_state={int(getattr(trainer.model.cfg, 'skill_arg_encoder_use_state', True))} "
+              f"pol_state={int(getattr(trainer.model.cfg, 'skill_arg_policy_use_state', True))} "
+              f"dec_state={int(getattr(trainer.model.cfg, 'skill_arg_decoder_use_state', True))} "
               f"skill_d_no_h={int(cfg.skill_d_no_h)} "
               f"mean_after_pi={int(cfg.skill_arg_mean_after_pi_start)} "
               "critic=Q(z,h,arg,d)")

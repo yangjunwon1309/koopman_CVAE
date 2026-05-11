@@ -143,15 +143,16 @@ class KoopmanCVAEConfig:
     lambda_skill_decoder_latent: float = 0.0
     skill_decoder_detach_latents: bool = True
 
-    # EXTRACT-style skill argument decoder. Offline learns:
-    #   encoder q(arg | state, skill, action chunk)
-    #   frozen decoder D(state, skill, arg) -> action chunk
-    #   policy p(arg | state, skill)
+    # Skill argument decoder. EXTRACT-style sets encoder/decoder state flags
+    # false so q(arg | skill, action chunk), D(skill, arg), p(arg | state, skill).
     use_skill_arg_decoder:       bool  = False
     skill_arg_dim:               int   = 16
     skill_arg_hidden:            int   = 512
     skill_arg_layers:            int   = 3
     skill_arg_use_h:             bool  = True
+    skill_arg_encoder_use_state: bool  = True
+    skill_arg_policy_use_state:  bool  = True
+    skill_arg_decoder_use_state: bool  = True
     lambda_skill_arg_decoder:    float = 0.0
     lambda_skill_arg_kl:         float = 1e-3
     lambda_skill_arg_policy:     float = 1.0
@@ -703,12 +704,12 @@ class SkillArgumentEncoder(nn.Module):
         self.H = int(getattr(cfg, 'skill_decoder_horizon', 4))
         arg_dim = int(getattr(cfg, 'skill_arg_dim', 16))
         self.use_h = bool(getattr(cfg, 'skill_arg_use_h', True))
-        in_dim = (
-            cfg.koopman_dim
-            + (cfg.gru_hidden if self.use_h else 0)
-            + cfg.num_skills
-            + self.H * cfg.action_dim
-        )
+        self.use_state = bool(getattr(cfg, 'skill_arg_encoder_use_state', True))
+        in_dim = cfg.num_skills + self.H * cfg.action_dim
+        if self.use_state:
+            in_dim += cfg.koopman_dim
+            if self.use_h:
+                in_dim += cfg.gru_hidden
         hidden = int(getattr(cfg, 'skill_arg_hidden', cfg.mlp_hidden))
         layers = int(getattr(cfg, 'skill_arg_layers', 3))
         self.net = make_mlp(in_dim, 2 * arg_dim, hidden, layers, cfg.dropout)
@@ -721,9 +722,11 @@ class SkillArgumentEncoder(nn.Module):
         action_chunk: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         flat_a = action_chunk.reshape(*action_chunk.shape[:-2], -1)
-        parts = [o]
-        if self.use_h:
-            parts.append(h)
+        parts = []
+        if self.use_state:
+            parts.append(o)
+            if self.use_h:
+                parts.append(h)
         parts.extend([skill_prob, flat_a])
         out = self.net(torch.cat(parts, dim=-1))
         mu, logvar = out.chunk(2, dim=-1)
@@ -742,9 +745,12 @@ class SkillArgumentPolicy(nn.Module):
         self.cfg = cfg
         arg_dim = int(getattr(cfg, 'skill_arg_dim', 16))
         self.use_h = bool(getattr(cfg, 'skill_arg_use_h', True))
-        in_dim = cfg.koopman_dim + cfg.num_skills
-        if self.use_h:
-            in_dim += cfg.gru_hidden
+        self.use_state = bool(getattr(cfg, 'skill_arg_policy_use_state', True))
+        in_dim = cfg.num_skills
+        if self.use_state:
+            in_dim += cfg.koopman_dim
+            if self.use_h:
+                in_dim += cfg.gru_hidden
         hidden = int(getattr(cfg, 'skill_arg_hidden', cfg.mlp_hidden))
         layers = int(getattr(cfg, 'skill_arg_layers', 3))
         self.net = make_mlp(in_dim, 2 * arg_dim, hidden, layers, cfg.dropout)
@@ -757,9 +763,11 @@ class SkillArgumentPolicy(nn.Module):
         h: torch.Tensor,
         skill_prob: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        parts = [o]
-        if self.use_h:
-            parts.append(h)
+        parts = []
+        if self.use_state:
+            parts.append(o)
+            if self.use_h:
+                parts.append(h)
         parts.append(skill_prob)
         out = self.net(torch.cat(parts, dim=-1))
         mean, log_std_raw = out.chunk(2, dim=-1)
@@ -818,7 +826,7 @@ class SkillDiscretePolicy(nn.Module):
 
 
 class SkillArgumentActionDecoder(nn.Module):
-    """Frozen low-level executor D(o, h, skill, arg) -> action chunk."""
+    """Frozen low-level executor D(state?, skill, arg) -> action chunk."""
 
     def __init__(self, cfg: 'KoopmanCVAEConfig'):
         super().__init__()
@@ -826,9 +834,12 @@ class SkillArgumentActionDecoder(nn.Module):
         self.H = int(getattr(cfg, 'skill_decoder_horizon', 4))
         arg_dim = int(getattr(cfg, 'skill_arg_dim', 16))
         self.use_h = bool(getattr(cfg, 'skill_arg_use_h', True))
-        in_dim = cfg.koopman_dim + cfg.num_skills + arg_dim
-        if self.use_h:
-            in_dim += cfg.gru_hidden
+        self.use_state = bool(getattr(cfg, 'skill_arg_decoder_use_state', True))
+        in_dim = cfg.num_skills + arg_dim
+        if self.use_state:
+            in_dim += cfg.koopman_dim
+            if self.use_h:
+                in_dim += cfg.gru_hidden
         hidden = int(getattr(cfg, 'skill_arg_hidden', cfg.mlp_hidden))
         layers = int(getattr(cfg, 'skill_arg_layers', 3))
         self.net = make_mlp(
@@ -846,9 +857,11 @@ class SkillArgumentActionDecoder(nn.Module):
         skill_prob: torch.Tensor,
         arg: torch.Tensor,
     ) -> torch.Tensor:
-        parts = [o]
-        if self.use_h:
-            parts.append(h)
+        parts = []
+        if self.use_state:
+            parts.append(o)
+            if self.use_h:
+                parts.append(h)
         parts.extend([skill_prob, arg])
         x = torch.cat(parts, dim=-1)
         out = self.net(x)

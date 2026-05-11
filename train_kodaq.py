@@ -640,7 +640,13 @@ class Trainer:
               f"arg_dim={self.model.cfg.skill_arg_dim}", flush=True)
         print("  WM/Q/R frozen; train arg_encoder + arg_policy + arg_decoder",
               flush=True)
-        print(f"  use_h={self.model.cfg.skill_arg_use_h}", flush=True)
+        print(
+            f"  use_h={self.model.cfg.skill_arg_use_h} "
+            f"enc_state={int(getattr(self.model.cfg, 'skill_arg_encoder_use_state', True))} "
+            f"pol_state={int(getattr(self.model.cfg, 'skill_arg_policy_use_state', True))} "
+            f"dec_state={int(getattr(self.model.cfg, 'skill_arg_decoder_use_state', True))}",
+            flush=True,
+        )
         print(f"{'='*60}", flush=True)
 
         self._set_all_requires_grad(False)
@@ -883,6 +889,14 @@ def parse_args():
     p.add_argument('--skill_arg_layers', type=int, default=3)
     p.add_argument('--skill_arg_no_h', action='store_true',
                    help='Do not feed h_t to skill argument encoder/policy/decoder.')
+    p.add_argument('--skill_arg_extract_style', action='store_true',
+                   help='Use EXTRACT factorization: q(c|d,a), D(d,c), pi(c|state,d).')
+    p.add_argument('--skill_arg_encoder_no_state', action='store_true',
+                   help='Do not feed z_t/h_t to q(c|...).')
+    p.add_argument('--skill_arg_decoder_no_state', action='store_true',
+                   help='Do not feed z_t/h_t to D(...).')
+    p.add_argument('--skill_arg_policy_no_state', action='store_true',
+                   help='Do not feed z_t/h_t to pi(c|...). Mostly for ablations.')
     p.add_argument('--lambda_skill_arg_decoder', type=float, default=1.0)
     p.add_argument('--lambda_skill_arg_kl', type=float, default=1e-3)
     p.add_argument('--lambda_skill_arg_policy', type=float, default=1.0)
@@ -991,6 +1005,11 @@ if __name__ == '__main__':
     cfg.skill_arg_hidden = args.skill_arg_hidden
     cfg.skill_arg_layers = args.skill_arg_layers
     cfg.skill_arg_use_h = not args.skill_arg_no_h
+    cfg.skill_arg_encoder_use_state = not (
+        args.skill_arg_extract_style or args.skill_arg_encoder_no_state)
+    cfg.skill_arg_decoder_use_state = not (
+        args.skill_arg_extract_style or args.skill_arg_decoder_no_state)
+    cfg.skill_arg_policy_use_state = not args.skill_arg_policy_no_state
     cfg.lambda_skill_arg_decoder = (
         args.lambda_skill_arg_decoder if args.train_skill_arg_decoder else 0.0)
     cfg.lambda_skill_arg_kl = args.lambda_skill_arg_kl
@@ -1093,6 +1112,11 @@ if __name__ == '__main__':
         resume_cfg.skill_arg_hidden = args.skill_arg_hidden
         resume_cfg.skill_arg_layers = args.skill_arg_layers
         resume_cfg.skill_arg_use_h = not args.skill_arg_no_h
+        resume_cfg.skill_arg_encoder_use_state = not (
+            args.skill_arg_extract_style or args.skill_arg_encoder_no_state)
+        resume_cfg.skill_arg_decoder_use_state = not (
+            args.skill_arg_extract_style or args.skill_arg_decoder_no_state)
+        resume_cfg.skill_arg_policy_use_state = not args.skill_arg_policy_no_state
         resume_cfg.lambda_skill_arg_decoder = (
             args.lambda_skill_arg_decoder if args.train_skill_arg_decoder else 0.0)
         resume_cfg.lambda_skill_arg_kl = args.lambda_skill_arg_kl
@@ -1181,7 +1205,10 @@ if __name__ == '__main__':
             print(f"  Skill argument decoder resume:", flush=True)
             print(f"    epochs={args.skill_arg_epochs} lr={args.skill_arg_lr} "
                   f"H={args.skill_decoder_horizon} arg_dim={args.skill_arg_dim} "
-                  f"use_h={not args.skill_arg_no_h}",
+                  f"use_h={not args.skill_arg_no_h} "
+                  f"enc_state={int(not (args.skill_arg_extract_style or args.skill_arg_encoder_no_state))} "
+                  f"pol_state={int(not args.skill_arg_policy_no_state)} "
+                  f"dec_state={int(not (args.skill_arg_extract_style or args.skill_arg_decoder_no_state))}",
                   flush=True)
         else:
             args.resume_stage  = 'two_stage'
