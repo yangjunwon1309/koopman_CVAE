@@ -35,13 +35,14 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
+from matplotlib.patches import Patch
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 from collections import defaultdict
 
 from models.koopman_cvae import KoopmanCVAE, KoopmanCVAEConfig
 from models.losses import symexp
-from data.extract_skill_label import load_x_sequences
+from data.extract_skill_label import load_x_sequences, load_cluster_data
 from lqr_koopman import (
     load_kitchen_episodes,
     obs_to_x_goal,
@@ -689,10 +690,104 @@ def plot_summary_heatmap(results: List[Dict], stats: Dict, out_dir: Path):
 # Main
 # ──────────────────────────────────────────────────────────────────────────────
 
+@torch.no_grad()
+def plot_skill_prediction_trajectories(
+    model: KoopmanCVAE,
+    episodes: List[Dict],
+    x_seq_full: np.ndarray,
+    skill_labels: np.ndarray,
+    out_dir: Path,
+    device: str = 'cuda',
+):
+    """Plot EXTRACT GT skill labels against predicted soft skill weights."""
+    if skill_labels is None:
+        print("No skill labels available for skill trajectory plot.")
+        return
+
+    dev = torch.device(device)
+    K = int(model.cfg.num_skills)
+    colors = [PAL[k % len(PAL)] for k in range(K)]
+    n_ep = len(episodes)
+    if n_ep == 0:
+        return
+
+    fig, axes = plt.subplots(
+        n_ep, 2, figsize=(18, max(2.2, 1.9 * n_ep)), squeeze=False,
+        gridspec_kw={'width_ratios': [1, 1]},
+    )
+
+    for row, ep in enumerate(episodes):
+        s, e = int(ep['start_t']), int(ep['end_t'])
+        L = int(ep['length'])
+        s_clip = max(0, min(s, len(skill_labels)))
+        e_clip = max(s_clip, min(e + 1, len(skill_labels), s_clip + L))
+        gt = skill_labels[s_clip:e_clip].astype(np.int64)
+
+        x_ep = x_seq_full[s:e + 1]
+        acts_ep = ep['actions']
+        n = min(len(x_ep), len(acts_ep), len(gt))
+        if n <= 0:
+            continue
+        x_ep = x_ep[:n]
+        acts_ep = acts_ep[:n]
+        gt = gt[:n]
+
+        x_t = torch.FloatTensor(x_ep).unsqueeze(0).to(dev)
+        a_t = torch.FloatTensor(acts_ep).unsqueeze(0).to(dev)
+        enc = model.encode_sequence(x_t, a_t)
+        h_for_skill = enc.get('h_pre_seq', enc['h_seq'])[0, :n]
+        weights = model.skill_prior.soft_weights(h_for_skill).cpu().numpy()
+
+        ts = np.arange(n)
+
+        ax_gt = axes[row, 0]
+        for t, label in enumerate(gt):
+            ax_gt.axvspan(
+                t, t + 1, color=colors[int(label) % K],
+                alpha=0.85, linewidth=0,
+            )
+        ax_gt.set_xlim(0, n)
+        ax_gt.set_ylim(0, 1)
+        ax_gt.set_yticks([])
+        ax_gt.set_ylabel(f"Ep {row}", rotation=0, labelpad=35, fontsize=9)
+        ax_gt.set_xlabel("timestep", fontsize=8)
+        if row == 0:
+            ax_gt.set_title("EXTRACT GT labels", fontsize=10)
+
+        ax_pred = axes[row, 1]
+        ax_pred.stackplot(
+            ts, [weights[:, k] for k in range(K)],
+            colors=colors, alpha=0.75, linewidth=0,
+        )
+        ax_pred.set_xlim(0, n)
+        ax_pred.set_ylim(0, 1.0)
+        ax_pred.set_yticks([0.0, 0.5, 1.0])
+        ax_pred.set_ylabel("weight", fontsize=8)
+        ax_pred.set_xlabel("timestep", fontsize=8)
+        if row == 0:
+            ax_pred.set_title("Predicted skill weights w_t", fontsize=10)
+
+    handles = [Patch(color=colors[k], label=f"Skill {k}") for k in range(K)]
+    fig.legend(
+        handles=handles, loc='upper right', ncol=min(K, 4),
+        fontsize=8, frameon=True,
+    )
+    fig.suptitle(
+        "Skill Trajectories: GT vs Predicted Weights",
+        fontsize=13, fontweight='bold',
+    )
+    plt.tight_layout(rect=(0, 0, 0.92, 0.96))
+    path = str(out_dir / 'skill_prediction_trajectories.png')
+    plt.savefig(path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved: {path}")
+
+
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument('--ckpt',       required=True)
     p.add_argument('--x_cache',    default='checkpoints/skill_pretrain/x_sequences.npz')
+    p.add_argument('--skill_h5',   default='checkpoints/skill_pretrain/cluster_data.h5')
     p.add_argument('--env',        default='kitchen-mixed-v0')
     p.add_argument('--quality',    default='mixed',
                    choices=['mixed', 'partial', 'complete'])
@@ -723,6 +818,12 @@ if __name__ == '__main__':
 
     print(f"\nLoading dataset: {args.env}")
     x_seq_full, _, _ = load_x_sequences(args.x_cache)
+    skill_labels = None
+    if args.skill_h5 and Path(args.skill_h5).exists():
+        skill_labels, _ = load_cluster_data(args.skill_h5)
+        print(f"Loaded skill labels: {args.skill_h5}  n={len(skill_labels)}")
+    else:
+        print(f"Skill label file not found: {args.skill_h5}")
     episodes, _      = load_kitchen_episodes(
         quality=args.quality, min_len=args.min_seg_len + args.horizon + 2)
     reward_crop = None if args.reward_crop < 0 else args.reward_crop
@@ -739,6 +840,13 @@ if __name__ == '__main__':
     print(f"Selected {len(selected)} episodes  "
           f"(reward range: {selected[-1]['goal_info']['reward_total']:.0f}"
           f"~{selected[0]['goal_info']['reward_total']:.0f})")
+
+    if skill_labels is not None:
+        print("\n=== Fig S: Skill GT vs predicted weights ===")
+        plot_skill_prediction_trajectories(
+            model, selected, x_seq_full, skill_labels, out,
+            device=args.device,
+        )
 
     # ── Core analysis ─────────────────────────────────────────────────────────
     print(f"\nAnalyzing skill segments (horizon={args.horizon}) ...")
