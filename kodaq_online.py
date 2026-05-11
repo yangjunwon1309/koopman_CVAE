@@ -44,7 +44,7 @@ from dataclasses import dataclass
 from collections import deque
 
 from models.koopman_cvae import KoopmanCVAE
-from models.losses import q_categorical_loss, two_hot_decode, policy_prior_loss
+from models.losses import q_categorical_loss, two_hot_decode, policy_prior_loss, symexp
 from data.extract_skill_label import load_x_sequences
 from lqr_koopman import (
     blend_koopman,
@@ -121,6 +121,12 @@ class OnlineConfig:
     lambda_q_negative:        float = 0.0
     lambda_q_success_rank:    float = 0.0
     q_success_margin:         float = 0.5
+    lambda_q_wm_penalty:      float = 0.0
+    q_wm_penalty_percentile:  float = 95.0
+    q_wm_penalty_clip:        float = 1.0
+    q_wm_penalty_min_elite:   int   = 128
+    q_wm_penalty_q_weight:    float = 1.0
+    q_wm_penalty_obj_weight:  float = 1.0
     pi_update_start:          int   = 10_000
     actor_mode:               str   = 'policy_prior'  # policy_prior | skill_decoder
     pi_q_weight:              float = 1.0
@@ -520,6 +526,7 @@ class PriorReplayBuffer:
             'skill_prob': np.zeros((C, int(self.skill_dim)), dtype=np.float32),
             'skill_arg': np.zeros((C, int(self.arg_dim)), dtype=np.float32),
             'has_skill_arg': np.zeros(C, dtype=np.float32),
+            'wm_err': np.zeros(C, dtype=np.float32),
             'source': np.zeros(C, dtype=np.float32),
         }
 
@@ -530,6 +537,7 @@ class PriorReplayBuffer:
             u_lqr=None, u_lqr_aux=None, has_lqr: float = 0.0,
             skill_id=None, skill_prob=None,
             skill_arg=None, has_skill_arg: float = 0.0,
+            wm_err: float = 0.0,
             source: float = 0.0):
         if not self._d:
             self._init(z.shape[-1], u.shape[-1])
@@ -586,6 +594,7 @@ class PriorReplayBuffer:
             self._d['skill_arg'][p] = np.asarray(skill_arg, dtype=np.float32)
             has_skill_arg = 1.0
         self._d['has_skill_arg'][p] = float(has_skill_arg)
+        self._d['wm_err'][p] = float(wm_err)
         self._d['source'][p] = float(source)
         self._ptr = (p + 1) % self.capacity
         self._n = min(self._n + 1, self.capacity)
@@ -636,6 +645,7 @@ class PolicyPriorOnlineTrainer:
         self.elite_return_ema: float = 0.0
         self.elite_return_last: float = 0.0
         self.elite_episode_count: int = 0
+        self.wm_penalty_threshold: float = 0.0
         self.action_inv_steps = action_inv_steps
         self.action_inv_lr = action_inv_lr
         self.lqr_planner = lqr_planner
@@ -1036,6 +1046,78 @@ class PolicyPriorOnlineTrainer:
             "expected env, rhat, or penalized"
         )
 
+    @torch.no_grad()
+    def _wm_prediction_error_tensor(
+        self,
+        z: torch.Tensor,
+        h: torch.Tensor,
+        u: torch.Tensor,
+        x_next: torch.Tensor,
+    ) -> torch.Tensor:
+        m = self.model
+        w = torch.softmax(m.skill_prior(h), dim=-1)
+        z_pred, _, _ = m.koopman(z, u, w)
+        recon = m.decoder(z_pred)
+        q_pred = symexp(recon['q'])
+        p_pred = symexp(recon['delta_p'])
+        q_true = x_next[..., X_DQ_START:X_DQ_END]
+        p_true = x_next[..., X_DP_START:X_DP_END]
+        q_mse = (q_pred - q_true).pow(2).mean(-1)
+        p_mse = (p_pred - p_true).pow(2).mean(-1)
+        err = (
+            float(self.cfg.q_wm_penalty_q_weight) * q_mse
+            + float(self.cfg.q_wm_penalty_obj_weight) * p_mse
+        ).clamp_min(0.0).sqrt()
+        return err
+
+    @torch.no_grad()
+    def wm_prediction_error_np(
+        self,
+        z: torch.Tensor,
+        h: torch.Tensor,
+        u_np: np.ndarray,
+        x_next_np: np.ndarray,
+    ) -> float:
+        dev = torch.device(self.device)
+        u = torch.as_tensor(u_np, dtype=torch.float32, device=dev).view(1, -1)
+        x_next = torch.as_tensor(
+            x_next_np, dtype=torch.float32, device=dev).view(1, -1)
+        return float(self._wm_prediction_error_tensor(z, h, u, x_next)[0].item())
+
+    def _elite_wm_penalty_threshold(self) -> Optional[float]:
+        if self.cfg.lambda_q_wm_penalty <= 0.0 or self.elite_buf is None:
+            return None
+        n = int(self.elite_buf.size)
+        if n < int(self.cfg.q_wm_penalty_min_elite):
+            return None
+        err = self.elite_buf._d.get('wm_err', None)
+        if err is None:
+            return None
+        vals = err[:n]
+        vals = vals[np.isfinite(vals)]
+        if vals.size < int(self.cfg.q_wm_penalty_min_elite):
+            return None
+        pct = max(0.0, min(100.0, float(self.cfg.q_wm_penalty_percentile)))
+        thr = float(np.percentile(vals, pct))
+        self.wm_penalty_threshold = thr
+        return thr
+
+    def _q_wm_penalty(
+        self,
+        batch: Dict[str, torch.Tensor],
+        like: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.cfg.lambda_q_wm_penalty <= 0.0:
+            return like.new_zeros(like.shape)
+        thr = self._elite_wm_penalty_threshold()
+        if thr is None or 'wm_err' not in batch:
+            return like.new_zeros(like.shape)
+        wm_err = batch['wm_err'].to(like.device)
+        excess = (wm_err - float(thr)).clamp_min(0.0)
+        if self.cfg.q_wm_penalty_clip > 0.0:
+            excess = excess.clamp_max(float(self.cfg.q_wm_penalty_clip))
+        return float(self.cfg.lambda_q_wm_penalty) * excess
+
     def _skillarg_q_logits(
         self,
         q_head: nn.Module,
@@ -1328,10 +1410,13 @@ class PolicyPriorOnlineTrainer:
                 z_boot = z_next
                 h_boot = h_next_q
                 discount = (1 - done) * float(self.cfg.q_n_step_gamma)
+            wm_penalty = self._q_wm_penalty(b_q, r_targ)
+            r_targ_pen = (r_targ - wm_penalty).clamp(
+                m.cfg.v_min, m.cfg.v_max)
             q_next, next_info = self._skillarg_soft_value(
                 z_boot, h_boot, m.skill_arg_q_head_target, detach_actor=True)
             y = (
-                r_targ + self.cfg.q_bootstrap * discount * q_next
+                r_targ_pen + self.cfg.q_bootstrap * discount * q_next
             ).clamp(m.cfg.v_min, m.cfg.v_max)
 
         q_logits_d = self._skillarg_q_logits(
@@ -1437,6 +1522,9 @@ class PolicyPriorOnlineTrainer:
             'rho': m.scale_tracker.rho,
             'r_hat': r_hat.detach().mean().item(),
             'q_reward': r_targ.detach().mean().item(),
+            'q_wm_penalty': wm_penalty.detach().mean().item(),
+            'q_wm_error': b_q.get('wm_err', z.new_zeros(z.shape[0])).mean().item(),
+            'q_wm_threshold': float(self.wm_penalty_threshold),
             'q_target': y.detach().mean().item(),
             'q_next': q_next.detach().mean().item(),
             'pi_active': pi_active,
@@ -1482,11 +1570,14 @@ class PolicyPriorOnlineTrainer:
                 z_boot = z_next
                 h_boot = h_next_q
                 discount = (1 - done) * float(self.cfg.q_n_step_gamma)
+            wm_penalty = self._q_wm_penalty(b_q, r_targ)
+            r_targ_pen = (r_targ - wm_penalty).clamp(
+                m.cfg.v_min, m.cfg.v_max)
             u_next = self._actor_u_for_q(z_boot, h_boot)
             q_next = m.q_head_target.expected_value(
                 z_boot, u_next, return_type='min')
             y = (
-                r_targ
+                r_targ_pen
                 + self.cfg.q_bootstrap * discount * q_next
             ).clamp(m.cfg.v_min, m.cfg.v_max)
 
@@ -1608,6 +1699,9 @@ class PolicyPriorOnlineTrainer:
             'rho': m.scale_tracker.rho,
             'r_hat': r_hat.detach().mean().item(),
             'q_reward': r_targ.detach().mean().item(),
+            'q_wm_penalty': wm_penalty.detach().mean().item(),
+            'q_wm_error': b_q.get('wm_err', z.new_zeros(z.shape[0])).mean().item(),
+            'q_wm_threshold': float(self.wm_penalty_threshold),
             'q_target': y.detach().mean().item(),
             'q_next': q_next.detach().mean().item(),
             'pi_active': pi_active,
@@ -1763,6 +1857,7 @@ class PolicyPriorOnlineTrainer:
             'elite_return_ema': self.elite_return_ema,
             'elite_return_last': self.elite_return_last,
             'elite_episode_count': self.elite_episode_count,
+            'wm_penalty_threshold': self.wm_penalty_threshold,
         }, path)
         print(f"  Saved: {path}")
 
@@ -1784,6 +1879,8 @@ class PolicyPriorOnlineTrainer:
             ck.get('elite_return_last', self.elite_return_last))
         self.elite_episode_count = int(
             ck.get('elite_episode_count', self.elite_episode_count))
+        self.wm_penalty_threshold = float(
+            ck.get('wm_penalty_threshold', self.wm_penalty_threshold))
         self.step = int(ck.get('step', 0))
         return self.step
 
@@ -1886,6 +1983,13 @@ def prefill_prior_buffer_from_offline(trainer: PolicyPriorOnlineTrainer,
         h_ep = enc['h_seq'][0]
         h_pre_ep = enc.get('h_pre_seq', enc['h_seq'])[0]
         u_ep = model.action_encoder(torch.FloatTensor(acts).to(dev))
+        if L > 1:
+            x_next_all = torch.FloatTensor(x_ep[1:L]).to(dev)
+            wm_err_step = trainer._wm_prediction_error_tensor(
+                z_ep[:L - 1], h_pre_ep[:L - 1], u_ep[:L - 1], x_next_all,
+            ).detach().cpu().numpy().astype(np.float32)
+        else:
+            wm_err_step = np.zeros(0, dtype=np.float32)
 
         rew_max = float(rews.max()) if len(rews) else 0.0
         if len(rews) > 1 and np.all(np.diff(rews) >= -1e-6) and rew_max > 1.0:
@@ -1941,6 +2045,11 @@ def prefill_prior_buffer_from_offline(trainer: PolicyPriorOnlineTrainer,
                 r_ret += (gam ** j) * float(r_step[t + j] > 0.0)
             boot_idx = min(t + n_avail, L - 1)
             done_n = boot_idx >= (L - 1)
+            wm_end = min(t + max(1, n_avail), len(wm_err_step))
+            wm_err = (
+                float(np.max(wm_err_step[t:wm_end]))
+                if wm_end > t else 0.0
+            )
             trans = {
                 'z': z_ep[t].cpu().numpy(),
                 'h': h_pre_ep[t].cpu().numpy(),
@@ -1963,6 +2072,7 @@ def prefill_prior_buffer_from_offline(trainer: PolicyPriorOnlineTrainer,
                 'skill_prob': skill_prob_np,
                 'skill_arg': skill_arg_t,
                 'has_skill_arg': 1.0,
+                'wm_err': wm_err,
                 'source': 1.0,
             }
             trainer.buf.add(**trans)
@@ -2524,12 +2634,13 @@ def train_policy_prior_online(cfg: OnlineConfig,
                'loss_pi', 'loss_lqr_pi', 'loss_bc_pi',
                'loss_elite_bc_pi', 'loss_elite_skill_bc_pi',
                'loss_elite_arg_bc_pi',
-               'loss_skilldec_anchor', 'skilldec_anchor_w',
-                'q_mean', 'q_policy_cql', 'q_data', 'rho', 'r_hat',
-                'q_reward', 'q_target', 'q_next', 'pi_active',
-                'pi_q_weight_eff', 'q_loss_ema', 'q_guide_active',
-                'ep_reward', 'ep_tasks', 'elite_size',
-                'elite_ep_reward', 'elite_added']}
+                'loss_skilldec_anchor', 'skilldec_anchor_w',
+                 'q_mean', 'q_policy_cql', 'q_data', 'rho', 'r_hat',
+                 'q_reward', 'q_wm_penalty', 'q_wm_error',
+                 'q_wm_threshold', 'q_target', 'q_next', 'pi_active',
+                 'pi_q_weight_eff', 'q_loss_ema', 'q_guide_active',
+                 'ep_reward', 'ep_tasks', 'elite_size',
+                 'elite_ep_reward', 'elite_added']}
     global_step = trainer.step
     ep_r = 0.0
     ep_tasks = 0
@@ -2560,6 +2671,10 @@ def train_policy_prior_online(cfg: OnlineConfig,
           f"succ_margin={cfg.q_success_margin:.2f} "
           f"succ_thr={cfg.q_success_threshold:.2f} "
           f"succ_src={int(cfg.q_success_include_source)}")
+    print(f"  q wm_penalty lambda={cfg.lambda_q_wm_penalty:.3f} "
+          f"pct={cfg.q_wm_penalty_percentile:.1f} "
+          f"clip={cfg.q_wm_penalty_clip:.3f} "
+          f"min_elite={cfg.q_wm_penalty_min_elite}")
     print(f"  pi batch pos/off={cfg.pi_positive_fraction:.2f}/"
           f"{cfg.pi_offline_fraction:.2f}  pi_start={cfg.pi_update_start} "
           f"elite={cfg.pi_elite_fraction:.2f} "
@@ -2635,6 +2750,7 @@ def train_policy_prior_online(cfg: OnlineConfig,
             exec_actions: List[np.ndarray] = []
             exec_us: List[np.ndarray] = []
             exec_rewards: List[float] = []
+            exec_wm_errors: List[float] = []
             z_final = None
             h_final = None
             done_chunk = False
@@ -2643,7 +2759,15 @@ def train_policy_prior_online(cfg: OnlineConfig,
                 cur_step = ctx.current_latent()
                 if cur_step is None or global_step >= cfg.n_env_steps:
                     break
+                z_step, h_step = cur_step
                 obs_nx, r_env, done, info = env.step(a_np.clip(-1, 1))
+                x_next_np = ctx._obs_to_x(obs_nx)
+                exec_wm_errors.append(
+                    trainer.wm_prediction_error_np(
+                        z_step, h_step, np.asarray(u_np, dtype=np.float32),
+                        x_next_np,
+                    )
+                )
                 ctx.step(obs_nx, a_np)
 
                 ep_r += r_env
@@ -2700,6 +2824,10 @@ def train_policy_prior_online(cfg: OnlineConfig,
                                         dtype=np.float32).reshape(-1).copy()
                     ),
                     'has_skill_arg': 1.0 if 'skill_arg' in skillarg_meta else 0.0,
+                    'wm_err': (
+                        float(np.max(exec_wm_errors))
+                        if exec_wm_errors else 0.0
+                    ),
                     'source': 0.0,
                 }
                 trainer.buf.add(**trans)
@@ -2745,7 +2873,9 @@ def train_policy_prior_online(cfg: OnlineConfig,
                       f"Aw={ms['skilldec_anchor_w']:.2f} "
                       f"q={ms['q_mean']:.3f} "
                       f"qd={ms['q_data']:.3f} rho={ms['rho']:.3f} rhat={ms['r_hat']:.3f} "
-                      f"rQ={ms['q_reward']:.3f} y={ms['q_target']:.3f} "
+                      f"rQ={ms['q_reward']:.3f} WMp={ms['q_wm_penalty']:.3f} "
+                      f"WMe={ms['q_wm_error']:.3f} WMt={ms['q_wm_threshold']:.3f} "
+                      f"y={ms['q_target']:.3f} "
                       f"pi={ms['pi_active']:.0f} qg={ms['q_guide_active']:.0f} "
                       f"qema={ms['q_loss_ema']:.3f} | "
                       f"ep_r={ms['ep_reward']:.2f} tasks={ms['ep_tasks']:.2f} | "
@@ -2770,6 +2900,9 @@ def train_policy_prior_online(cfg: OnlineConfig,
             h_t = h_t.clone()
 
             obs_nx, r_env, done, info = env.step(a_np.clip(-1, 1))
+            x_next_np = ctx._obs_to_x(obs_nx)
+            wm_err = trainer.wm_prediction_error_np(
+                z_t, h_t, np.asarray(u_np, dtype=np.float32), x_next_np)
             ctx.step(obs_nx, a_np)
 
             ep_r += r_env
@@ -2813,6 +2946,7 @@ def train_policy_prior_online(cfg: OnlineConfig,
                         else np.asarray(skillarg_meta['skill_arg'], dtype=np.float32).reshape(-1).copy()
                     ),
                     'has_skill_arg': 1.0 if 'skill_arg' in skillarg_meta else 0.0,
+                    'wm_err': wm_err,
                     'source': 0.0,
                 }
                 trainer.buf.add(
@@ -2864,7 +2998,9 @@ def train_policy_prior_online(cfg: OnlineConfig,
                       f"Aw={ms['skilldec_anchor_w']:.2f} "
                       f"q={ms['q_mean']:.3f} "
                       f"qd={ms['q_data']:.3f} rho={ms['rho']:.3f} rhat={ms['r_hat']:.3f} "
-                      f"rQ={ms['q_reward']:.3f} y={ms['q_target']:.3f} "
+                      f"rQ={ms['q_reward']:.3f} WMp={ms['q_wm_penalty']:.3f} "
+                      f"WMe={ms['q_wm_error']:.3f} WMt={ms['q_wm_threshold']:.3f} "
+                      f"y={ms['q_target']:.3f} "
                       f"pi={ms['pi_active']:.0f} qg={ms['q_guide_active']:.0f} "
                       f"qema={ms['q_loss_ema']:.3f} | "
                       f"ep_r={ms['ep_reward']:.2f} tasks={ms['ep_tasks']:.2f} | "
@@ -2959,6 +3095,12 @@ def main():
     p.add_argument('--lambda_q_negative', type=float, default=0.0)
     p.add_argument('--lambda_q_success_rank', type=float, default=0.0)
     p.add_argument('--q_success_margin', type=float, default=0.5)
+    p.add_argument('--lambda_q_wm_penalty', type=float, default=0.0)
+    p.add_argument('--q_wm_penalty_percentile', type=float, default=95.0)
+    p.add_argument('--q_wm_penalty_clip', type=float, default=1.0)
+    p.add_argument('--q_wm_penalty_min_elite', type=int, default=128)
+    p.add_argument('--q_wm_penalty_q_weight', type=float, default=1.0)
+    p.add_argument('--q_wm_penalty_obj_weight', type=float, default=1.0)
     p.add_argument('--pi_update_start', type=int, default=10_000)
     p.add_argument('--actor_mode', choices=['policy_prior', 'skill_decoder', 'skill_arg'],
                    default='policy_prior')
@@ -3086,6 +3228,12 @@ def main():
         lambda_q_negative=args.lambda_q_negative,
         lambda_q_success_rank=args.lambda_q_success_rank,
         q_success_margin=args.q_success_margin,
+        lambda_q_wm_penalty=args.lambda_q_wm_penalty,
+        q_wm_penalty_percentile=args.q_wm_penalty_percentile,
+        q_wm_penalty_clip=args.q_wm_penalty_clip,
+        q_wm_penalty_min_elite=args.q_wm_penalty_min_elite,
+        q_wm_penalty_q_weight=args.q_wm_penalty_q_weight,
+        q_wm_penalty_obj_weight=args.q_wm_penalty_obj_weight,
         pi_update_start=args.pi_update_start,
         actor_mode=args.actor_mode,
         pi_q_weight=args.pi_q_weight,
