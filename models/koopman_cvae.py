@@ -1472,13 +1472,15 @@ class KoopmanCVAE(nn.Module):
         N = T - H + 1
         o_in = o_seq[:, :N]
         h_in = h_pre_seq[:, :N]
-        if (getattr(cfg, 'skill_arg_use_label_onehot', False)
-                and skill_labels is not None):
+        has_labels = skill_labels is not None
+        start_labels = None
+        if has_labels:
             start_labels = skill_labels[:, :N].long().clamp(
                 0, cfg.num_skills - 1)
+        if (getattr(cfg, 'skill_arg_use_label_onehot', False)
+                and start_labels is not None):
             w_in = F.one_hot(start_labels, num_classes=cfg.num_skills).float()
         else:
-            start_labels = None
             w_in = torch.softmax(skill_logits[:, :N], dim=-1)
         target_a = torch.stack(
             [actions[:, k:k + N] for k in range(H)], dim=2
@@ -1497,13 +1499,34 @@ class KoopmanCVAE(nn.Module):
             same_skill = label_chunks.eq(start_labels.unsqueeze(-1))
             action_step_mask = step_valid & same_skill
             valid = action_step_mask.any(dim=-1)
-            progress_target = torch.zeros(B, N, H, device=device)
+
+            # EXTRACT trains on skill segments and uses a progress ramp inside
+            # each segment. We emulate that on sliding windows by computing the
+            # absolute within-segment progress for every timestep, then masking
+            # all action/progress targets after the first label boundary.
+            seq_valid = (mask.to(device).bool() if mask is not None
+                         else torch.ones(B, T, dtype=torch.bool, device=device))
+            progress_seq = torch.zeros(B, T, device=device)
+            labels_dev = skill_labels.to(device).long()
+            for b in range(B):
+                valid_len = int(seq_valid[b].long().sum().item())
+                t0 = 0
+                while t0 < valid_len:
+                    t1 = t0
+                    while (t1 + 1 < valid_len
+                           and int(labels_dev[b, t1 + 1].item())
+                           == int(labels_dev[b, t0].item())):
+                        t1 += 1
+                    seg_len = t1 - t0 + 1
+                    if seg_len > 1:
+                        progress_seq[b, t0:t1 + 1] = torch.linspace(
+                            0.0, 1.0, seg_len, device=device)
+                    else:
+                        progress_seq[b, t0] = 1.0
+                    t0 = t1 + 1
+            progress_target = torch.stack(
+                [progress_seq[:, k:k + N] for k in range(H)], dim=2)
             progress_mask = action_step_mask.float()
-            for k in range(H - 1):
-                cur = skill_labels[:, k:k + N].to(device)
-                nxt = skill_labels[:, k + 1:k + 1 + N].to(device)
-                progress_target[:, :, k] = (
-                    cur.long() != nxt.long()).float()
             progress_target = progress_target * progress_mask
         else:
             action_step_mask = step_valid
