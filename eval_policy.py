@@ -6,6 +6,9 @@ sys.path.insert(0, os.path.expanduser('~/koopman_CVAE'))
 os.environ.setdefault('MUJOCO_GL', 'egl')
 
 import argparse
+import csv
+import json
+import re
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -103,6 +106,7 @@ class PolicyWrapper:
         self.H_lo = 1; self.n_skills = None
         self._pi_iql = None; self._trainer = None; self._cfg = None
         self._model = None; self._inv_steps = 30; self._deterministic = True
+        self._skill_d_no_h = False
         self._hi_timer = 0; self._sid = 0
 
     @classmethod
@@ -197,7 +201,7 @@ class PolicyWrapper:
         return pw, model, None
 
     @classmethod
-    def load_skill_arg(cls, world_ckpt, device):
+    def load_skill_arg(cls, world_ckpt, device, skill_d_no_h=False):
         dev = device
         print(f"\n[SkillArg] world: {world_ckpt}")
         wc    = torch.load(world_ckpt, map_location=dev)
@@ -211,6 +215,7 @@ class PolicyWrapper:
         pw = cls('skill_arg', device)
         pw._model = model
         pw.H_lo = H
+        pw._skill_d_no_h = bool(skill_d_no_h)
         return pw, model, None
 
     @torch.no_grad()
@@ -262,8 +267,12 @@ class PolicyWrapper:
         elif self.mode == 'skill_arg':
             if h_t is None:
                 raise ValueError("h_t is required for skill_arg mode")
-            prior_logits = self._model.skill_prior(h_t).detach()
-            logits_d = self._model.skill_discrete_policy(z_t, h_t, prior_logits)
+            h_d = torch.zeros_like(h_t) if self._skill_d_no_h else h_t
+            prior_logits = (
+                torch.zeros_like(self._model.skill_prior(h_t))
+                if self._skill_d_no_h else self._model.skill_prior(h_t).detach()
+            )
+            logits_d = self._model.skill_discrete_policy(z_t, h_d, prior_logits)
             skill_id = logits_d.argmax(dim=-1)
             w = F.one_hot(
                 skill_id, num_classes=self._model.cfg.num_skills).float()
@@ -293,8 +302,12 @@ class PolicyWrapper:
         if self.mode == 'skill_decoder':
             a_seq = self._model.skill_action_decoder(z_now, h, w)
         else:
-            prior_logits = self._model.skill_prior(h).detach()
-            logits_d = self._model.skill_discrete_policy(z_now, h, prior_logits)
+            h_d = torch.zeros_like(h) if self._skill_d_no_h else h
+            prior_logits = (
+                torch.zeros_like(self._model.skill_prior(h))
+                if self._skill_d_no_h else self._model.skill_prior(h).detach()
+            )
+            logits_d = self._model.skill_discrete_policy(z_now, h_d, prior_logits)
             skill_id = logits_d.argmax(dim=-1)
             w = F.one_hot(
                 skill_id, num_classes=self._model.cfg.num_skills).float()
@@ -403,6 +416,248 @@ def visualize_summary(results, mode, out_path):
     plt.tight_layout(); Path(out_path).parent.mkdir(parents=True,exist_ok=True)
     plt.savefig(out_path,dpi=130,bbox_inches='tight'); plt.close()
     print(f"Summary: {out_path}")
+
+
+def load_policy_for_eval(args, world_ckpt=None, policy_ckpt=None):
+    world_ckpt = world_ckpt or args.world_ckpt
+    policy_ckpt = policy_ckpt or args.policy_ckpt
+
+    if args.mode == 'iql':
+        if policy_ckpt is None:
+            raise ValueError("--policy_ckpt is required for --mode iql")
+        policy, model, wm = PolicyWrapper.load_iql(
+            world_ckpt, policy_ckpt, args.device)
+        cond_len = 16
+    elif args.mode == 'online':
+        if policy_ckpt is None:
+            raise ValueError("--policy_ckpt is required for --mode online")
+        policy, model, wm = PolicyWrapper.load_online(
+            world_ckpt, policy_ckpt, args.cat_ckpt, args.device)
+        cond_len = OnlineConfig().cond_len
+    elif args.mode == 'skill_decoder':
+        policy, model, wm = PolicyWrapper.load_skill_decoder(
+            world_ckpt, args.device)
+        cond_len = OnlineConfig().cond_len
+    elif args.mode == 'skill_arg':
+        policy, model, wm = PolicyWrapper.load_skill_arg(
+            world_ckpt, args.device, skill_d_no_h=args.skill_d_no_h)
+        cond_len = OnlineConfig().cond_len
+    else:
+        policy, model, wm = PolicyWrapper.load_prior(
+            world_ckpt, args.device,
+            action_inv_steps=args.action_inv_steps,
+            deterministic=not args.prior_sample)
+        cond_len = OnlineConfig().cond_len
+    return policy, model, wm, cond_len
+
+
+def evaluate_policy(args, policy, model, wm, cond_len, out_dir,
+                    save_artifacts=True, all_fixed_seeds=False):
+    import gym, d4rl
+
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    results = []
+    all_info_keys = set()
+    print(f"\n{'='*55}\n[{args.mode.upper()}] {args.n_ep} episodes  env={args.env}\n{'='*55}\n")
+
+    for ep_i in range(args.n_ep):
+        env = gym.make(args.env)
+        if all_fixed_seeds or ep_i < args.n_ep // 2:
+            seed = args.fixed_seed + ep_i
+            env.seed(seed)
+            label = f'seed{seed}'
+        else:
+            label = 'random'
+        print(f"  Ep {ep_i:2d} [{label}]  ", end='', flush=True)
+        result = rollout_episode(
+            env, model, policy, args.device,
+            cond_len=cond_len, max_steps=args.max_steps,
+            render=(save_artifacts and not args.no_gif))
+        env.close()
+        all_info_keys.update(result['info_keys'])
+        results.append(result)
+        print(f"reward={result['total_reward']:.3f}  tasks={result['n_tasks']}  steps={result['n_steps']}")
+
+        if save_artifacts and not args.no_gif and result['frames']:
+            save_gif(
+                result['frames'],
+                f"{out_dir}/gif/ep{ep_i:02d}_{label}_r{result['total_reward']:.2f}.gif",
+                fps=args.fps)
+        if save_artifacts:
+            visualize_episode(
+                result, ep_i, label, args.mode,
+                f"{out_dir}/plots/ep{ep_i:02d}_{label}.png")
+
+    total_rs = np.array([r['total_reward'] for r in results], dtype=np.float32)
+    n_tasks = np.array([r['n_tasks'] for r in results], dtype=np.float32)
+    n_steps = np.array([r['n_steps'] for r in results], dtype=np.float32)
+    summary = {
+        'mean_reward': float(total_rs.mean()),
+        'std_reward': float(total_rs.std()),
+        'max_reward': float(total_rs.max()),
+        'mean_tasks': float(n_tasks.mean()),
+        'std_tasks': float(n_tasks.std()),
+        'max_tasks': float(n_tasks.max()),
+        'mean_steps': float(n_steps.mean()),
+        'std_steps': float(n_steps.std()),
+        'episode_rewards': total_rs.tolist(),
+        'episode_tasks': n_tasks.tolist(),
+        'episode_steps': n_steps.tolist(),
+        'info_keys': sorted(all_info_keys),
+    }
+
+    print(f"\n{'='*55}\n[{args.mode.upper()}] Results:")
+    print(f"  mean_reward: {summary['mean_reward']:.4f} +/- {summary['std_reward']:.4f}")
+    print(f"  max_reward:  {summary['max_reward']:.4f}")
+    print(f"  mean_tasks:  {summary['mean_tasks']:.4f}  max_tasks: {int(summary['max_tasks'])}")
+    task_keys = [k for k in all_info_keys if any(w in k.lower()
+                 for w in ['task','success','complete','solve','goal'])]
+    print(f"  info keys: {sorted(all_info_keys)}")
+    if task_keys:
+        print(f"  task candidates: {task_keys}")
+    print(f"{'='*55}")
+
+    visualize_summary(results, args.mode, f"{out_dir}/summary_{args.mode}.png")
+    Path(f"{out_dir}/summary_{args.mode}.json").write_text(
+        json.dumps(summary, indent=2))
+    return results, summary
+
+
+def checkpoint_step(path: Path) -> int:
+    m = re.search(r'(?:step|epoch[_a-zA-Z]*_?)(\d+)', path.stem)
+    if m:
+        return int(m.group(1))
+    m = re.search(r'(\d+)', path.stem)
+    return int(m.group(1)) if m else -1
+
+
+def discover_sweep_checkpoints(args) -> List[Path]:
+    ckpt_dir = Path(args.sweep_ckpt_dir)
+    paths = sorted(ckpt_dir.glob(args.sweep_pattern),
+                   key=lambda p: (checkpoint_step(p), str(p)))
+    if args.sweep_start_step >= 0:
+        paths = [p for p in paths if checkpoint_step(p) >= args.sweep_start_step]
+    if args.sweep_end_step >= 0:
+        paths = [p for p in paths if checkpoint_step(p) <= args.sweep_end_step]
+    if args.sweep_stride > 1:
+        paths = paths[::args.sweep_stride]
+    if args.sweep_limit > 0:
+        paths = paths[:args.sweep_limit]
+    if not paths:
+        raise FileNotFoundError(
+            f"No checkpoints matched {ckpt_dir / args.sweep_pattern}")
+    return paths
+
+
+def plot_checkpoint_sweep(rows: List[Dict], out_path: str):
+    steps = np.array([r['step'] for r in rows], dtype=np.float32)
+    mean_r = np.array([r['mean_reward'] for r in rows], dtype=np.float32)
+    std_r = np.array([r['std_reward'] for r in rows], dtype=np.float32)
+    mean_t = np.array([r['mean_tasks'] for r in rows], dtype=np.float32)
+    std_t = np.array([r['std_tasks'] for r in rows], dtype=np.float32)
+
+    fig, axes = plt.subplots(1, 2, figsize=(15, 5))
+    reward_col = '#5B8FF9'
+    task_col = '#61DDAA'
+
+    ax = axes[0]
+    ax.plot(steps, mean_r, color=reward_col, lw=2.0, marker='o',
+            label='mean reward')
+    ax.fill_between(steps, mean_r - std_r, mean_r + std_r,
+                    color=reward_col, alpha=0.20, label='+/- 1 std')
+    ax.set_xlabel('Checkpoint step')
+    ax.set_ylabel('Episode reward')
+    ax.set_title('Reward Across Checkpoints', fontweight='bold')
+    ax.grid(alpha=0.25)
+    ax.legend(fontsize=8)
+    ax.spines[['top','right']].set_visible(False)
+
+    ax = axes[1]
+    ax.plot(steps, mean_t, color=task_col, lw=2.0, marker='o',
+            label='mean tasks')
+    ax.fill_between(steps, mean_t - std_t, mean_t + std_t,
+                    color=task_col, alpha=0.20, label='+/- 1 std')
+    ax.set_xlabel('Checkpoint step')
+    ax.set_ylabel('Tasks completed')
+    ax.set_title('Tasks Across Checkpoints', fontweight='bold')
+    ax.grid(alpha=0.25)
+    ax.legend(fontsize=8)
+    ax.spines[['top','right']].set_visible(False)
+
+    best_i = int(np.argmax(mean_r))
+    fig.suptitle(
+        f'Checkpoint Sweep  best_step={int(steps[best_i])}  '
+        f'best_reward={mean_r[best_i]:.3f}+/-{std_r[best_i]:.3f}',
+        fontsize=12, fontweight='bold')
+    plt.tight_layout()
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Sweep plot: {out_path}")
+
+
+def run_checkpoint_sweep(args):
+    import gym, d4rl  # noqa: F401
+
+    paths = discover_sweep_checkpoints(args)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    rows = []
+    episode_rewards = {}
+
+    print(f"\n{'='*55}")
+    print(f"[SWEEP] mode={args.mode}  checkpoints={len(paths)}  n_ep={args.n_ep}")
+    print(f"        dir={args.sweep_ckpt_dir}  pattern={args.sweep_pattern}")
+    print(f"{'='*55}\n")
+
+    model_ckpt_modes = {'prior', 'skill_decoder', 'skill_arg'}
+    if args.mode in {'iql', 'online'} and args.world_ckpt is None:
+        raise ValueError("--world_ckpt is required when sweeping policy checkpoints for iql/online")
+
+    for i, ckpt in enumerate(paths):
+        step = checkpoint_step(ckpt)
+        ckpt_out = out_dir / f"step{step:07d}"
+        print(f"\n[{i+1}/{len(paths)}] step={step}  ckpt={ckpt}")
+        if args.mode in model_ckpt_modes:
+            world_ckpt = str(ckpt)
+            policy_ckpt = args.policy_ckpt
+        else:
+            world_ckpt = args.world_ckpt
+            policy_ckpt = str(ckpt)
+        policy, model, wm, cond_len = load_policy_for_eval(
+            args, world_ckpt=world_ckpt, policy_ckpt=policy_ckpt)
+        _, summary = evaluate_policy(
+            args, policy, model, wm, cond_len, str(ckpt_out),
+            save_artifacts=args.sweep_save_details,
+            all_fixed_seeds=True)
+        row = {
+            'step': int(step),
+            'checkpoint': str(ckpt),
+            'mean_reward': summary['mean_reward'],
+            'std_reward': summary['std_reward'],
+            'max_reward': summary['max_reward'],
+            'mean_tasks': summary['mean_tasks'],
+            'std_tasks': summary['std_tasks'],
+            'max_tasks': summary['max_tasks'],
+            'mean_steps': summary['mean_steps'],
+            'std_steps': summary['std_steps'],
+        }
+        rows.append(row)
+        episode_rewards[str(step)] = summary['episode_rewards']
+        del policy, model, wm
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    csv_path = out_dir / 'sweep_results.csv'
+    with csv_path.open('w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+    json_path = out_dir / 'sweep_episode_rewards.json'
+    json_path.write_text(json.dumps(episode_rewards, indent=2))
+    plot_checkpoint_sweep(rows, str(out_dir / 'sweep_reward_curve.png'))
+    print(f"Sweep CSV: {csv_path}")
+    print(f"Sweep episode rewards: {json_path}")
 
 
 # ─── Main ──────────────────────────────────────────────────────────────────
@@ -605,7 +860,7 @@ def analyze_reward_distribution(results_with_extra, wm, out_path, device):
 def main():
     p=argparse.ArgumentParser()
     p.add_argument('--mode',        choices=['iql','online','prior','skill_decoder','skill_arg'], default='online')
-    p.add_argument('--world_ckpt',  required=True)
+    p.add_argument('--world_ckpt',  default=None)
     p.add_argument('--policy_ckpt', default=None)
     p.add_argument('--cat_ckpt',    default=None)
     p.add_argument('--env',         default='kitchen-mixed-v0')
@@ -619,10 +874,28 @@ def main():
     p.add_argument('--action_inv_steps', type=int, default=30)
     p.add_argument('--prior_sample', action='store_true',
                    help='Sample policy_prior instead of using tanh(mean).')
+    p.add_argument('--skill_d_no_h', action='store_true',
+                   help='For skill_arg eval, match training with pi_d conditioned on z only.')
+    p.add_argument('--sweep_ckpt_dir', default=None,
+                   help='Evaluate every checkpoint in this directory and plot mean+/-std over steps.')
+    p.add_argument('--sweep_pattern', default='policy_prior_online_step*.pt')
+    p.add_argument('--sweep_start_step', type=int, default=-1)
+    p.add_argument('--sweep_end_step', type=int, default=-1)
+    p.add_argument('--sweep_stride', type=int, default=1,
+                   help='Evaluate every Nth matched checkpoint after sorting by step.')
+    p.add_argument('--sweep_limit', type=int, default=0,
+                   help='Maximum number of checkpoints to evaluate; 0 means all.')
+    p.add_argument('--sweep_save_details', action='store_true',
+                   help='In sweep mode, also save GIFs and per-episode plots for each checkpoint.')
     args=p.parse_args()
 
     import gym, d4rl
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
+    if args.sweep_ckpt_dir:
+        run_checkpoint_sweep(args)
+        return
+    if args.world_ckpt is None:
+        raise ValueError("--world_ckpt is required unless --sweep_ckpt_dir is used")
 
     if args.mode=='iql':
         if args.policy_ckpt is None:
@@ -642,7 +915,7 @@ def main():
         cond_len=OnlineConfig().cond_len
     elif args.mode=='skill_arg':
         policy, model, wm = PolicyWrapper.load_skill_arg(
-            args.world_ckpt, args.device)
+            args.world_ckpt, args.device, skill_d_no_h=args.skill_d_no_h)
         cond_len=OnlineConfig().cond_len
     else:
         policy, model, wm = PolicyWrapper.load_prior(
