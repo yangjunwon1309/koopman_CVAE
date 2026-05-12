@@ -159,6 +159,44 @@ def crop_episodes_by_reward(
 # ──────────────────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
+def rollout_with_skill_weights(
+    model: KoopmanCVAE,
+    x_cond: torch.Tensor,
+    a_cond: torch.Tensor,
+    a_plan: torch.Tensor,
+    h_init: Optional[torch.Tensor] = None,
+):
+    B = x_cond.shape[0]
+    device = x_cond.device
+    h = h_init if h_init is not None else model.recurrent.init_hidden(B, device)
+    o = None
+
+    for t in range(x_cond.shape[1]):
+        o, _, _ = model.posterior.sample(x_cond[:, t], h)
+        h = model.recurrent(h, o, a_cond[:, t])
+
+    o_preds, recon_preds, skill_weights = [], [], []
+    w = model.skill_prior.soft_weights(h)
+    for t in range(a_plan.shape[1]):
+        u = model.action_encoder(a_plan[:, t])
+        o_next, _, _ = model.koopman(o, u, w)
+        o = o_next
+        h = model.recurrent(h, o, a_plan[:, t])
+        w = model.skill_prior.soft_weights(h)
+        o_preds.append(o)
+        recon_preds.append(model.decoder(o))
+        skill_weights.append(w)
+
+    result = {
+        'o_preds': torch.stack(o_preds, dim=1),
+        'skill_weights': torch.stack(skill_weights, dim=1),
+    }
+    for key in ['delta_e', 'delta_p', 'q', 'qdot']:
+        result[key] = symexp(torch.stack([r[key] for r in recon_preds], dim=1))
+    return result
+
+
+@torch.no_grad()
 def analyze_skill_segments(
     model:       KoopmanCVAE,
     episodes:    List[Dict],
@@ -317,6 +355,135 @@ def analyze_skill_segments(
             seg_start = seg_end
 
     print(f"\nSegment analysis: {len(results)} segments from "
+          f"{len(set(r['ep_idx'] for r in results))} episodes")
+    return results
+
+
+@torch.no_grad()
+def analyze_random_midpoint_rollouts(
+    model: KoopmanCVAE,
+    episodes: List[Dict],
+    x_seq_full: np.ndarray,
+    horizon: int = 8,
+    device: str = 'cuda',
+    min_context: int = 8,
+    rng: Optional[np.random.Generator] = None,
+) -> List[Dict]:
+    """
+    One random mid-episode rollout per episode.
+
+    All frames before the sampled t0 are encoded as the given history, then
+    the world model predicts the horizon after t0 using the GT action plan.
+    """
+    dev = torch.device(device)
+    rng = rng or np.random.default_rng()
+    results = []
+
+    cfg = model.cfg
+    dq_sl = slice(X_DQ_START, X_DQ_END)
+    dp_sl = slice(X_DP_START, X_DP_END)
+
+    for ep_idx, ep in enumerate(episodes):
+        s, e = ep['start_t'], ep['end_t']
+        L = ep['length']
+        acts_ep = ep['actions']
+        rew_ep = ep['rewards']
+        gi = ep['goal_info']
+
+        if L < min_context + horizon + 2:
+            continue
+
+        x_ep = x_seq_full[s:e + 1]
+        x_t = torch.FloatTensor(x_ep).unsqueeze(0).to(dev)
+        a_t = torch.FloatTensor(acts_ep).unsqueeze(0).to(dev)
+
+        low = max(min_context, int(0.2 * L))
+        high = min(L - horizon - 1, int(0.8 * L))
+        if low > high:
+            low = min_context
+            high = L - horizon - 1
+        if low > high:
+            continue
+
+        t0 = int(rng.integers(low, high + 1))
+        t1 = min(t0 + horizon, L - 1)
+        H = t1 - t0
+        if H <= 0:
+            continue
+
+        prefix_enc = model.encode_sequence(x_t[:, :t0], a_t[:, :t0])
+        h_pre = prefix_enc.get('h_pre_seq', prefix_enc['h_seq'])[0]
+        h_init = h_pre[-1].unsqueeze(0).to(dev)
+
+        x_cond = x_t[:, t0 - 1:t0]
+        a_cond = a_t[:, t0 - 1:t0]
+        a_plan = a_t[:, t0:t1]
+
+        pred = rollout_with_skill_weights(
+            model, x_cond, a_cond, a_plan, h_init=h_init)
+
+        x_true = x_ep[t0:t1]
+        H_c = min(pred['q'].shape[1], len(x_true))
+        if H_c <= 0:
+            continue
+
+        dq_pred = pred['q'][0, :H_c].cpu().numpy()
+        dq_true = x_true[:H_c, dq_sl]
+        dp_pred = pred['delta_p'][0, :H_c].cpu().numpy()
+        dp_true = x_true[:H_c, dp_sl]
+
+        rmse_dq = float(np.sqrt(((dq_pred - dq_true) ** 2).mean()))
+        rmse_dp = float(np.sqrt(((dp_pred - dp_true) ** 2).mean()))
+        rmse_per_joint = np.sqrt(((dq_pred - dq_true) ** 2).mean(0))
+
+        skill_weights = pred['skill_weights'][0, :H_c].cpu().numpy()
+        skill_pred = skill_weights.argmax(axis=-1)
+
+        completions = gi.get('completions', {})
+        future_tasks = [
+            (task, t) for task, t in completions.items() if t >= t0
+        ]
+        if future_tasks:
+            task_label = min(future_tasks, key=lambda x: x[1])[0]
+        else:
+            task_label = 'midpoint'
+
+        z_seg = pred['o_preds'][0, :H_c]
+        u_seg = model.action_encoder(a_t[0, t0:t0 + H_c])
+        r_gt = rew_ep[t0:t0 + H_c]
+
+        has_ens = hasattr(model, 'reward_ensemble_head')
+        r_mu_seg = r_std_seg = r_pen_seg = None
+        if has_ens:
+            probs = model.reward_ensemble_head.member_probs(z_seg, u_seg)
+            r_mu_seg = probs.mean(0).cpu().numpy()
+            r_std_seg = probs.std(0).cpu().numpy()
+            r_pen_seg = (r_mu_seg - cfg.mopo_beta * r_std_seg).clip(0, 1)
+
+        results.append({
+            'ep_idx': ep_idx,
+            'seg_idx': 0,
+            'task': task_label,
+            'seg_start': t0,
+            'seg_end': t1,
+            'H': H_c,
+            'rmse_dq': rmse_dq,
+            'rmse_dp': rmse_dp,
+            'rmse_per_joint': rmse_per_joint,
+            'dq_pred': dq_pred,
+            'dq_true': dq_true,
+            'dp_pred': dp_pred,
+            'dp_true': dp_true,
+            'skill_weights': skill_weights,
+            'skill_pred': skill_pred,
+            'r_gt': r_gt[:H_c],
+            'r_mu': r_mu_seg,
+            'r_std': r_std_seg,
+            'r_pen': r_pen_seg,
+            'reward_total': float(gi['reward_total']),
+        })
+
+    print(f"\nRandom midpoint analysis: {len(results)} rollouts from "
           f"{len(set(r['ep_idx'] for r in results))} episodes")
     return results
 
@@ -941,8 +1108,8 @@ def parse_args():
     p.add_argument('--env',        default='kitchen-mixed-v0')
     p.add_argument('--quality',    default='mixed',
                    choices=['mixed', 'partial', 'complete'])
-    p.add_argument('--n_ep',       type=int, default=10,
-                   help='Number of episodes to analyze (≥10 for statistics)')
+    p.add_argument('--n_ep',       type=int, default=8,
+                   help='Number of random episodes to analyze')
     p.add_argument('--horizon',    type=int, default=8,
                    help='Rollout horizon per segment (≤8 recommended)')
     p.add_argument('--min_seg_len',type=int, default=8,
@@ -980,16 +1147,23 @@ if __name__ == '__main__':
     episodes = crop_episodes_by_reward(
         episodes, reward_crop, min_len=args.min_seg_len + args.horizon + 2)
 
-    # Select episodes with tasks, sorted by reward (descending for variety)
-    eps_with_tasks = [e for e in episodes if e['tasks']]
-    eps_with_tasks.sort(key=lambda e: e['goal_info']['reward_total'], reverse=True)
-    selected = eps_with_tasks[:args.n_ep]
+    rng = np.random.default_rng(args.seed)
+
+    eligible = [
+        e for e in episodes
+        if e['length'] >= args.min_seg_len + args.horizon + 2
+    ]
+    if len(eligible) > args.n_ep:
+        idx = rng.choice(len(eligible), size=args.n_ep, replace=False)
+        selected = [eligible[int(i)] for i in idx]
+    else:
+        selected = eligible
     if not selected:
         print("No episodes selected. Check reward_crop, quality, and min lengths.")
         exit(1)
-    print(f"Selected {len(selected)} episodes  "
-          f"(reward range: {selected[-1]['goal_info']['reward_total']:.0f}"
-          f"~{selected[0]['goal_info']['reward_total']:.0f})")
+    rewards = [e['goal_info']['reward_total'] for e in selected]
+    print(f"Selected {len(selected)} random episodes  "
+          f"(reward range: {min(rewards):.0f}~{max(rewards):.0f})")
 
     if skill_labels is not None:
         print("\n=== Fig S: Skill GT vs predicted weights ===")
@@ -999,15 +1173,16 @@ if __name__ == '__main__':
         )
 
     # ── Core analysis ─────────────────────────────────────────────────────────
-    print(f"\nAnalyzing skill segments (horizon={args.horizon}) ...")
-    results = analyze_skill_segments(
+    print(f"\nAnalyzing random mid-episode rollouts (horizon={args.horizon}) ...")
+    results = analyze_random_midpoint_rollouts(
         model, selected, x_seq_full,
         horizon=args.horizon, device=args.device,
-        min_seg_len=args.min_seg_len,
+        min_context=args.min_seg_len,
+        rng=rng,
     )
 
     if not results:
-        print("No segments to analyze. Check episodes and min_seg_len.")
+        print("No rollouts to analyze. Check episodes and min_seg_len.")
         exit(1)
 
     # ── Statistics ────────────────────────────────────────────────────────────
@@ -1015,7 +1190,7 @@ if __name__ == '__main__':
     print_statistics(stats, out)
 
     # ── Figures ───────────────────────────────────────────────────────────────
-    print("\n=== Fig A: Per-episode segment rollout ===")
+    print("\n=== Fig A: Random midpoint rollout ===")
     plot_per_episode_rollout(results, out)
 
     print("\n=== Fig B: Skill category statistics ===")
