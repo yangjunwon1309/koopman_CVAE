@@ -36,6 +36,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from matplotlib.patches import Patch
+from matplotlib.colors import to_rgba
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 from collections import defaultdict
@@ -51,6 +52,12 @@ from lqr_koopman import (
 
 PAL = ['#E53935','#1E88E5','#43A047','#FB8C00',
        '#8E24AA','#00ACC1','#FFB300','#6D4C41','#546E7A','#D81B60']
+
+SKILL_PAL = [
+    '#F4B183', '#A9D18E', '#9DC3E6', '#D7BDE2', '#F8CBAD',
+    '#B7DEE8', '#C6E0B4', '#FFD966', '#D9EAD3', '#D5A6BD',
+    '#B4C6E7', '#EADCF8', '#C9DAF8', '#FCE5CD', '#D9D2E9',
+]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -262,6 +269,14 @@ def analyze_skill_segments(
             rmse_dp = float(np.sqrt(((dp_pred - dp_true)**2).mean()))
             rmse_per_joint = np.sqrt(((dq_pred - dq_true)**2).mean(0))  # (9,)
 
+            skill_weights = skill_pred = None
+            if hasattr(model, 'skill_prior'):
+                h_skill = h_seq[t0:t0 + H_c]
+                if h_skill.shape[0] > 0:
+                    skill_weights = model.skill_prior.soft_weights(
+                        h_skill).cpu().numpy()
+                    skill_pred = skill_weights.argmax(axis=-1)
+
             # ── Ensemble reward along GT trajectory ───────────────────────
             z_seg = o_seq[t0:t1]   # (H, m)
             u_seg = u_seq[t0:t1]   # (H, d_u)
@@ -291,6 +306,8 @@ def analyze_skill_segments(
                 'dq_true':   dq_true,
                 'dp_pred':   dp_pred,
                 'dp_true':   dp_true,
+                'skill_weights': skill_weights,
+                'skill_pred': skill_pred,
                 'r_gt':      r_gt[:H_c],
                 'r_mu':      r_mu_seg,
                 'r_std':     r_std_seg,
@@ -418,7 +435,7 @@ def print_statistics(stats: Dict, out_dir: Path):
 # Fig A: Per-episode rollout quality
 # ──────────────────────────────────────────────────────────────────────────────
 
-def plot_per_episode_rollout(results: List[Dict], out_dir: Path):
+def _plot_per_episode_rollout_old(results: List[Dict], out_dir: Path):
     """
     각 episode의 각 segment에 대해 GT vs pred Δq 비교.
     Episode별로 한 figure, segment별로 subplot.
@@ -489,6 +506,139 @@ def plot_per_episode_rollout(results: List[Dict], out_dir: Path):
         plt.close()
 
     print(f"Saved: {out_dir}/ep*_segments.png")
+
+
+def _skill_colors(num_skills: int) -> List[str]:
+    if num_skills <= len(SKILL_PAL):
+        return SKILL_PAL[:num_skills]
+    cmap = plt.get_cmap('Pastel1')
+    colors = list(SKILL_PAL)
+    colors.extend(cmap(i % cmap.N) for i in range(num_skills - len(colors)))
+    return colors[:num_skills]
+
+
+def _add_skill_overlay(ax, skill_pred: Optional[np.ndarray], skill_colors: List[str]):
+    if skill_pred is None or len(skill_pred) == 0:
+        return
+
+    pred = np.asarray(skill_pred, dtype=np.int64)
+    start = 0
+    for i in range(1, len(pred) + 1):
+        if i == len(pred) or pred[i] != pred[start]:
+            color = skill_colors[int(pred[start]) % len(skill_colors)]
+            ax.axvspan(start - 0.5, i - 0.5, color=color,
+                       alpha=0.12, lw=0, zorder=0)
+            start = i
+
+
+def _add_skill_loci(ax, skill_pred: Optional[np.ndarray], skill_colors: List[str]):
+    if skill_pred is None or len(skill_pred) == 0:
+        return
+
+    y0, y1 = ax.get_ylim()
+    strip_h = max((y1 - y0) * 0.035, 1e-6)
+    rgba = np.array([
+        to_rgba(skill_colors[int(k) % len(skill_colors)], alpha=0.92)
+        for k in np.asarray(skill_pred, dtype=np.int64)
+    ])[None, :, :]
+    ax.imshow(
+        rgba, aspect='auto', interpolation='nearest',
+        extent=(-0.5, len(skill_pred) - 0.5, y0, y0 + strip_h),
+        zorder=5,
+    )
+    ax.set_ylim(y0, y1)
+
+
+def _top_object_dims(seg: Dict, top_k: int = 5) -> np.ndarray:
+    n_dim = seg['dp_true'].shape[1]
+    top_k = min(top_k, n_dim)
+    if top_k == n_dim:
+        return np.arange(n_dim)
+    stacked = np.concatenate([seg['dp_true'], seg['dp_pred']], axis=0)
+    score = np.nanmax(stacked, axis=0) - np.nanmin(stacked, axis=0)
+    return np.argsort(score)[-top_k:][::-1]
+
+
+def plot_per_episode_rollout(results: List[Dict], out_dir: Path):
+    """
+    Plot multiple rollout segments in one figure.
+    Columns: joint delta q and object delta p. Skill prediction is shown as
+    a faint background and a colored loci strip on the x-axis.
+    """
+    segs = sorted(results, key=lambda r: (r['ep_idx'], r['seg_idx']))
+    if not segs:
+        return
+
+    n = len(segs)
+    fig, axes = plt.subplots(
+        n, 2, figsize=(15, max(3.0, 2.7 * n)), squeeze=False,
+        sharex=False,
+    )
+
+    q_cmap = plt.get_cmap('tab10')
+    p_cmap = plt.get_cmap('Dark2')
+    num_skills = 1
+    for seg in segs:
+        if seg.get('skill_weights') is not None:
+            num_skills = max(num_skills, int(seg['skill_weights'].shape[-1]))
+        elif seg.get('skill_pred') is not None and len(seg['skill_pred']) > 0:
+            num_skills = max(num_skills, int(np.max(seg['skill_pred'])) + 1)
+    skill_colors = _skill_colors(num_skills)
+
+    for row, seg in enumerate(segs):
+        H = seg['H']
+        ts = np.arange(H)
+        skill_pred = seg.get('skill_pred')
+
+        ax_q = axes[row, 0]
+        _add_skill_overlay(ax_q, skill_pred, skill_colors)
+        for d in range(seg['dq_true'].shape[1]):
+            color = q_cmap(d % q_cmap.N)
+            ax_q.plot(ts, seg['dq_true'][:, d], '-',
+                      color=color, lw=1.1, alpha=0.86)
+            ax_q.plot(ts, seg['dq_pred'][:, d], '--',
+                      color=color, lw=1.1, alpha=0.72)
+        _add_skill_loci(ax_q, skill_pred, skill_colors)
+        ax_q.set_title(
+            f"Ep {seg['ep_idx']} seg {seg['seg_idx']} [{seg['task']}] "
+            f"t={seg['seg_start']}..{seg['seg_end']}",
+            fontsize=9,
+        )
+        ax_q.set_ylabel('dq [rad]', fontsize=8)
+        ax_q.set_xlabel('step', fontsize=8)
+        ax_q.spines[['top', 'right']].set_visible(False)
+
+        ax_p = axes[row, 1]
+        _add_skill_overlay(ax_p, skill_pred, skill_colors)
+        dims = _top_object_dims(seg, top_k=5)
+        for i, d in enumerate(dims):
+            color = p_cmap(i % p_cmap.N)
+            ax_p.plot(ts, seg['dp_true'][:, d], '-',
+                      color=color, lw=1.1, alpha=0.86)
+            ax_p.plot(ts, seg['dp_pred'][:, d], '--',
+                      color=color, lw=1.1, alpha=0.72)
+        _add_skill_loci(ax_p, skill_pred, skill_colors)
+        dim_txt = ','.join(str(int(d)) for d in dims)
+        ax_p.set_title(f"Object position delta, top dims [{dim_txt}]",
+                       fontsize=9)
+        ax_p.set_ylabel('dp', fontsize=8)
+        ax_p.set_xlabel('step', fontsize=8)
+        ax_p.spines[['top', 'right']].set_visible(False)
+
+    handles = [Patch(color=skill_colors[k], label=f"Skill {k}")
+               for k in range(num_skills)]
+    fig.legend(handles=handles, loc='upper right',
+               ncol=min(num_skills, 6), fontsize=8, frameon=True)
+    fig.suptitle(
+        'Rollout Quality  (solid=GT, dashed=pred, background/strip=predicted skill)',
+        fontsize=12, fontweight='bold',
+    )
+    plt.tight_layout(rect=(0, 0, 0.92, 0.97))
+    path = str(out_dir / 'rollout_quality.png')
+    plt.savefig(path, dpi=140, bbox_inches='tight')
+    plt.close()
+
+    print(f"Saved: {path}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
