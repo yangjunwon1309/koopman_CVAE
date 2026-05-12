@@ -107,6 +107,8 @@ class PolicyWrapper:
         self._pi_iql = None; self._trainer = None; self._cfg = None
         self._model = None; self._inv_steps = 30; self._deterministic = True
         self._skill_d_no_h = False
+        self._skill_arg_eval_variant = 'policy'
+        self._ref_model = None
         self._hi_timer = 0; self._sid = 0
 
     @classmethod
@@ -201,7 +203,8 @@ class PolicyWrapper:
         return pw, model, None
 
     @classmethod
-    def load_skill_arg(cls, world_ckpt, device, skill_d_no_h=False):
+    def load_skill_arg(cls, world_ckpt, device, skill_d_no_h=False,
+                       eval_variant='policy', ref_ckpt=None):
         dev = device
         print(f"\n[SkillArg] world: {world_ckpt}")
         wc    = torch.load(world_ckpt, map_location=dev)
@@ -216,6 +219,21 @@ class PolicyWrapper:
         pw._model = model
         pw.H_lo = H
         pw._skill_d_no_h = bool(skill_d_no_h)
+        pw._skill_arg_eval_variant = str(eval_variant)
+        if ref_ckpt is not None:
+            print(f"[SkillArg] ref prior: {ref_ckpt}")
+            rc = torch.load(ref_ckpt, map_location=dev)
+            ref_model = KoopmanCVAE(rc['cfg'])
+            ref_model.load_state_dict(rc['model_state'], strict=False)
+            ref_model.eval().to(dev)
+            pw._ref_model = ref_model
+        if 'prior_c' in pw._skill_arg_eval_variant and pw._ref_model is None:
+            raise ValueError(
+                "--skill_arg_ref_ckpt is required for variants using prior_c")
+        if pw._skill_arg_eval_variant == 'prior' and pw._ref_model is None:
+            raise ValueError(
+                "--skill_arg_ref_ckpt is required for --skill_arg_eval_variant prior")
+        print(f"  eval_variant={pw._skill_arg_eval_variant}")
         return pw, model, None
 
     @torch.no_grad()
@@ -246,6 +264,47 @@ class PolicyWrapper:
     def reset(self):
         self._hi_timer = 0; self._sid = 0
 
+    def _online_skill_id(self, z_t, h_t):
+        h_d = torch.zeros_like(h_t) if self._skill_d_no_h else h_t
+        prior_logits = (
+            torch.zeros_like(self._model.skill_prior(h_t))
+            if self._skill_d_no_h else self._model.skill_prior(h_t).detach()
+        )
+        logits_d = self._model.skill_discrete_policy(z_t, h_d, prior_logits)
+        return logits_d.argmax(dim=-1)
+
+    def _prior_skill_id(self, h_t):
+        return self._model.skill_prior(h_t).argmax(dim=-1)
+
+    def _skill_arg_action_seq(self, z_t, h_t):
+        variant = self._skill_arg_eval_variant
+        if variant in ('prior', 'prior_d_policy_c'):
+            skill_id = self._prior_skill_id(h_t)
+        else:
+            skill_id = self._online_skill_id(z_t, h_t)
+        self._sid = int(skill_id.detach().cpu().reshape(-1)[0])
+        w = F.one_hot(
+            skill_id, num_classes=self._model.cfg.num_skills).float()
+
+        arg_model = (
+            self._ref_model
+            if variant in ('prior', 'policy_d_prior_c')
+            else self._model
+        )
+        arg = arg_model.skill_argument_policy.mean_arg(z_t, h_t, w)
+        if bool(getattr(self._model.cfg, 'skill_arg_predict_progress', False)):
+            a_seq, progress = self._model.skill_argument_decoder(
+                z_t, h_t, w, arg, return_progress=True)
+            p_term = torch.sigmoid(progress[0])
+            threshold = float(getattr(
+                self._model.cfg, 'skill_arg_progress_threshold', 0.5))
+            hits = torch.nonzero(p_term >= threshold, as_tuple=False)
+            if hits.numel() > 0:
+                a_seq = a_seq[:, :int(hits[0, 0].item()) + 1]
+        else:
+            a_seq = self._model.skill_argument_decoder(z_t, h_t, w, arg)
+        return a_seq
+
     @torch.no_grad()
     def act(self, z_t, h_t=None):
         dev = torch.device(self.device)
@@ -267,27 +326,7 @@ class PolicyWrapper:
         elif self.mode == 'skill_arg':
             if h_t is None:
                 raise ValueError("h_t is required for skill_arg mode")
-            h_d = torch.zeros_like(h_t) if self._skill_d_no_h else h_t
-            prior_logits = (
-                torch.zeros_like(self._model.skill_prior(h_t))
-                if self._skill_d_no_h else self._model.skill_prior(h_t).detach()
-            )
-            logits_d = self._model.skill_discrete_policy(z_t, h_d, prior_logits)
-            skill_id = logits_d.argmax(dim=-1)
-            w = F.one_hot(
-                skill_id, num_classes=self._model.cfg.num_skills).float()
-            arg = self._model.skill_argument_policy.mean_arg(z_t, h_t, w)
-            if bool(getattr(self._model.cfg, 'skill_arg_predict_progress', False)):
-                a_seq, progress = self._model.skill_argument_decoder(
-                    z_t, h_t, w, arg, return_progress=True)
-                p_term = torch.sigmoid(progress[0])
-                threshold = float(getattr(
-                    self._model.cfg, 'skill_arg_progress_threshold', 0.5))
-                hits = torch.nonzero(p_term >= threshold, as_tuple=False)
-                if hits.numel() > 0:
-                    a_seq = a_seq[:, :int(hits[0, 0].item()) + 1]
-            else:
-                a_seq = self._model.skill_argument_decoder(z_t, h_t, w, arg)
+            a_seq = self._skill_arg_action_seq(z_t, h_t)
             return a_seq[0].cpu().numpy()
         else:
             trainer = self._trainer; cfg = self._cfg
@@ -314,31 +353,11 @@ class PolicyWrapper:
         if self.mode == 'skill_decoder':
             a_seq = self._model.skill_action_decoder(z_now, h, w)
         else:
-            h_d = torch.zeros_like(h) if self._skill_d_no_h else h
-            prior_logits = (
-                torch.zeros_like(self._model.skill_prior(h))
-                if self._skill_d_no_h else self._model.skill_prior(h).detach()
-            )
-            logits_d = self._model.skill_discrete_policy(z_now, h_d, prior_logits)
-            skill_id = logits_d.argmax(dim=-1)
-            w = F.one_hot(
-                skill_id, num_classes=self._model.cfg.num_skills).float()
-            arg = self._model.skill_argument_policy.mean_arg(z_now, h, w)
-            if bool(getattr(self._model.cfg, 'skill_arg_predict_progress', False)):
-                a_seq, progress = self._model.skill_argument_decoder(
-                    z_now, h, w, arg, return_progress=True)
-                p_term = torch.sigmoid(progress[0])
-                threshold = float(getattr(
-                    self._model.cfg, 'skill_arg_progress_threshold', 0.5))
-                hits = torch.nonzero(p_term >= threshold, as_tuple=False)
-                if hits.numel() > 0:
-                    a_seq = a_seq[:, :int(hits[0, 0].item()) + 1]
-            else:
-                a_seq = self._model.skill_argument_decoder(z_now, h, w, arg)
+            a_seq = self._skill_arg_action_seq(z_now, h)
         return a_seq[0].cpu().numpy()
 
     @property
-    def skill_id(self): return self._sid if self.mode == 'online' else -1
+    def skill_id(self): return self._sid if self.mode in ('online', 'skill_arg') else -1
 
 
 # ─── Rollout ───────────────────────────────────────────────────────────────
@@ -462,7 +481,9 @@ def load_policy_for_eval(args, world_ckpt=None, policy_ckpt=None):
         cond_len = OnlineConfig().cond_len
     elif args.mode == 'skill_arg':
         policy, model, wm = PolicyWrapper.load_skill_arg(
-            world_ckpt, args.device, skill_d_no_h=args.skill_d_no_h)
+            world_ckpt, args.device, skill_d_no_h=args.skill_d_no_h,
+            eval_variant=args.skill_arg_eval_variant,
+            ref_ckpt=args.skill_arg_ref_ckpt)
         cond_len = OnlineConfig().cond_len
     else:
         policy, model, wm = PolicyWrapper.load_prior(
@@ -898,6 +919,12 @@ def main():
                    help='Sample policy_prior instead of using tanh(mean).')
     p.add_argument('--skill_d_no_h', action='store_true',
                    help='For skill_arg eval, match training with pi_d conditioned on z only.')
+    p.add_argument('--skill_arg_eval_variant',
+                   choices=['policy', 'prior', 'policy_d_prior_c', 'prior_d_policy_c'],
+                   default='policy',
+                   help='Ablation for skill_arg eval: online policy, prior-only, online d + prior c, or prior d + online c.')
+    p.add_argument('--skill_arg_ref_ckpt', default=None,
+                   help='Reference skill-arg checkpoint used for prior c in ablation variants.')
     p.add_argument('--sweep_ckpt_dir', default=None,
                    help='Evaluate every checkpoint in this directory and plot mean+/-std over steps.')
     p.add_argument('--sweep_pattern', default='policy_prior_online_step*.pt')
@@ -937,7 +964,9 @@ def main():
         cond_len=OnlineConfig().cond_len
     elif args.mode=='skill_arg':
         policy, model, wm = PolicyWrapper.load_skill_arg(
-            args.world_ckpt, args.device, skill_d_no_h=args.skill_d_no_h)
+            args.world_ckpt, args.device, skill_d_no_h=args.skill_d_no_h,
+            eval_variant=args.skill_arg_eval_variant,
+            ref_ckpt=args.skill_arg_ref_ckpt)
         cond_len=OnlineConfig().cond_len
     else:
         policy, model, wm = PolicyWrapper.load_prior(
