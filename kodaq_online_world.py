@@ -122,8 +122,8 @@ class OnlineConfig:
     lambda_q_success_rank:    float = 0.0
     q_success_margin:         float = 0.5
     lambda_q_wm_penalty:      float = 0.0
-    q_wm_penalty_percentile:  float = 95.0
-    q_wm_penalty_clip:        float = 1.0
+    q_wm_penalty_percentile:  float = 50.0  # kept for CLI compatibility; norm mode uses elite mean.
+    q_wm_penalty_clip:        float = 0.0
     q_wm_penalty_min_elite:   int   = 128
     q_wm_penalty_q_weight:    float = 1.0
     q_wm_penalty_obj_weight:  float = 1.0
@@ -133,6 +133,8 @@ class OnlineConfig:
     q_wm_progress_bins:       int   = 4
     q_wm_min_bin_count:       int   = 16
     q_world_target:           bool  = True
+    q_world_bootstrap:        float = 0.0
+    q_wm_penalty_eps:         float = 1e-6
     pi_update_start:          int   = 10_000
     actor_mode:               str   = 'policy_prior'  # policy_prior | skill_decoder
     pi_q_weight:              float = 1.0
@@ -1225,8 +1227,7 @@ class PolicyPriorOnlineTrainer:
         vals = vals[np.isfinite(vals)]
         if vals.size < int(self.cfg.q_wm_penalty_min_elite):
             return None
-        pct = max(0.0, min(100.0, float(self.cfg.q_wm_penalty_percentile)))
-        global_thr = float(np.percentile(vals, pct))
+        global_thr = float(vals.mean())
         self.wm_penalty_threshold = global_thr
         self.wm_penalty_global_threshold = global_thr
 
@@ -1243,11 +1244,11 @@ class PolicyPriorOnlineTrainer:
                 for b in range(P):
                     mask = (s == k) & (p == b) & np.isfinite(err[:n])
                     if int(mask.sum()) >= min_count:
-                        thresholds[k, b] = float(np.percentile(err[:n][mask], pct))
+                        thresholds[k, b] = float(err[:n][mask].mean())
         self.wm_penalty_thresholds = thresholds
         print(
-            f"[WM penalty] built skill/progress thresholds "
-            f"K={K} P={P} global={global_thr:.4f} pct={pct:.1f} "
+            f"[WM penalty] built skill/progress normalizers "
+            f"K={K} P={P} global_mean={global_thr:.4f} "
             f"elite={n}"
         )
         return thresholds
@@ -1276,11 +1277,9 @@ class PolicyPriorOnlineTrainer:
         skill_id = skill_id.clamp(0, K - 1).detach().cpu().numpy()
         progress_bin = progress_bin.clamp(0, P - 1).detach().cpu().numpy()
         thr_np = thresholds[skill_id, progress_bin]
-        thr = torch.as_tensor(thr_np, dtype=like.dtype, device=like.device)
-        excess = (wm_err - thr).clamp_min(0.0)
-        if self.cfg.q_wm_penalty_clip > 0.0:
-            excess = excess.clamp_max(float(self.cfg.q_wm_penalty_clip))
-        return float(self.cfg.lambda_q_wm_penalty) * excess
+        norm = torch.as_tensor(thr_np, dtype=like.dtype, device=like.device)
+        norm = norm.clamp_min(float(self.cfg.q_wm_penalty_eps))
+        return float(self.cfg.lambda_q_wm_penalty) * (wm_err / norm)
 
     def _skillarg_q_logits(
         self,
@@ -1593,7 +1592,11 @@ class PolicyPriorOnlineTrainer:
                 m.cfg.v_min, m.cfg.v_max)
             q_next, next_info = self._skillarg_soft_value(
                 z_boot, h_boot, m.skill_arg_q_head_target, detach_actor=True)
-            boot_w = 1.0 if self.cfg.q_world_target else float(self.cfg.q_bootstrap)
+            boot_w = (
+                float(self.cfg.q_world_bootstrap)
+                if self.cfg.q_world_target
+                else float(self.cfg.q_bootstrap)
+            )
             y = (r_targ_pen + boot_w * discount * q_next).clamp(
                 m.cfg.v_min, m.cfg.v_max)
 
@@ -2877,6 +2880,7 @@ def train_policy_prior_online(cfg: OnlineConfig,
     print(f"  q batch pos/off={cfg.q_positive_fraction:.2f}/"
           f"{cfg.q_offline_fraction:.2f}  reward={cfg.q_reward_source} "
           f"world={int(cfg.q_world_target)} H={cfg.q_world_horizon} "
+          f"world_boot={cfg.q_world_bootstrap:.2f} "
           f"boot={cfg.q_bootstrap:.2f} n={cfg.q_n_step} "
           f"g={cfg.q_n_step_gamma:.2f} elite={cfg.q_elite_fraction:.2f}")
     print(f"  q combo cql={cfg.lambda_q_cql_policy:.3f} "
@@ -2892,8 +2896,7 @@ def train_policy_prior_online(cfg: OnlineConfig,
           f"succ_thr={cfg.q_success_threshold:.2f} "
           f"succ_src={int(cfg.q_success_include_source)}")
     print(f"  q wm_penalty lambda={cfg.lambda_q_wm_penalty:.3f} "
-          f"pct={cfg.q_wm_penalty_percentile:.1f} "
-          f"clip={cfg.q_wm_penalty_clip:.3f} "
+          f"mode=wm_err/elite_mean clip=off "
           f"min_elite={cfg.q_wm_penalty_min_elite} "
           f"errH={cfg.q_wm_error_horizon} bins={cfg.q_wm_progress_bins} "
           f"w(z/q/p)={cfg.q_wm_penalty_latent_weight:.2f}/"
@@ -3362,18 +3365,21 @@ def main():
     p.add_argument('--lambda_q_success_rank', type=float, default=0.0)
     p.add_argument('--q_success_margin', type=float, default=0.5)
     p.add_argument('--lambda_q_wm_penalty', type=float, default=0.0)
-    p.add_argument('--q_wm_penalty_percentile', type=float, default=95.0)
-    p.add_argument('--q_wm_penalty_clip', type=float, default=1.0)
+    p.add_argument('--q_wm_penalty_percentile', type=float, default=50.0)
+    p.add_argument('--q_wm_penalty_clip', type=float, default=0.0)
     p.add_argument('--q_wm_penalty_min_elite', type=int, default=128)
     p.add_argument('--q_wm_penalty_q_weight', type=float, default=1.0)
     p.add_argument('--q_wm_penalty_obj_weight', type=float, default=1.0)
     p.add_argument('--q_wm_penalty_latent_weight', type=float, default=1.0)
+    p.add_argument('--q_wm_penalty_eps', type=float, default=1e-6)
     p.add_argument('--q_wm_error_horizon', type=int, default=4)
     p.add_argument('--q_world_horizon', type=int, default=3)
     p.add_argument('--q_wm_progress_bins', type=int, default=4)
     p.add_argument('--q_wm_min_bin_count', type=int, default=16)
     p.add_argument('--no_q_world_target', action='store_true',
                    help='Use legacy Q target instead of the WM-penalized world target.')
+    p.add_argument('--q_world_bootstrap', type=float, default=0.0,
+                   help='Bootstrap coefficient for gamma^H Q in world target. Use 0 to train on env-reward minus WM penalty only.')
     p.add_argument('--pi_update_start', type=int, default=10_000)
     p.add_argument('--actor_mode', choices=['policy_prior', 'skill_decoder', 'skill_arg'],
                    default='policy_prior')
@@ -3506,11 +3512,13 @@ def main():
         q_wm_penalty_q_weight=args.q_wm_penalty_q_weight,
         q_wm_penalty_obj_weight=args.q_wm_penalty_obj_weight,
         q_wm_penalty_latent_weight=args.q_wm_penalty_latent_weight,
+        q_wm_penalty_eps=args.q_wm_penalty_eps,
         q_wm_error_horizon=args.q_wm_error_horizon,
         q_world_horizon=args.q_world_horizon,
         q_wm_progress_bins=args.q_wm_progress_bins,
         q_wm_min_bin_count=args.q_wm_min_bin_count,
         q_world_target=not args.no_q_world_target,
+        q_world_bootstrap=args.q_world_bootstrap,
         pi_update_start=args.pi_update_start,
         actor_mode=args.actor_mode,
         pi_q_weight=args.pi_q_weight,
