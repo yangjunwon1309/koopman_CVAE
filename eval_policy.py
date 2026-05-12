@@ -292,9 +292,11 @@ class PolicyWrapper:
         else:
             trainer = self._trainer; cfg = self._cfg
             if self._hi_timer == 0:
-                self._sid, _ = trainer.pi_hi.hard_sample(z_t)
+                sid_t = trainer.pi_hi.logits(z_t).argmax(dim=-1)
+                self._sid = int(sid_t.item())
                 self._hi_timer = cfg.H_hi
-            a_seq, _ = trainer.pi_lo.sample(z_t)
+            mu, _ = trainer.pi_lo(z_t)
+            a_seq = torch.tanh(mu)
             self._hi_timer = max(0, self._hi_timer - cfg.H_lo)
             return a_seq[0].cpu().numpy()  # (H_lo, 9)
 
@@ -307,7 +309,7 @@ class PolicyWrapper:
         dev = torch.device(self.device)
         h = ctx.h_t.to(dev)
         x_now = torch.FloatTensor(ctx._obs_to_x(ctx.obs_buf[-1])).unsqueeze(0).to(dev)
-        z_now, _, _ = self._model.posterior.sample(x_now, h)
+        z_now, _ = self._model.posterior(x_now, h)
         w = self._model.skill_prior.soft_weights(h)
         if self.mode == 'skill_decoder':
             a_seq = self._model.skill_action_decoder(z_now, h, w)

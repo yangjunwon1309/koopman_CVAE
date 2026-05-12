@@ -364,7 +364,7 @@ def analyze_random_midpoint_rollouts(
     model: KoopmanCVAE,
     episodes: List[Dict],
     x_seq_full: np.ndarray,
-    horizon: int = 8,
+    horizon: int = 32,
     device: str = 'cuda',
     min_context: int = 8,
     rng: Optional[np.random.Generator] = None,
@@ -390,18 +390,15 @@ def analyze_random_midpoint_rollouts(
         rew_ep = ep['rewards']
         gi = ep['goal_info']
 
-        if L < min_context + horizon + 2:
+        if L < 30 + horizon + 1:
             continue
 
         x_ep = x_seq_full[s:e + 1]
         x_t = torch.FloatTensor(x_ep).unsqueeze(0).to(dev)
         a_t = torch.FloatTensor(acts_ep).unsqueeze(0).to(dev)
 
-        low = max(min_context, int(0.2 * L))
-        high = min(L - horizon - 1, int(0.8 * L))
-        if low > high:
-            low = min_context
-            high = L - horizon - 1
+        low = 30
+        high = min(100, L - horizon - 1)
         if low > high:
             continue
 
@@ -439,14 +436,7 @@ def analyze_random_midpoint_rollouts(
         skill_weights = pred['skill_weights'][0, :H_c].cpu().numpy()
         skill_pred = skill_weights.argmax(axis=-1)
 
-        completions = gi.get('completions', {})
-        future_tasks = [
-            (task, t) for task, t in completions.items() if t >= t0
-        ]
-        if future_tasks:
-            task_label = min(future_tasks, key=lambda x: x[1])[0]
-        else:
-            task_label = 'midpoint'
+        task_label = 'random_t0'
 
         z_seg = pred['o_preds'][0, :H_c]
         u_seg = model.action_encoder(a_t[0, t0:t0 + H_c])
@@ -767,8 +757,8 @@ def plot_per_episode_rollout(results: List[Dict], out_dir: Path):
                       color=color, lw=1.1, alpha=0.72)
         _add_skill_loci(ax_q, skill_pred, skill_colors)
         ax_q.set_title(
-            f"Ep {seg['ep_idx']} seg {seg['seg_idx']} [{seg['task']}] "
-            f"t={seg['seg_start']}..{seg['seg_end']}",
+            f"Ep {seg['ep_idx']}  t0={seg['seg_start']}  "
+            f"horizon={seg['H']}",
             fontsize=9,
         )
         ax_q.set_ylabel('dq [rad]', fontsize=8)
@@ -1110,8 +1100,8 @@ def parse_args():
                    choices=['mixed', 'partial', 'complete'])
     p.add_argument('--n_ep',       type=int, default=8,
                    help='Number of random episodes to analyze')
-    p.add_argument('--horizon',    type=int, default=8,
-                   help='Rollout horizon per segment (≤8 recommended)')
+    p.add_argument('--horizon',    type=int, default=32,
+                   help='Rollout horizon after sampled t0')
     p.add_argument('--min_seg_len',type=int, default=8,
                    help='Minimum segment length to analyze')
     p.add_argument('--reward_crop', type=float, default=2.0,
@@ -1141,17 +1131,19 @@ if __name__ == '__main__':
         print(f"Loaded skill labels: {args.skill_h5}  n={len(skill_labels)}")
     else:
         print(f"Skill label file not found: {args.skill_h5}")
+    min_episode_len = max(args.min_seg_len + args.horizon + 2,
+                          30 + args.horizon + 1)
     episodes, _      = load_kitchen_episodes(
-        quality=args.quality, min_len=args.min_seg_len + args.horizon + 2)
+        quality=args.quality, min_len=min_episode_len)
     reward_crop = None if args.reward_crop < 0 else args.reward_crop
     episodes = crop_episodes_by_reward(
-        episodes, reward_crop, min_len=args.min_seg_len + args.horizon + 2)
+        episodes, reward_crop, min_len=min_episode_len)
 
     rng = np.random.default_rng(args.seed)
 
     eligible = [
         e for e in episodes
-        if e['length'] >= args.min_seg_len + args.horizon + 2
+        if e['length'] >= min_episode_len
     ]
     if len(eligible) > args.n_ep:
         idx = rng.choice(len(eligible), size=args.n_ep, replace=False)
