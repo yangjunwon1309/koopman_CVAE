@@ -110,6 +110,8 @@ class OnlineConfig:
     lambda_elite_bc_pi:       float = 0.0
     lambda_elite_skill_bc_pi: float = 0.0
     lambda_elite_arg_bc_pi:   float = 0.0
+    lambda_elite_arg_bc_min:  float = 0.0
+    elite_arg_bc_decay_steps: int   = 100_000
     q_n_step:                 int   = 3
     q_n_step_gamma:           float = 0.99
     q_reward_source:          str   = 'env'
@@ -156,6 +158,7 @@ class OnlineConfig:
     skill_arg_alpha_d:        float = 0.1
     skill_arg_alpha_z:        float = 0.01
     skill_d_no_h:             bool  = False
+    skill_d_prior_fixed:      bool  = False
     skill_arg_mean_after_pi_start: bool = True
     lambda_lqr_pi:     float = 0.0
     lqr_horizon:       int   = 4
@@ -712,10 +715,14 @@ class PolicyPriorOnlineTrainer:
         if self.actor_mode == 'skill_decoder':
             actor_mod = model.skill_action_decoder
         elif self.actor_mode == 'skill_arg':
-            actor_mod = nn.ModuleList([
-                model.skill_discrete_policy,
-                model.skill_argument_policy,
-            ])
+            actor_mod = (
+                model.skill_argument_policy
+                if cfg.skill_d_prior_fixed
+                else nn.ModuleList([
+                    model.skill_discrete_policy,
+                    model.skill_argument_policy,
+                ])
+            )
         else:
             actor_mod = model.policy_prior
         q_mod = model.skill_arg_q_head if self.actor_mode == 'skill_arg' else model.q_head
@@ -766,9 +773,18 @@ class PolicyPriorOnlineTrainer:
 
     def _skill_policy_logits(self, z: torch.Tensor,
                              h: torch.Tensor) -> torch.Tensor:
+        if self.cfg.skill_d_prior_fixed:
+            return self.model.skill_prior(h).detach()
         prior_logits = self._skill_prior_logits(h)
         h_policy = torch.zeros_like(h) if self.cfg.skill_d_no_h else h
         return self.model.skill_discrete_policy(z, h_policy, prior_logits)
+
+    def _effective_elite_arg_bc_weight(self) -> float:
+        lam0 = float(self.cfg.lambda_elite_arg_bc_pi)
+        lam_min = float(self.cfg.lambda_elite_arg_bc_min)
+        decay = max(1, int(self.cfg.elite_arg_bc_decay_steps))
+        frac = min(1.0, max(0.0, self.step / decay))
+        return lam_min + (lam0 - lam_min) * (1.0 - frac)
 
     def _one_hot_skill(self, skill_id: torch.Tensor) -> torch.Tensor:
         return F.one_hot(
@@ -1439,7 +1455,8 @@ class PolicyPriorOnlineTrainer:
                 has_soft_skill = skill_prob_bc.sum(-1) > 0.5
             else:
                 has_soft_skill = torch.zeros_like(elite_mask)
-            if self.cfg.lambda_elite_skill_bc_pi > 0.0:
+            if (self.cfg.lambda_elite_skill_bc_pi > 0.0
+                    and not self.cfg.skill_d_prior_fixed):
                 log_pi_bc = F.log_softmax(logits_d, dim=-1)
                 soft_mask = elite_mask & has_soft_skill
                 hard_mask = elite_mask & (~has_soft_skill)
@@ -1466,7 +1483,8 @@ class PolicyPriorOnlineTrainer:
                     soft_mask = has_soft_skill.view(-1, 1)
                     skill_oh = torch.where(soft_mask, skill_prob_bc, skill_oh)
                 arg_bc = m.skill_argument_policy.mean_arg(z, h, skill_oh)
-            if self.cfg.lambda_elite_arg_bc_pi > 0.0:
+            arg_bc_w = self._effective_elite_arg_bc_weight()
+            if arg_bc_w > 0.0:
                 arg_target = batch.get('skill_arg', None)
                 if arg_target is not None:
                     arg_mask = elite_mask
@@ -1480,7 +1498,7 @@ class PolicyPriorOnlineTrainer:
                         ).pow(2).mean()
                         loss = (
                             loss
-                            + self.cfg.lambda_elite_arg_bc_pi * loss_elite_arg_bc
+                            + arg_bc_w * loss_elite_arg_bc
                         )
             if self.cfg.lambda_elite_bc_pi > 0.0:
                 a_seq = m.skill_argument_decoder(z, h, skill_oh, arg_bc)
@@ -2910,7 +2928,8 @@ def train_policy_prior_online(cfg: OnlineConfig,
           f"{cfg.pi_q_guide_min_step} bc={cfg.lambda_bc_pi:.3f} "
           f"ebc={cfg.lambda_elite_bc_pi:.3f} "
           f"eskill={cfg.lambda_elite_skill_bc_pi:.3f} "
-          f"earg={cfg.lambda_elite_arg_bc_pi:.3f} "
+          f"earg={cfg.lambda_elite_arg_bc_pi:.3f}->{cfg.lambda_elite_arg_bc_min:.3f}"
+          f"/{cfg.elite_arg_bc_decay_steps} "
           f"anchor={cfg.lambda_skilldec_anchor:.3f}->{cfg.skilldec_anchor_min:.3f}")
     if cfg.pi_q_guide_loss_threshold > 0.0:
         print(
@@ -2935,6 +2954,7 @@ def train_policy_prior_online(cfg: OnlineConfig,
               f"progress={int(getattr(trainer.model.cfg, 'skill_arg_predict_progress', False))} "
               f"pthr={float(getattr(trainer.model.cfg, 'skill_arg_progress_threshold', 0.5)):.2f} "
               f"skill_d_no_h={int(cfg.skill_d_no_h)} "
+              f"skill_d_prior_fixed={int(cfg.skill_d_prior_fixed)} "
               f"mean_after_pi={int(cfg.skill_arg_mean_after_pi_start)} "
               "critic=Q(z,h,arg,d)")
     print(f"  elite buffer size={cfg.elite_buffer_size} "
@@ -3349,6 +3369,8 @@ def main():
     p.add_argument('--lambda_elite_bc_pi',       type=float, default=0.0)
     p.add_argument('--lambda_elite_skill_bc_pi', type=float, default=0.0)
     p.add_argument('--lambda_elite_arg_bc_pi',   type=float, default=0.0)
+    p.add_argument('--lambda_elite_arg_bc_min',  type=float, default=0.0)
+    p.add_argument('--elite_arg_bc_decay_steps', type=int, default=100_000)
     p.add_argument('--q_n_step',                 type=int,   default=3)
     p.add_argument('--q_n_step_gamma',           type=float, default=0.99)
     p.add_argument('--q_reward_source', choices=['env', 'rhat', 'penalized'],
@@ -3406,6 +3428,8 @@ def main():
     p.add_argument('--skill_arg_alpha_z', type=float, default=0.01)
     p.add_argument('--skill_d_no_h', action='store_true',
                    help='For skill_arg actor, condition pi_d on z only by zeroing h and using a uniform skill prior.')
+    p.add_argument('--skill_d_prior_fixed', action='store_true',
+                   help='For skill_arg actor, replace trainable pi_d with frozen world-model skill prior p(d|h).')
     p.add_argument('--skill_arg_sample_after_pi_start', action='store_true',
                    help='Keep sampling c after pi_start instead of using mean_arg for rollout.')
     p.add_argument('--lambda_lqr_pi',     type=float, default=0.0)
@@ -3494,6 +3518,8 @@ def main():
         lambda_elite_bc_pi=args.lambda_elite_bc_pi,
         lambda_elite_skill_bc_pi=args.lambda_elite_skill_bc_pi,
         lambda_elite_arg_bc_pi=args.lambda_elite_arg_bc_pi,
+        lambda_elite_arg_bc_min=args.lambda_elite_arg_bc_min,
+        elite_arg_bc_decay_steps=args.elite_arg_bc_decay_steps,
         q_n_step=args.q_n_step,
         q_n_step_gamma=args.q_n_step_gamma,
         q_reward_source=args.q_reward_source,
@@ -3540,6 +3566,7 @@ def main():
         skill_arg_alpha_d=args.skill_arg_alpha_d,
         skill_arg_alpha_z=args.skill_arg_alpha_z,
         skill_d_no_h=args.skill_d_no_h,
+        skill_d_prior_fixed=args.skill_d_prior_fixed,
         skill_arg_mean_after_pi_start=not args.skill_arg_sample_after_pi_start,
         lambda_lqr_pi=args.lambda_lqr_pi,
         lqr_horizon=args.lqr_horizon,
